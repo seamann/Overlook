@@ -40,7 +40,7 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
-                        hidesLocalCursor: inputManager.isLocalInputCaptureAllowed && !isOCRModeEnabled,
+                        hidesLocalCursor: inputManager.isMouseCaptureEnabled && !isOCRModeEnabled,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
                             inputManager.handleVideoMouseMove(
