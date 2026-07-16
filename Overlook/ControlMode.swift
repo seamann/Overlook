@@ -1,5 +1,9 @@
 import Foundation
 
+extension Notification.Name {
+    static let overlookControlModeChanged = Notification.Name("overlook.controlModeChanged")
+}
+
 enum OverlookControlMode: String, CaseIterable, Identifiable {
     case manual
     case codexHeadless

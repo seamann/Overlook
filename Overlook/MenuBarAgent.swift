@@ -8,6 +8,7 @@ class MenuBarAgent: NSObject, ObservableObject {
     private var menu: NSMenu?
     private var popover: NSPopover?
     private var monitoringWindow: NSWindow?
+    private var globalKeyMonitor: Any?
 
     private let kvmDeviceManager: KVMDeviceManager
     private let webRTCManager: WebRTCManager
@@ -548,12 +549,16 @@ class MenuBarAgent: NSObject, ObservableObject {
     
     private func setupKeyboardShortcuts() {
         // Global keyboard shortcuts for quick actions
-        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handleGlobalKeyEvent(event)
         }
     }
     
     private func handleGlobalKeyEvent(_ event: NSEvent) {
+        let mode = OverlookControlMode(
+            rawValue: UserDefaults.standard.string(forKey: "overlook.controlMode") ?? ""
+        ) ?? .manual
+        guard mode == .manual else { return }
         guard event.modifierFlags.contains([.command, .shift]) else { return }
         
         switch event.keyCode {
@@ -596,6 +601,10 @@ class MenuBarAgent: NSObject, ObservableObject {
     }
     
     func cleanup() {
+        if let globalKeyMonitor {
+            NSEvent.removeMonitor(globalKeyMonitor)
+            self.globalKeyMonitor = nil
+        }
         statusItem = nil
         menu = nil
         popover = nil

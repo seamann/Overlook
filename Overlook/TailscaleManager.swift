@@ -534,6 +534,7 @@ enum TailscaleError: Error, LocalizedError {
     case authenticationFailed
     case configurationFailed
     case networkUnavailable
+    case manualInstallationRequired
     
     var errorDescription: String? {
         switch self {
@@ -549,6 +550,8 @@ enum TailscaleError: Error, LocalizedError {
             return "Failed to configure Tailscale"
         case .networkUnavailable:
             return "Network is not available"
+        case .manualInstallationRequired:
+            return "Tailscale installation must be completed from the official download page"
         }
     }
 }
@@ -556,33 +559,11 @@ enum TailscaleError: Error, LocalizedError {
 // MARK: - Tailscale Installation Helper
 extension TailscaleManager {
     func installTailscale() async throws {
-        // Download and install Tailscale
-        let downloadURL = URL(string: "https://pkgs.tailscale.com/stable/tailscale-installer-darwin")!
-        
-        let (data, _) = try await URLSession.shared.data(from: downloadURL)
-        
-        // Save installer to temporary location
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("tailscale-installer")
-        try data.write(to: tempURL)
-        
-        // Make installer executable
-        let chmodTask = Process()
-        chmodTask.executableURL = URL(fileURLWithPath: "/bin/chmod")
-        chmodTask.arguments = ["+x", tempURL.path]
-        try chmodTask.run()
-        chmodTask.waitUntilExit()
-        
-        // Run installer
-        let installTask = Process()
-        installTask.executableURL = tempURL
-        try installTask.run()
-        installTask.waitUntilExit()
-        
-        // Clean up
-        try? FileManager.default.removeItem(at: tempURL)
-        
-        // Update installation status
-        checkTailscaleInstallation()
+        // Never download and execute an installer inside Overlook. Installation
+        // remains an explicit user action through Tailscale's official page so
+        // macOS can verify the signed and notarized application bundle.
+        openTailscaleWebsite()
+        throw TailscaleError.manualInstallationRequired
     }
     
     func openTailscaleWebsite() {

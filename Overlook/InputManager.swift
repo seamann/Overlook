@@ -19,6 +19,7 @@ class InputManager: ObservableObject {
     private var mouseModeRefreshTask: Task<Void, Never>?
     private var hidCommandTail: Task<Void, Never>?
     private var hidReconnectTask: Task<Void, Never>?
+    private var acceptsHIDCommands = true
 
     private struct PendingAbsoluteMouseMove {
         let toX: Int
@@ -45,6 +46,7 @@ class InputManager: ObservableObject {
     @Published private(set) var isLocalInputCaptureAllowed = true
     @Published private(set) var activityStatus = "Ready"
     @Published private(set) var lastInputError: String?
+    @Published private(set) var hidStatus = "Disconnected"
 
     enum TransportMode: String, CaseIterable {
         case webRTC
@@ -174,9 +176,17 @@ class InputManager: ObservableObject {
 
                 if snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws {
                     if snapshot.isAbsoluteMouseMode, let move = snapshot.absoluteMove {
-                        try? await ws.sendHidMouseMove(toX: move.toX, toY: move.toY)
+                        await MainActor.run {
+                            self.enqueueHIDCommand(label: "Mouse move") {
+                                try await ws.sendHidMouseMove(toX: move.toX, toY: move.toY)
+                            }
+                        }
                     } else if let move = snapshot.relativeMove {
-                        await Self.sendRelativeMouseMove(move, through: ws)
+                        await MainActor.run {
+                            self.enqueueHIDCommand(label: "Relative mouse move") {
+                                try await Self.sendRelativeMouseMove(move, through: ws)
+                            }
+                        }
                     }
                 }
 
@@ -222,6 +232,7 @@ class InputManager: ObservableObject {
         stopMouseMoveSender()
         let ws = glkvmWebSocketClient
         glkvmWebSocketClient = nil
+        hidStatus = "Disconnected"
         hidReconnectTask?.cancel()
         hidReconnectTask = nil
         enqueueHIDCommand(label: "Release inputs") {
@@ -485,10 +496,21 @@ class InputManager: ObservableObject {
         }
         let x = Self.clampInt(signedX, min: -32_767, max: 32_767)
         let y = Self.clampInt(signedY, min: -32_767, max: 32_767)
-        try await ws.sendHidMouseMove(toX: x, toY: y)
-        try await ws.sendHidMouseButton(button: "left", state: true)
-        try await Task.sleep(nanoseconds: 50_000_000)
-        try await ws.sendHidMouseButton(button: "left", state: false)
+        try await withCheckedThrowingContinuation { continuation in
+            enqueueHIDCommand(label: "Codex click", completion: { result in
+                continuation.resume(with: result)
+            }) {
+                try await ws.sendHidMouseMove(toX: x, toY: y)
+                try await ws.sendHidMouseButton(button: "left", state: true)
+                do {
+                    try await Task.sleep(nanoseconds: 50_000_000)
+                    try await ws.sendHidMouseButton(button: "left", state: false)
+                } catch {
+                    try? await ws.sendHidMouseButton(button: "left", state: false)
+                    throw error
+                }
+            }
+        }
     }
 
     enum RemoteTextInputError: LocalizedError {
@@ -642,8 +664,8 @@ class InputManager: ObservableObject {
                 deltaY: Int(event.delta.height.rounded())
             )
             guard move.deltaX != 0 || move.deltaY != 0 else { return }
-            Task {
-                await Self.sendRelativeMouseMove(move, through: ws)
+            enqueueHIDCommand(label: "Relative mouse move") {
+                try await Self.sendRelativeMouseMove(move, through: ws)
             }
             return
         }
@@ -791,6 +813,25 @@ class InputManager: ObservableObject {
         mouseModeRefreshTask = nil
     }
 
+    func shutdown() async {
+        acceptsHIDCommands = false
+        stopFullInputCapture()
+        stopMouseMoveSender()
+        mouseModeRefreshTask?.cancel()
+        mouseModeRefreshTask = nil
+        hidReconnectTask?.cancel()
+        hidReconnectTask = nil
+        let pendingCommands = hidCommandTail
+        await pendingCommands?.value
+        hidCommandTail = nil
+
+        let ws = glkvmWebSocketClient
+        glkvmWebSocketClient = nil
+        try? await ws?.releaseAllHIDInputs()
+        await ws?.disconnect()
+        activityStatus = "Input stopped"
+    }
+
     private func reconnectGLKVMWebSocketIfNeeded() async {
         if transportMode != .glkvmWebSocket {
             return
@@ -807,25 +848,36 @@ class InputManager: ObservableObject {
             glkvmWebSocketClient = ws
             await ws?.connect()
             activityStatus = ws == nil ? "HID connection failed" : "HID connecting"
+            hidStatus = ws == nil ? "Failed" : "Connecting"
         }
     }
 
     private func enqueueHIDCommand(
         label: String,
+        completion: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil,
         operation: @escaping @Sendable () async throws -> Void
     ) {
+        guard acceptsHIDCommands else {
+            completion?(.failure(CancellationError()))
+            return
+        }
         let predecessor = hidCommandTail
         hidCommandTail = Task { [weak self] in
             await predecessor?.value
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else {
+                completion?(.failure(CancellationError()))
+                return
+            }
             do {
                 try await operation()
                 self?.activityStatus = label
                 self?.lastInputError = nil
+                completion?(.success(()))
             } catch {
                 self?.lastInputError = error.localizedDescription
                 self?.activityStatus = "Input interrupted; reconnecting"
                 self?.scheduleHIDReconnect()
+                completion?(.failure(error))
             }
         }
     }
@@ -838,6 +890,7 @@ class InputManager: ObservableObject {
                 try? await Task.sleep(nanoseconds: delay)
                 await self.reconnectGLKVMWebSocketIfNeeded()
                 if await self.glkvmWebSocketClient?.isConnected == true {
+                    self.hidStatus = "Connected"
                     self.hidReconnectTask = nil
                     return
                 }
@@ -1030,14 +1083,14 @@ class InputManager: ObservableObject {
         }
     }
 
-    private static func sendRelativeMouseMove(_ move: PendingRelativeMouseMove, through ws: GLKVMClient.WebSocketClient) async {
+    private static func sendRelativeMouseMove(_ move: PendingRelativeMouseMove, through ws: GLKVMClient.WebSocketClient) async throws {
         var remainingX = move.deltaX
         var remainingY = move.deltaY
 
         while remainingX != 0 || remainingY != 0 {
             let dx = clampInt(remainingX, min: -127, max: 127)
             let dy = clampInt(remainingY, min: -127, max: 127)
-            try? await ws.sendHidMouseRelative(deltaX: dx, deltaY: dy)
+            try await ws.sendHidMouseRelative(deltaX: dx, deltaY: dy)
             remainingX -= dx
             remainingY -= dy
         }

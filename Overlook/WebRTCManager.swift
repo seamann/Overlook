@@ -144,6 +144,9 @@ class WebRTCManager: NSObject, ObservableObject {
     private let allowInsecureTLS = true
     private var signalingSession: URLSession?
     private var webSocketTask: URLSessionWebSocketTask?
+    private var signalingListenerTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var connectionGeneration = 0
 
     private var janusSessionId: Int?
     private var janusHandleId: Int?
@@ -308,6 +311,7 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     func connect(to device: KVMDevice) async throws {
+        connectionGeneration += 1
         lastConnectedDevice = device
         setupWebRTC()
 
@@ -376,19 +380,41 @@ class WebRTCManager: NSObject, ObservableObject {
             startStreamHealthMonitoring()
         } catch {
             let reason = "Connect failed: \(String(describing: error))"
-            disconnect()
+            tearDown(cancelReconnect: false)
             lastDisconnectReason = reason
             throw error
         }
     }
 
     func reconnect(to device: KVMDevice) async {
-        disconnect()
+        tearDown(cancelReconnect: false)
         do {
             try await connect(to: device)
         } catch {
             isConnecting = false
             lastDisconnectReason = "Reconnect failed: \(String(describing: error))"
+        }
+    }
+
+    private func requestReconnect(reason: String, delayNanoseconds: UInt64 = 500_000_000) {
+        guard reconnectTask == nil, let device = lastConnectedDevice else { return }
+        lastDisconnectReason = reason
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.reconnectTask = nil }
+            let delays: [UInt64] = [delayNanoseconds, 1_000_000_000, 2_000_000_000, 4_000_000_000]
+            for delay in delays {
+                try? await Task.sleep(nanoseconds: delay)
+                guard !Task.isCancelled else { return }
+                self.tearDown(cancelReconnect: false)
+                self.lastDisconnectReason = reason
+                do {
+                    try await self.connect(to: device)
+                    return
+                } catch {
+                    self.lastDisconnectReason = "\(reason) · retry failed: \(error.localizedDescription)"
+                }
+            }
         }
     }
 
@@ -453,8 +479,12 @@ class WebRTCManager: NSObject, ObservableObject {
         
         webSocketTask?.resume()
 
-        Task {
-            await listenForSignalingMessages()
+        let socket = webSocketTask
+        let generation = connectionGeneration
+        signalingListenerTask?.cancel()
+        signalingListenerTask = Task { [weak self] in
+            guard let self, let socket else { return }
+            await self.listenForSignalingMessages(socket: socket, generation: generation)
         }
 
         // Janus session setup
@@ -555,10 +585,7 @@ class WebRTCManager: NSObject, ObservableObject {
                 do {
                     try await self.sendJanusKeepAlive()
                 } catch {
-                    self.lastDisconnectReason = "Signaling keepalive failed"
-                    if let device = self.lastConnectedDevice {
-                        await self.reconnect(to: device)
-                    }
+                    self.requestReconnect(reason: "Signaling keepalive failed")
                 }
             }
         }
@@ -647,23 +674,20 @@ class WebRTCManager: NSObject, ObservableObject {
         return comps.url ?? url
     }
     
-    private func listenForSignalingMessages() async {
-        while let webSocketTask = webSocketTask {
+    private func listenForSignalingMessages(socket: URLSessionWebSocketTask, generation: Int) async {
+        while !Task.isCancelled, generation == connectionGeneration {
             do {
-                let message = try await webSocketTask.receive()
+                let message = try await socket.receive()
+                guard generation == connectionGeneration else { return }
                 await handleSignalingMessage(message)
             } catch {
+                guard !Task.isCancelled, generation == connectionGeneration else { return }
                 print("WebSocket receive error: \(error)")
                 isConnecting = false
                 if isConnected || hasEverConnectedToStream || lastDisconnectReason == nil {
                     lastDisconnectReason = "Signaling connection lost"
                 }
-                if let device = lastConnectedDevice {
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 500_000_000)
-                        await self.reconnect(to: device)
-                    }
-                }
+                requestReconnect(reason: "Signaling connection lost")
                 break
             }
         }
@@ -847,8 +871,8 @@ class WebRTCManager: NSObject, ObservableObject {
                     if self.isStreamStalled == false {
                         self.isStreamStalled = true
                         self.lastDisconnectReason = "Video stream stalled"
-                        if let device = self.lastConnectedDevice {
-                            Task { @MainActor in await self.reconnect(to: device) }
+                        if self.lastConnectedDevice != nil {
+                            self.requestReconnect(reason: "Video stream stalled")
                         }
                     }
                     return
@@ -860,8 +884,8 @@ class WebRTCManager: NSObject, ObservableObject {
                     if self.isStreamStalled == false {
                         self.isStreamStalled = true
                         self.lastDisconnectReason = "Video stream stalled"
-                        if let device = self.lastConnectedDevice {
-                            Task { @MainActor in await self.reconnect(to: device) }
+                        if self.lastConnectedDevice != nil {
+                            self.requestReconnect(reason: "Video stream stalled")
                         }
                     }
                     return
@@ -1207,6 +1231,17 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     func disconnect() {
+        tearDown(cancelReconnect: true)
+    }
+
+    private func tearDown(cancelReconnect: Bool) {
+        connectionGeneration += 1
+        signalingListenerTask?.cancel()
+        signalingListenerTask = nil
+        if cancelReconnect {
+            reconnectTask?.cancel()
+            reconnectTask = nil
+        }
         connectionTimer?.invalidate()
         connectionTimer = nil
 
@@ -1228,6 +1263,8 @@ class WebRTCManager: NSObject, ObservableObject {
         
         webSocketTask?.cancel()
         webSocketTask = nil
+        signalingSession?.invalidateAndCancel()
+        signalingSession = nil
         
         dataChannel?.close()
         dataChannel = nil
@@ -1358,12 +1395,8 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
                     lastDisconnectReason = "Video connection closed"
                     isConnecting = false
                 }
-                if stateChanged == .disconnected || stateChanged == .failed,
-                   let device = lastConnectedDevice {
-                    Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 750_000_000)
-                        await self.reconnect(to: device)
-                    }
+                if stateChanged == .disconnected || stateChanged == .failed {
+                    requestReconnect(reason: lastDisconnectReason ?? "Video connection lost", delayNanoseconds: 750_000_000)
                 }
             }
             print("ICE connection state changed: \(stateChanged)")

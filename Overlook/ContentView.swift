@@ -131,6 +131,12 @@ struct ContentView: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Label("Headless", systemImage: "eye")
                                 .font(.caption.weight(.semibold))
+                            Text("API: \(isConnected ? "Connected" : "Disconnected")")
+                                .font(.caption2)
+                            Text("HID: \(inputManager.hidStatus)")
+                                .font(.caption2)
+                            Text("Video: \(webRTCManager.isConnected ? "Connected" : (webRTCManager.isConnecting ? "Connecting" : "Disconnected"))")
+                                .font(.caption2)
                             Text(inputManager.activityStatus)
                                 .font(.caption2)
                             if let error = inputManager.lastInputError {
@@ -158,13 +164,6 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding()
                     .allowsHitTesting(false)
-            }
-
-            if controlMode == .codexHeadless {
-                CodexInputBridgeView()
-                    .frame(width: 2, height: 2)
-                    .opacity(0.001)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
             }
 
             if isFullscreen && !showingSettings && !showingConnections {
@@ -572,6 +571,7 @@ struct ContentView: View {
         }
         activeWindowMode = controlMode
         didApplyControlMode = true
+        NotificationCenter.default.post(name: .overlookControlModeChanged, object: controlMode.rawValue)
         if controlMode == .codexHeadless {
             inputManager.setLocalInputCaptureAllowed(false)
             isOCRModeEnabled = false
@@ -624,7 +624,13 @@ struct ContentView: View {
         Task {
             do {
                 try await inputManager.sendTextToRemote(value)
-                transferStatus = nil
+                transferStatus = "\(value.count) characters transferred"
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if transferStatus == "\(value.count) characters transferred" {
+                        transferStatus = nil
+                    }
+                }
             } catch {
                 transferStatus = error.localizedDescription
             }
@@ -700,49 +706,6 @@ struct ContentView: View {
         pausedCaptureKeyboardWasEnabled = nil
         pausedCaptureMouseWasEnabled = nil
         isInputCapturePausedForUI = false
-    }
-}
-
-private struct CodexInputBridgeView: View {
-    @EnvironmentObject private var inputManager: InputManager
-    @EnvironmentObject private var webRTCManager: WebRTCManager
-    @State private var text = ""
-    @State private var pixelX = "0"
-    @State private var pixelY = "0"
-
-    var body: some View {
-        VStack {
-            TextField("Codex text", text: $text)
-                .accessibilityLabel("Codex Bridge Text")
-            Button("Send Codex Text") {
-                let payload = text
-                Task {
-                    do {
-                        try await inputManager.sendTextToRemote(payload)
-                        if text == payload {
-                            text = ""
-                        }
-                    } catch {
-                        // Keep the payload visible for inspection and an explicit retry.
-                    }
-                }
-            }
-            .accessibilityLabel("Send Codex Bridge Text")
-            TextField("X", text: $pixelX)
-                .accessibilityLabel("Codex Bridge X")
-            TextField("Y", text: $pixelY)
-                .accessibilityLabel("Codex Bridge Y")
-            Button("Send Codex Click") {
-                guard let size = webRTCManager.videoSize,
-                      let x = Int(pixelX), let y = Int(pixelY),
-                      size.width > 1, size.height > 1 else { return }
-                let sx = Int(((Double(x) / Double(Int(size.width) - 1) * 2 - 1) * 32_767).rounded())
-                let sy = Int(((Double(y) / Double(Int(size.height) - 1) * 2 - 1) * 32_767).rounded())
-                Task { try? await inputManager.sendCodexClick(signedX: sx, signedY: sy) }
-            }
-            .accessibilityLabel("Send Codex Bridge Click")
-        }
-        .accessibilityElement(children: .contain)
     }
 }
 

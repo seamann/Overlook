@@ -2,6 +2,7 @@ import Foundation
 import Network
 import Combine
 import CryptoKit
+import Security
 
 @MainActor
 final class KVMDeviceManager: NSObject, ObservableObject {
@@ -53,7 +54,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         let port: Int
         let name: String
         let type: KVMDeviceType
-        let authToken: String
+        let authToken: String?
         let capabilities: Set<KVMCapability>
     }
     
@@ -130,6 +131,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
                     let uniqueDevices = self.removeDuplicates(from: allDevices)
                     await MainActor.run {
+                        guard self.scanGeneration == generation else { return }
                         let combined = self.removeDuplicates(from: pinnedDevices + uniqueDevices)
                         self.availableDevices = combined.sorted { $0.name < $1.name }
                     }
@@ -698,12 +700,13 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     private func persistDevice(_ device: KVMDevice) -> KVMDevice {
+        let tokenStored = device.authToken.isEmpty || KVMTokenStore.save(device.authToken, host: device.host, port: device.port)
         let record = PersistedDevice(
             host: device.host,
             port: device.port,
             name: device.name,
             type: device.type,
-            authToken: device.authToken,
+            authToken: tokenStored ? nil : device.authToken,
             capabilities: device.capabilities
         )
 
@@ -729,17 +732,27 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         guard !records.isEmpty else { return }
 
         let devices: [KVMDevice] = records.map { record in
-            KVMDevice(
+            let token = KVMTokenStore.load(host: record.host, port: record.port) ?? record.authToken ?? ""
+            if !token.isEmpty, record.authToken != nil {
+                _ = KVMTokenStore.save(token, host: record.host, port: record.port)
+            }
+            return KVMDevice(
                 id: savedDeviceId(host: record.host, port: record.port),
                 name: record.name,
                 host: record.host,
                 port: record.port,
                 type: record.type,
-                authToken: record.authToken,
+                authToken: token,
                 capabilities: record.capabilities
             )
         }
         availableDevices = removeDuplicates(from: devices).sorted { $0.name < $1.name }
+        if records.contains(where: { $0.authToken != nil }) {
+            writePersistedDevices(records.map {
+                let persisted = KVMTokenStore.load(host: $0.host, port: $0.port) != nil
+                return PersistedDevice(host: $0.host, port: $0.port, name: $0.name, type: $0.type, authToken: persisted ? nil : $0.authToken, capabilities: $0.capabilities)
+            })
+        }
     }
 
     private func savedDeviceId(host: String, port: Int) -> String {
@@ -817,6 +830,38 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         networkMonitor?.cancel()
         scanTimer?.invalidate()
         deviceDiscoverySessions.forEach { $0.cancel() }
+    }
+}
+
+private enum KVMTokenStore {
+    private static let service = "com.overlook.app.kvm-token"
+
+    private static func account(host: String, port: Int) -> String { "\(host):\(port)" }
+
+    @discardableResult
+    static func save(_ token: String, host: String, port: Int) -> Bool {
+        let account = account(host: host, port: port)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service,
+                                    kSecAttrAccount as String: account]
+        SecItemDelete(query as CFDictionary)
+        var item = query
+        item[kSecValueData as String] = Data(token.utf8)
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { return false }
+        return load(host: host, port: port) == token
+    }
+
+    static func load(host: String, port: Int) -> String? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
+                                    kSecAttrService as String: service,
+                                    kSecAttrAccount as String: account(host: host, port: port),
+                                    kSecReturnData as String: true,
+                                    kSecMatchLimit as String: kSecMatchLimitOne]
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
     }
 }
 

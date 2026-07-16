@@ -32,6 +32,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let ocrManager = OCRManager()
     let kvmDeviceManager = KVMDeviceManager()
     let localControlServer = LocalControlServer()
+    private var isTerminating = false
+    private var controlModeObserver: NSObjectProtocol?
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         // LaunchServices and the Dock can retain the generic icon for locally
@@ -51,7 +53,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
         menuBarAgent?.setup()
-        localControlServer.start(inputManager: inputManager)
+        localControlServer.setCommandGate {
+            let raw = UserDefaults.standard.string(forKey: "overlook.controlMode") ?? ""
+            let mode = OverlookControlMode(rawValue: raw) ?? .manual
+            return ControlMutationPolicy.allows(.mutation, in: mode)
+        }
+        let currentMode = OverlookControlMode(
+            rawValue: UserDefaults.standard.string(forKey: "overlook.controlMode") ?? ""
+        ) ?? .manual
+        if currentMode == .codexHeadless {
+            localControlServer.start(inputManager: inputManager)
+        }
+        controlModeObserver = NotificationCenter.default.addObserver(
+            forName: .overlookControlModeChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in
+                guard let self else { return }
+                let raw = note.object as? String ?? ""
+                self.localControlServer.stop()
+                if OverlookControlMode(rawValue: raw) == .codexHeadless {
+                    self.localControlServer.start(inputManager: self.inputManager)
+                }
+            }
+        }
         
         // Configure app for KVM control
         NSApp.setActivationPolicy(.regular)
@@ -68,8 +94,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !isTerminating else { return .terminateLater }
+        isTerminating = true
         menuBarAgent?.cleanup()
+        if let controlModeObserver {
+            NotificationCenter.default.removeObserver(controlModeObserver)
+            self.controlModeObserver = nil
+        }
         localControlServer.stop()
-        return .terminateNow
+        Task { @MainActor in
+            kvmDeviceManager.cancelScan()
+            await inputManager.shutdown()
+            webRTCManager.disconnect()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 }
