@@ -40,6 +40,7 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
+                        hidesLocalCursor: inputManager.isLocalInputCaptureAllowed && !isOCRModeEnabled,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
                             inputManager.handleVideoMouseMove(
@@ -256,12 +257,14 @@ struct VideoSurfaceView: View {
 #if canImport(WebRTC)
 struct VideoViewRepresentable: NSViewRepresentable {
     let videoView: RTCMTLNSVideoView
+    let hidesLocalCursor: Bool
     let onMouseMove: (CGPoint, CGSize) -> Void
     let onMouseButton: (MouseButton, Bool, CGPoint) -> Void
     let onScrollWheel: (CGFloat, CGFloat) -> Void
 
     func makeNSView(context: Context) -> TrackingContainerView {
         let container = TrackingContainerView()
+        container.hidesLocalCursor = hidesLocalCursor
         container.onMouseMove = onMouseMove
         container.onMouseButton = onMouseButton
         container.onScrollWheel = onScrollWheel
@@ -270,6 +273,7 @@ struct VideoViewRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: TrackingContainerView, context: Context) {
+        nsView.hidesLocalCursor = hidesLocalCursor
         nsView.onMouseMove = onMouseMove
         nsView.onMouseButton = onMouseButton
         nsView.onScrollWheel = onScrollWheel
@@ -283,6 +287,11 @@ final class TrackingContainerView: NSView {
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
 
     private var trackingAreaRef: NSTrackingArea?
+    private var isMouseInside = false
+    private var isCursorHidden = false
+    var hidesLocalCursor = false {
+        didSet { updateCursorVisibility() }
+    }
 
     private weak var embeddedVideoView: RTCMTLNSVideoView?
     private var embeddedConstraints: [NSLayoutConstraint] = []
@@ -304,6 +313,7 @@ final class TrackingContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        if window == nil { restoreCursorIfNeeded() }
     }
 
     override func updateTrackingAreas() {
@@ -317,10 +327,41 @@ final class TrackingContainerView: NSView {
             .activeInKeyWindow,
             .inVisibleRect,
             .mouseMoved,
+            .mouseEnteredAndExited,
         ]
         let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingAreaRef = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isMouseInside = true
+        updateCursorVisibility()
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isMouseInside = false
+        restoreCursorIfNeeded()
+    }
+
+    private func updateCursorVisibility() {
+        if hidesLocalCursor && isMouseInside {
+            guard !isCursorHidden else { return }
+            NSCursor.hide()
+            isCursorHidden = true
+        } else {
+            restoreCursorIfNeeded()
+        }
+    }
+
+    private func restoreCursorIfNeeded() {
+        guard isCursorHidden else { return }
+        NSCursor.unhide()
+        isCursorHidden = false
+    }
+
+    deinit {
+        restoreCursorIfNeeded()
     }
 
     func embedVideoViewIfNeeded(_ videoView: RTCMTLNSVideoView) {

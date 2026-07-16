@@ -125,36 +125,6 @@ struct ContentView: View {
                 .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
             }
 
-            if controlMode.showsObserverBadge {
-                VStack {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 3) {
-                            Label("Headless", systemImage: "eye")
-                                .font(.caption.weight(.semibold))
-                            Text("API: \(isConnected ? "Connected" : "Disconnected")")
-                                .font(.caption2)
-                            Text("HID: \(inputManager.hidStatus)")
-                                .font(.caption2)
-                            Text("Video: \(webRTCManager.isConnected ? "Connected" : (webRTCManager.isConnecting ? "Connecting" : "Disconnected"))")
-                                .font(.caption2)
-                            Text(inputManager.activityStatus)
-                                .font(.caption2)
-                            if let error = inputManager.lastInputError {
-                                Text(error).font(.caption2).foregroundStyle(.red)
-                            }
-                        }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(.ultraThinMaterial)
-                        .clipShape(Capsule())
-                        Spacer()
-                    }
-                    Spacer()
-                }
-                .padding(10)
-                .allowsHitTesting(false)
-            }
-
             if let transferStatus {
                 Text(transferStatus)
                     .font(.caption)
