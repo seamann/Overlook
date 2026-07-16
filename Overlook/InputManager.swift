@@ -40,6 +40,7 @@ class InputManager: ObservableObject {
     
     @Published var isKeyboardCaptureEnabled = false
     @Published var isMouseCaptureEnabled = false
+    @Published private(set) var isLocalInputCaptureAllowed = true
 
     enum TransportMode: String, CaseIterable {
         case webRTC
@@ -223,6 +224,10 @@ class InputManager: ObservableObject {
     }
     
     func startKeyboardCapture() {
+        guard isLocalInputCaptureAllowed else {
+            stopKeyboardCapture()
+            return
+        }
         guard keyEventMonitor == nil else {
             isCapturing = true
             isKeyboardCaptureEnabled = true
@@ -253,8 +258,21 @@ class InputManager: ObservableObject {
     }
     
     func startMouseCapture() {
+        guard isLocalInputCaptureAllowed else {
+            stopMouseCapture()
+            return
+        }
         isCapturing = true
         isMouseCaptureEnabled = true
+    }
+
+    func setLocalInputCaptureAllowed(_ allowed: Bool) {
+        isLocalInputCaptureAllowed = allowed
+        if allowed {
+            startFullInputCapture()
+        } else {
+            stopFullInputCapture()
+        }
     }
     
     func stopMouseCapture() {
@@ -432,6 +450,45 @@ class InputManager: ObservableObject {
             }
         }
     }
+
+    func sendTextToRemote(_ text: String) async throws {
+        guard let client = glkvmClient else {
+            throw RemoteTextInputError.notConnected
+        }
+
+        guard !text.isEmpty else {
+            throw RemoteTextInputError.emptyText
+        }
+
+        let keymap: String? = try? await client.getSystemConfig().keymap
+        try await client.hidPrint(text: text, keymap: keymap)
+    }
+
+    func sendCodexClick(signedX: Int, signedY: Int) async throws {
+        guard transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient else {
+            throw RemoteTextInputError.notConnected
+        }
+        let x = Self.clampInt(signedX, min: -32_767, max: 32_767)
+        let y = Self.clampInt(signedY, min: -32_767, max: 32_767)
+        try await ws.sendHidMouseMove(toX: x, toY: y)
+        try await ws.sendHidMouseButton(button: "left", state: true)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        try await ws.sendHidMouseButton(button: "left", state: false)
+    }
+
+    enum RemoteTextInputError: LocalizedError {
+        case notConnected
+        case emptyText
+
+        var errorDescription: String? {
+            switch self {
+            case .notConnected:
+                return "GLKVM input is not connected."
+            case .emptyText:
+                return "Enter text before sending."
+            }
+        }
+    }
     
     private func handleMouseEvent(_ event: NSEvent) {
         guard isMouseCaptureEnabled else { return }
@@ -500,7 +557,15 @@ class InputManager: ObservableObject {
            let key = glkvmKeyForMacKeyCode(event.keyCode),
            let ws = glkvmWebSocketClient {
             Task {
+                let isShiftKey = key == "ShiftLeft" || key == "ShiftRight"
+                let carriesSyntheticShift = !isShiftKey && event.modifiers.contains(.shift)
+                if event.isKeyDown && carriesSyntheticShift {
+                    try? await ws.sendHidKey(key: "ShiftLeft", state: true)
+                }
                 try? await ws.sendHidKey(key: key, state: event.isKeyDown)
+                if !event.isKeyDown && carriesSyntheticShift {
+                    try? await ws.sendHidKey(key: "ShiftLeft", state: false)
+                }
             }
             return
         }
@@ -982,6 +1047,10 @@ extension InputManager {
     }
     
     func startFullInputCapture() {
+        guard isLocalInputCaptureAllowed else {
+            stopFullInputCapture()
+            return
+        }
         startKeyboardCapture()
         startMouseCapture()
     }
@@ -1042,4 +1111,3 @@ extension InputManager {
         return true
     }
 }
-

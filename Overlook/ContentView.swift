@@ -14,6 +14,7 @@ struct ContentView: View {
     @State private var isShowingOCRResult = false
     @State private var showingSettings = false
     @State private var selectedText = ""
+    @State private var transferStatus: String?
 
     @State private var showingManualConnect = false
     @State private var manualHostPort = ""
@@ -42,6 +43,11 @@ struct ContentView: View {
     @State private var fullscreenHoverTask: Task<Void, Never>?
 
     @AppStorage("overlook.appAppearance") private var appAppearance: String = "system"
+    @AppStorage("overlook.controlMode") private var controlModeRawValue: String = OverlookControlMode.manual.rawValue
+
+    private var controlMode: OverlookControlMode {
+        OverlookControlMode(rawValue: controlModeRawValue) ?? .manual
+    }
 
     private var preferredColorScheme: ColorScheme? {
         switch appAppearance {
@@ -55,46 +61,22 @@ struct ContentView: View {
     }
 
     private var windowTitle: String {
-        let device = kvmDeviceManager.connectedDevice
+        guard controlMode == .codexHeadless else {
+            return ""
+        }
 
+        let device = kvmDeviceManager.connectedDevice
         let deviceLabel: String
         if let device {
-            if device.type == .glinetComet {
-                deviceLabel = "GLKVM"
-            } else {
-                deviceLabel = device.type.displayName
-            }
+            deviceLabel = device.type == .glinetComet ? "GLKVM" : device.type.displayName
         } else {
             deviceLabel = "Overlook"
         }
 
-        let connectionState: String
-        if device == nil || isConnected == false {
-            connectionState = "Disconnected"
-        } else {
-            connectionState = "Connected"
-        }
-
-        let resolution: String
-        if let size = webRTCManager.videoSize {
-            resolution = "\(Int(size.width))x\(Int(size.height))"
-        } else {
-            resolution = "—"
-        }
-
-        let kbps: String
-        if let value = webRTCManager.inboundVideoKbps {
-            kbps = "\(value) kbps"
-        } else {
-            kbps = "— kbps"
-        }
-
-        let fps: String
-        if let value = webRTCManager.inboundFps {
-            fps = "\(Int(value.rounded())) fps dynamic"
-        } else {
-            fps = "— fps dynamic"
-        }
+        let connectionState = device == nil || !isConnected ? "Disconnected" : "Connected"
+        let resolution = webRTCManager.videoSize.map { "\(Int($0.width))x\(Int($0.height))" } ?? "—"
+        let kbps = webRTCManager.inboundVideoKbps.map { "\($0) kbps" } ?? "— kbps"
+        let fps = webRTCManager.inboundFps.map { "\(Int($0.rounded())) fps dynamic" } ?? "— fps dynamic"
 
         return "Overlook - \(deviceLabel) / \(connectionState) / \(resolution) / \(kbps) / \(fps)"
     }
@@ -125,7 +107,7 @@ struct ContentView: View {
                     }
                 )
                 .ignoresSafeArea()
-                .allowsHitTesting(!showingSettings)
+                .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
             } else {
                 VideoSurfaceView(
                     isOCRModeEnabled: $isOCRModeEnabled,
@@ -138,7 +120,31 @@ struct ContentView: View {
                         }
                     }
                 )
-                .allowsHitTesting(!showingSettings)
+                .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
+            }
+
+            if controlMode.showsObserverBadge {
+                VStack {
+                    HStack {
+                        Label("Headless", systemImage: "eye")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(.ultraThinMaterial)
+                            .clipShape(Capsule())
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(10)
+                .allowsHitTesting(false)
+            }
+
+            if controlMode == .codexHeadless {
+                CodexInputBridgeView()
+                    .frame(width: 2, height: 2)
+                    .opacity(0.001)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
             }
 
             if isFullscreen && !showingSettings && !showingConnections {
@@ -281,6 +287,7 @@ struct ContentView: View {
             inputManager.setGLKVMClient(kvmDeviceManager.glkvmClient)
 
             updateInputCaptureForUIOverlays()
+            applyControlMode()
 
             if !didAutoOpenConnections, !isConnected {
                 didAutoOpenConnections = true
@@ -292,6 +299,9 @@ struct ContentView: View {
         }
         .onChange(of: showingConnections) { _, _ in
             updateInputCaptureForUIOverlays()
+        }
+        .onChange(of: controlModeRawValue) { _, _ in
+            applyControlMode()
         }
         .onChange(of: windowRef) { _, newValue in
             isFullscreen = newValue?.styleMask.contains(.fullScreen) ?? false
@@ -320,6 +330,7 @@ struct ContentView: View {
                     isConnected = true
                     DispatchQueue.main.async {
                         suppressDeviceAutoConnect = false
+                        applyControlMode()
                     }
                 } else {
                     isConnected = false
@@ -381,6 +392,14 @@ struct ContentView: View {
         .toolbar {
             if isFullscreen == false {
                 ToolbarItemGroup(placement: .automatic) {
+                    Picker("Control mode", selection: $controlModeRawValue) {
+                        ForEach(OverlookControlMode.allCases) { mode in
+                            Text(mode.title).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .help("Choose who controls the remote computer")
+
                     Button(action: { showingConnections.toggle() }) {
                         Image(systemName: "personalhotspot")
                     }
@@ -397,6 +416,12 @@ struct ContentView: View {
                     }
                     .disabled(!isConnected)
                     .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
+
+                    Button(action: { pasteMacClipboardToRemote() }) {
+                        Image(systemName: "doc.on.clipboard")
+                    }
+                    .disabled(!isConnected)
+                    .help("Paste Mac clipboard into the remote computer")
 
                     Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                         Image(systemName: "gearshape")
@@ -520,6 +545,48 @@ struct ContentView: View {
     }
 
     @MainActor
+    private func applyControlMode() {
+        if controlMode == .codexHeadless {
+            inputManager.setLocalInputCaptureAllowed(false)
+            isOCRModeEnabled = false
+            resizeForObserverMode()
+        } else {
+            inputManager.setLocalInputCaptureAllowed(true)
+        }
+    }
+
+    @MainActor
+    private func resizeForObserverMode() {
+        guard let window = windowRef ?? NSApp.keyWindow else { return }
+        let currentFrame = window.frame
+        let contentWidth: CGFloat = 640
+        let videoAspect = (webRTCManager.videoSize?.width ?? 16) / (webRTCManager.videoSize?.height ?? 9)
+        let contentHeight = contentWidth / max(videoAspect, 0.1)
+        let chromeWidth = currentFrame.width - window.contentLayoutRect.width
+        let chromeHeight = currentFrame.height - window.contentLayoutRect.height
+        var newFrame = currentFrame
+        newFrame.size = NSSize(width: contentWidth + chromeWidth, height: contentHeight + chromeHeight)
+        newFrame.origin.y += currentFrame.height - newFrame.height
+        window.setFrame(newFrame, display: true, animate: true)
+    }
+
+    @MainActor
+    private func pasteMacClipboardToRemote() {
+        guard let value = NSPasteboard.general.string(forType: .string), !value.isEmpty else {
+            transferStatus = "The Mac clipboard contains no text."
+            return
+        }
+        Task {
+            do {
+                try await inputManager.sendTextToRemote(value)
+                transferStatus = nil
+            } catch {
+                transferStatus = error.localizedDescription
+            }
+        }
+    }
+
+    @MainActor
     private func fitWindowToGuest() {
         guard let videoSize = webRTCManager.videoSize,
               videoSize.width > 0,
@@ -588,6 +655,49 @@ struct ContentView: View {
         pausedCaptureKeyboardWasEnabled = nil
         pausedCaptureMouseWasEnabled = nil
         isInputCapturePausedForUI = false
+    }
+}
+
+private struct CodexInputBridgeView: View {
+    @EnvironmentObject private var inputManager: InputManager
+    @EnvironmentObject private var webRTCManager: WebRTCManager
+    @State private var text = ""
+    @State private var pixelX = "0"
+    @State private var pixelY = "0"
+
+    var body: some View {
+        VStack {
+            TextField("Codex text", text: $text)
+                .accessibilityLabel("Codex Bridge Text")
+            Button("Send Codex Text") {
+                let payload = text
+                Task {
+                    do {
+                        try await inputManager.sendTextToRemote(payload)
+                        if text == payload {
+                            text = ""
+                        }
+                    } catch {
+                        // Keep the payload visible for inspection and an explicit retry.
+                    }
+                }
+            }
+            .accessibilityLabel("Send Codex Bridge Text")
+            TextField("X", text: $pixelX)
+                .accessibilityLabel("Codex Bridge X")
+            TextField("Y", text: $pixelY)
+                .accessibilityLabel("Codex Bridge Y")
+            Button("Send Codex Click") {
+                guard let size = webRTCManager.videoSize,
+                      let x = Int(pixelX), let y = Int(pixelY),
+                      size.width > 1, size.height > 1 else { return }
+                let sx = Int(((Double(x) / Double(Int(size.width) - 1) * 2 - 1) * 32_767).rounded())
+                let sy = Int(((Double(y) / Double(Int(size.height) - 1) * 2 - 1) * 32_767).rounded())
+                Task { try? await inputManager.sendCodexClick(signedX: sx, signedY: sy) }
+            }
+            .accessibilityLabel("Send Codex Bridge Click")
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 
