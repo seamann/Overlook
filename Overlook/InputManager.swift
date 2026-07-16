@@ -17,6 +17,8 @@ class InputManager: ObservableObject {
     private var mouseEventMonitor: Any?
     private var isCapturing = false
     private var mouseModeRefreshTask: Task<Void, Never>?
+    private var hidCommandTail: Task<Void, Never>?
+    private var hidReconnectTask: Task<Void, Never>?
 
     private struct PendingAbsoluteMouseMove {
         let toX: Int
@@ -41,6 +43,8 @@ class InputManager: ObservableObject {
     @Published var isKeyboardCaptureEnabled = false
     @Published var isMouseCaptureEnabled = false
     @Published private(set) var isLocalInputCaptureAllowed = true
+    @Published private(set) var activityStatus = "Ready"
+    @Published private(set) var lastInputError: String?
 
     enum TransportMode: String, CaseIterable {
         case webRTC
@@ -218,7 +222,13 @@ class InputManager: ObservableObject {
         stopMouseMoveSender()
         let ws = glkvmWebSocketClient
         glkvmWebSocketClient = nil
-        Task {
+        hidReconnectTask?.cancel()
+        hidReconnectTask = nil
+        enqueueHIDCommand(label: "Release inputs") {
+            try await ws?.releaseAllHIDInputs()
+        }
+        Task { [weak self] in
+            await self?.hidCommandTail?.value
             await ws?.disconnect()
         }
     }
@@ -271,6 +281,11 @@ class InputManager: ObservableObject {
         if allowed {
             startFullInputCapture()
         } else {
+            if let ws = glkvmWebSocketClient {
+                enqueueHIDCommand(label: "Local input released") {
+                    try await ws.releaseAllHIDInputs()
+                }
+            }
             stopFullInputCapture()
         }
     }
@@ -326,9 +341,9 @@ class InputManager: ObservableObject {
                     pendingCommandKeyCode = nil
                     commandKeySentToRemote = true
 
-                    Task {
-                        try? await ws.sendHidKey(key: metaKey, state: true)
-                        try? await ws.sendHidKey(key: keyName, state: true)
+                    enqueueHIDCommand(label: "Key combination") {
+                        try await ws.sendHidKey(key: metaKey, state: true)
+                        try await ws.sendHidKey(key: keyName, state: true)
                     }
                     return
                 }
@@ -404,8 +419,8 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient,
            let code = activeCommandKeyCode,
            let metaKey = glkvmKeyForMacKeyCode(code) {
-            Task {
-                try? await ws.sendHidKey(key: metaKey, state: false)
+            enqueueHIDCommand(label: "Modifier released") {
+                try await ws.sendHidKey(key: metaKey, state: false)
             }
         }
 
@@ -436,17 +451,15 @@ class InputManager: ObservableObject {
     }
 
     private func pasteClipboardToRemote() {
-        guard let client = glkvmClient else { return }
         guard let text = NSPasteboard.general.string(forType: .string) else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        guard !text.isEmpty else { return }
 
-        Task {
+        Task { [weak self] in
             do {
-                let keymap: String? = try? await client.getSystemConfig().keymap
-                try await client.hidPrint(text: trimmed, keymap: keymap)
+                try await self?.sendTextToRemote(text)
             } catch {
-                print("Paste to remote failed: \(error)")
+                self?.lastInputError = error.localizedDescription
+                self?.activityStatus = "Clipboard transfer failed"
             }
         }
     }
@@ -462,6 +475,8 @@ class InputManager: ObservableObject {
 
         let keymap: String? = try? await client.getSystemConfig().keymap
         try await client.hidPrint(text: text, keymap: keymap)
+        activityStatus = "Text sent (\(text.count) characters)"
+        lastInputError = nil
     }
 
     func sendCodexClick(signedX: Int, signedY: Int) async throws {
@@ -556,15 +571,15 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket,
            let key = glkvmKeyForMacKeyCode(event.keyCode),
            let ws = glkvmWebSocketClient {
-            Task {
+            enqueueHIDCommand(label: event.isKeyDown ? "Key down" : "Key up") {
                 let isShiftKey = key == "ShiftLeft" || key == "ShiftRight"
                 let carriesSyntheticShift = !isShiftKey && event.modifiers.contains(.shift)
                 if event.isKeyDown && carriesSyntheticShift {
-                    try? await ws.sendHidKey(key: "ShiftLeft", state: true)
+                    try await ws.sendHidKey(key: "ShiftLeft", state: true)
                 }
-                try? await ws.sendHidKey(key: key, state: event.isKeyDown)
+                try await ws.sendHidKey(key: key, state: event.isKeyDown)
                 if !event.isKeyDown && carriesSyntheticShift {
-                    try? await ws.sendHidKey(key: "ShiftLeft", state: false)
+                    try await ws.sendHidKey(key: "ShiftLeft", state: false)
                 }
             }
             return
@@ -589,11 +604,11 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient {
             let shouldMove = isGLKVMAbsoluteMouseMode && isNormalized(event.position)
             let absolutePoint = shouldMove ? glkvmAbsolutePoint(fromNormalized: event.position) : nil
-            Task {
+            enqueueHIDCommand(label: event.isDown ? "Mouse down" : "Mouse up") {
                 if let absolutePoint {
-                    try? await ws.sendHidMouseMove(toX: absolutePoint.0, toY: absolutePoint.1)
+                    try await ws.sendHidMouseMove(toX: absolutePoint.0, toY: absolutePoint.1)
                 }
-                try? await ws.sendHidMouseButton(button: button, state: event.isDown)
+                try await ws.sendHidMouseButton(button: button, state: event.isDown)
             }
             return
         }
@@ -615,8 +630,8 @@ class InputManager: ObservableObject {
     private func sendMouseMoveEvent(_ event: MouseMoveEvent) {
         if transportMode == .glkvmWebSocket, isGLKVMAbsoluteMouseMode, isNormalized(event.position), let ws = glkvmWebSocketClient {
             let (toX, toY) = glkvmAbsolutePoint(fromNormalized: event.position)
-            Task {
-                try? await ws.sendHidMouseMove(toX: toX, toY: toY)
+            enqueueHIDCommand(label: "Mouse move") {
+                try await ws.sendHidMouseMove(toX: toX, toY: toY)
             }
             return
         }
@@ -649,8 +664,8 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient {
             let dx = Self.clampInt(Int(event.deltaX.rounded()), min: -127, max: 127)
             let dy = Self.clampInt(Int(event.deltaY.rounded()), min: -127, max: 127)
-            Task {
-                try? await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy)
+            enqueueHIDCommand(label: "Mouse wheel") {
+                try await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy)
             }
             return
         }
@@ -784,10 +799,50 @@ class InputManager: ObservableObject {
             return
         }
 
-        if glkvmWebSocketClient == nil {
+        let connected = await glkvmWebSocketClient?.isConnected ?? false
+        let connecting = await glkvmWebSocketClient?.isConnecting ?? false
+        if !connected && !connecting {
+            await glkvmWebSocketClient?.disconnect()
             let ws = try? client.makeWebSocketClient(stream: false)
             glkvmWebSocketClient = ws
             await ws?.connect()
+            activityStatus = ws == nil ? "HID connection failed" : "HID connecting"
+        }
+    }
+
+    private func enqueueHIDCommand(
+        label: String,
+        operation: @escaping @Sendable () async throws -> Void
+    ) {
+        let predecessor = hidCommandTail
+        hidCommandTail = Task { [weak self] in
+            await predecessor?.value
+            guard !Task.isCancelled else { return }
+            do {
+                try await operation()
+                self?.activityStatus = label
+                self?.lastInputError = nil
+            } catch {
+                self?.lastInputError = error.localizedDescription
+                self?.activityStatus = "Input interrupted; reconnecting"
+                self?.scheduleHIDReconnect()
+            }
+        }
+    }
+
+    private func scheduleHIDReconnect() {
+        guard hidReconnectTask == nil else { return }
+        hidReconnectTask = Task { [weak self] in
+            for delay in [250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000] as [UInt64] {
+                guard !Task.isCancelled, let self else { return }
+                try? await Task.sleep(nanoseconds: delay)
+                await self.reconnectGLKVMWebSocketIfNeeded()
+                if await self.glkvmWebSocketClient?.isConnected == true {
+                    self.hidReconnectTask = nil
+                    return
+                }
+            }
+            self?.hidReconnectTask = nil
         }
     }
 

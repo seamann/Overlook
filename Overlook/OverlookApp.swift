@@ -31,6 +31,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let inputManager = InputManager()
     let ocrManager = OCRManager()
     let kvmDeviceManager = KVMDeviceManager()
+    let localControlServer = LocalControlServer()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         menuBarAgent = MenuBarAgent(
@@ -42,6 +43,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         )
         menuBarAgent?.setup()
+        localControlServer.start(inputManager: inputManager)
         
         // Configure app for KVM control
         NSApp.setActivationPolicy(.regular)
@@ -59,6 +61,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         menuBarAgent?.cleanup()
+        localControlServer.stop()
         return .terminateNow
     }
 }

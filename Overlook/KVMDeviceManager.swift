@@ -14,6 +14,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     
     private var networkMonitor: NWPathMonitor?
     private var scanTimer: Timer?
+    private var scanTask: Task<Void, Never>?
+    private var scanGeneration = 0
     private var deviceDiscoverySessions: [NWBrowser] = []
 
     private final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
@@ -76,7 +78,11 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     func scanForDevices() {
-        guard !isScanning else { return }
+        scanTask?.cancel()
+        scanTimer?.invalidate()
+        scanTimer = nil
+        scanGeneration += 1
+        let generation = scanGeneration
         
         isScanning = true
         scanProgress = 0.0
@@ -84,7 +90,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         availableDevices = pinnedDevices
         
         // Start multiple discovery methods
-        Task {
+        scanTask = Task { [weak self] in
+            guard let self else { return }
             await withTaskGroup(of: [KVMDevice].self) { group in
                 // GL.iNet Comet discovery
                 group.addTask {
@@ -118,6 +125,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 }
 
                 for await devices in group {
+                    guard !Task.isCancelled else { group.cancelAll(); return }
                     allDevices.append(contentsOf: devices)
 
                     let uniqueDevices = self.removeDuplicates(from: allDevices)
@@ -128,6 +136,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 }
 
                 await MainActor.run {
+                    guard self.scanGeneration == generation else { return }
                     self.isScanning = false
                     self.scanProgress = 1.0
                     self.scanTimer?.invalidate()
@@ -144,6 +153,15 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    func cancelScan() {
+        scanGeneration += 1
+        scanTask?.cancel()
+        scanTask = nil
+        scanTimer?.invalidate()
+        scanTimer = nil
+        isScanning = false
     }
     
     private func discoverGLiNetDevices() async -> [KVMDevice] {
@@ -795,6 +813,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     deinit {
+        scanTask?.cancel()
         networkMonitor?.cancel()
         scanTimer?.invalidate()
         deviceDiscoverySessions.forEach { $0.cancel() }

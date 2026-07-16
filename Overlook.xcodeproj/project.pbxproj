@@ -30,6 +30,8 @@
 		0100001E /* WebRTCAudioDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200001D /* WebRTCAudioDevice.swift */; };
 		0100001F /* WebRTCFactoryBuilder.m in Sources */ = {isa = PBXBuildFile; fileRef = 02000021 /* WebRTCFactoryBuilder.m */; };
 		01000020 /* ControlMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000022 /* ControlMode.swift */; };
+		01000021 /* ReliabilityPolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000023 /* ReliabilityPolicies.swift */; };
+		01000022 /* LocalControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000024 /* LocalControlServer.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -59,6 +61,8 @@
 		02000020 /* WebRTCFactoryBuilder.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = WebRTCFactoryBuilder.h; sourceTree = "<group>"; };
 		02000021 /* WebRTCFactoryBuilder.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WebRTCFactoryBuilder.m; sourceTree = "<group>"; };
 		02000022 /* ControlMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlMode.swift; sourceTree = "<group>"; };
+		02000023 /* ReliabilityPolicies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReliabilityPolicies.swift; sourceTree = "<group>"; };
+		02000024 /* LocalControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalControlServer.swift; sourceTree = "<group>"; };
 		03000001 /* Overlook.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Overlook.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -88,6 +92,8 @@
 				02000001 /* OverlookApp.swift */,
 				02000002 /* ContentView.swift */,
 				02000022 /* ControlMode.swift */,
+				02000023 /* ReliabilityPolicies.swift */,
+				02000024 /* LocalControlServer.swift */,
 				02000019 /* ContentControlBar.swift */,
 				0200001A /* VideoSurfaceView.swift */,
 				0200001B /* StatusBarView.swift */,
@@ -202,6 +208,8 @@
 				01000001 /* OverlookApp.swift in Sources */,
 				01000002 /* ContentView.swift in Sources */,
 				01000020 /* ControlMode.swift in Sources */,
+				01000021 /* ReliabilityPolicies.swift in Sources */,
+				01000022 /* LocalControlServer.swift in Sources */,
 				0100001A /* ContentControlBar.swift in Sources */,
 				0100001B /* VideoSurfaceView.swift in Sources */,
 				0100001C /* StatusBarView.swift in Sources */,

@@ -150,6 +150,7 @@ class WebRTCManager: NSObject, ObservableObject {
     private var janusAudioHandleId: Int?
     private var janusKeepAliveTimer: Timer?
     private var janusWaiters: [String: CheckedContinuation<[String: Any], Error>] = [:]
+    private var janusTimeoutTasks: [String: Task<Void, Never>] = [:]
 
     private var isFrameCaptureEnabled: Bool = false
     private var lastFrameCaptureTime: CFTimeInterval = 0
@@ -554,7 +555,10 @@ class WebRTCManager: NSObject, ObservableObject {
                 do {
                     try await self.sendJanusKeepAlive()
                 } catch {
-                    // Ignore keepalive errors, next user action will reconnect
+                    self.lastDisconnectReason = "Signaling keepalive failed"
+                    if let device = self.lastConnectedDevice {
+                        await self.reconnect(to: device)
+                    }
                 }
             }
         }
@@ -608,6 +612,13 @@ class WebRTCManager: NSObject, ObservableObject {
     private func waitForJanusTransaction(_ transaction: String) async throws -> [String: Any] {
         try await withCheckedThrowingContinuation { continuation in
             janusWaiters[transaction] = continuation
+            janusTimeoutTasks[transaction] = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard !Task.isCancelled, let self,
+                      let waiter = self.janusWaiters.removeValue(forKey: transaction) else { return }
+                self.janusTimeoutTasks.removeValue(forKey: transaction)
+                waiter.resume(throwing: WebRTCError.signalingTimeout)
+            }
         }
     }
 
@@ -647,6 +658,12 @@ class WebRTCManager: NSObject, ObservableObject {
                 if isConnected || hasEverConnectedToStream || lastDisconnectReason == nil {
                     lastDisconnectReason = "Signaling connection lost"
                 }
+                if let device = lastConnectedDevice {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        await self.reconnect(to: device)
+                    }
+                }
                 break
             }
         }
@@ -677,6 +694,7 @@ class WebRTCManager: NSObject, ObservableObject {
     private func handleJanusMessage(_ message: [String: Any]) async {
         if let transaction = message["transaction"] as? String,
            let waiter = janusWaiters.removeValue(forKey: transaction) {
+            janusTimeoutTasks.removeValue(forKey: transaction)?.cancel()
             waiter.resume(returning: message)
             return
         }
@@ -829,6 +847,9 @@ class WebRTCManager: NSObject, ObservableObject {
                     if self.isStreamStalled == false {
                         self.isStreamStalled = true
                         self.lastDisconnectReason = "Video stream stalled"
+                        if let device = self.lastConnectedDevice {
+                            Task { @MainActor in await self.reconnect(to: device) }
+                        }
                     }
                     return
                 }
@@ -839,6 +860,9 @@ class WebRTCManager: NSObject, ObservableObject {
                     if self.isStreamStalled == false {
                         self.isStreamStalled = true
                         self.lastDisconnectReason = "Video stream stalled"
+                        if let device = self.lastConnectedDevice {
+                            Task { @MainActor in await self.reconnect(to: device) }
+                        }
                     }
                     return
                 }
@@ -1196,6 +1220,8 @@ class WebRTCManager: NSObject, ObservableObject {
         janusAudioHandleId = nil
         let waiters = janusWaiters
         janusWaiters.removeAll()
+        janusTimeoutTasks.values.forEach { $0.cancel() }
+        janusTimeoutTasks.removeAll()
         for (_, waiter) in waiters {
             waiter.resume(throwing: WebRTCError.signalingConnectionLost)
         }
@@ -1331,6 +1357,13 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
                 } else if stateChanged == .closed {
                     lastDisconnectReason = "Video connection closed"
                     isConnecting = false
+                }
+                if stateChanged == .disconnected || stateChanged == .failed,
+                   let device = lastConnectedDevice {
+                    Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 750_000_000)
+                        await self.reconnect(to: device)
+                    }
                 }
             }
             print("ICE connection state changed: \(stateChanged)")
@@ -1494,6 +1527,7 @@ enum WebRTCError: Error {
     case factoryNotInitialized
     case invalidSignalingURL
     case signalingConnectionLost
+    case signalingTimeout
     case peerConnectionFailed
 }
 

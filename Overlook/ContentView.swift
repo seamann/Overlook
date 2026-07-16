@@ -41,6 +41,8 @@ struct ContentView: View {
     @State private var isFullscreen: Bool = false
     @State private var showFullscreenControls: Bool = false
     @State private var fullscreenHoverTask: Task<Void, Never>?
+    @State private var activeWindowMode: OverlookControlMode = .manual
+    @State private var didApplyControlMode = false
 
     @AppStorage("overlook.appAppearance") private var appAppearance: String = "system"
     @AppStorage("overlook.controlMode") private var controlModeRawValue: String = OverlookControlMode.manual.rawValue
@@ -126,18 +128,36 @@ struct ContentView: View {
             if controlMode.showsObserverBadge {
                 VStack {
                     HStack {
-                        Label("Headless", systemImage: "eye")
-                            .font(.caption.weight(.semibold))
+                        VStack(alignment: .leading, spacing: 3) {
+                            Label("Headless", systemImage: "eye")
+                                .font(.caption.weight(.semibold))
+                            Text(inputManager.activityStatus)
+                                .font(.caption2)
+                            if let error = inputManager.lastInputError {
+                                Text(error).font(.caption2).foregroundStyle(.red)
+                            }
+                        }
                             .padding(.horizontal, 10)
                             .padding(.vertical, 6)
                             .background(.ultraThinMaterial)
-                            .clipShape(Capsule())
+                        .clipShape(Capsule())
                         Spacer()
                     }
                     Spacer()
                 }
                 .padding(10)
                 .allowsHitTesting(false)
+            }
+
+            if let transferStatus {
+                Text(transferStatus)
+                    .font(.caption)
+                    .padding(8)
+                    .background(.ultraThinMaterial)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                    .padding()
+                    .allowsHitTesting(false)
             }
 
             if controlMode == .codexHeadless {
@@ -546,12 +566,37 @@ struct ContentView: View {
 
     @MainActor
     private func applyControlMode() {
+        let window = windowRef ?? NSApp.keyWindow
+        if didApplyControlMode, let window {
+            UserDefaults.standard.set(NSStringFromRect(window.frame), forKey: WindowFramePersistence.key(for: activeWindowMode))
+        }
+        activeWindowMode = controlMode
+        didApplyControlMode = true
         if controlMode == .codexHeadless {
             inputManager.setLocalInputCaptureAllowed(false)
             isOCRModeEnabled = false
-            resizeForObserverMode()
+            restoreWindowFrame(for: controlMode, fallbackToObserverSize: true)
         } else {
             inputManager.setLocalInputCaptureAllowed(true)
+            restoreWindowFrame(for: controlMode, fallbackToObserverSize: false)
+        }
+    }
+
+    @MainActor
+    private func restoreWindowFrame(for mode: OverlookControlMode, fallbackToObserverSize: Bool) {
+        guard let window = windowRef ?? NSApp.keyWindow else { return }
+        let key = WindowFramePersistence.key(for: mode)
+        if let value = UserDefaults.standard.string(forKey: key) {
+            var frame = NSRectFromString(value)
+            if let visible = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame {
+                frame.size.width = min(max(frame.width, 480), visible.width)
+                frame.size.height = min(max(frame.height, 320), visible.height)
+                frame.origin.x = min(max(frame.minX, visible.minX), visible.maxX - frame.width)
+                frame.origin.y = min(max(frame.minY, visible.minY), visible.maxY - frame.height)
+            }
+            window.setFrame(frame, display: true, animate: true)
+        } else if fallbackToObserverSize {
+            resizeForObserverMode()
         }
     }
 

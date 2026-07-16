@@ -1062,6 +1062,8 @@ extension GLKVMClient {
         private var task: URLSessionWebSocketTask?
         private var receiveTask: Task<Void, Never>?
         private var pingTask: Task<Void, Never>?
+        private(set) var isConnected = false
+        private(set) var isConnecting = false
 
         init(session: URLSession, request: URLRequest) {
             self.session = session
@@ -1078,6 +1080,7 @@ extension GLKVMClient {
             guard task == nil else { return }
             let ws = session.webSocketTask(with: request)
             task = ws
+            isConnecting = true
             ws.resume()
 
             receiveTask = Task { [weak self] in
@@ -1090,7 +1093,12 @@ extension GLKVMClient {
                 while !Task.isCancelled {
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
                     if Task.isCancelled { break }
-                    try? await self.send(eventType: "ping")
+                    do {
+                        try await self.send(eventType: "ping")
+                    } catch {
+                        await self.markDisconnected()
+                        break
+                    }
                 }
             }
         }
@@ -1104,6 +1112,8 @@ extension GLKVMClient {
 
             task?.cancel(with: .goingAway, reason: nil)
             task = nil
+            isConnected = false
+            isConnecting = false
 
             continuation.finish()
         }
@@ -1131,6 +1141,8 @@ extension GLKVMClient {
                 throw WebSocketError.notConnected
             }
             try await task.send(.data(data))
+            isConnecting = false
+            isConnected = true
         }
 
         func sendHidKey(key: String, state: Bool, finish: Bool = false) async throws {
@@ -1145,6 +1157,26 @@ extension GLKVMClient {
                 let finishPayload = Data([0x01, 0x00])
                 try await sendBinary(finishPayload)
             }
+        }
+
+        func releaseAllHIDInputs() async throws {
+            // GLKVM's empty key-up packet clears the keyboard report. Explicit
+            // button-up packets prevent a lost mouse-up from surviving a reconnect.
+            try await sendBinary(Data([0x01, 0x00]))
+            try await sendHidMouseButton(button: "left", state: false)
+            try await sendHidMouseButton(button: "right", state: false)
+            try await sendHidMouseButton(button: "middle", state: false)
+        }
+
+        private func markDisconnected() {
+            receiveTask?.cancel()
+            receiveTask = nil
+            pingTask?.cancel()
+            pingTask = nil
+            task?.cancel()
+            task = nil
+            isConnected = false
+            isConnecting = false
         }
 
         func sendHidMouseButton(button: String, state: Bool) async throws {
@@ -1215,6 +1247,7 @@ extension GLKVMClient {
                         break
                     }
                 } catch {
+                    markDisconnected()
                     break
                 }
             }
