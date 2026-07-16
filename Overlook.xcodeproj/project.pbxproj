@@ -364,7 +364,7 @@
 				CODE_SIGN_ENTITLEMENTS = Overlook/Overlook.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "\"Overlook/Preview Content\"";
 				DEVELOPMENT_TEAM = "";
@@ -399,7 +399,7 @@
 				CODE_SIGN_ENTITLEMENTS = Overlook/Overlook.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 2;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_ASSET_PATHS = "\"Overlook/Preview Content\"";
 				DEVELOPMENT_TEAM = "";

@@ -34,6 +34,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let localControlServer = LocalControlServer()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // LaunchServices and the Dock can retain the generic icon for locally
+        // replaced development builds. Set the compiled bundle icon explicitly
+        // so the running application always uses the WAGO monitor artwork.
+        if let iconPath = Bundle.main.path(forResource: "AppIcon", ofType: "icns"),
+           let icon = NSImage(contentsOfFile: iconPath) {
+            NSApp.applicationIconImage = icon
+        }
+
         menuBarAgent = MenuBarAgent(
             kvmDeviceManager: kvmDeviceManager,
             webRTCManager: webRTCManager,
