@@ -417,6 +417,12 @@ struct ContentView: View {
                     }
                     .disabled(!isConnected)
                     .help("Settings")
+
+                    Button(role: .destructive, action: { NSApp.terminate(nil) }) {
+                        Image(systemName: "power")
+                    }
+                    .help("Quit Overlook")
+                    .accessibilityLabel("Quit Overlook")
                 }
             }
         }
