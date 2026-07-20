@@ -287,11 +287,21 @@ final class TrackingContainerView: NSView {
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
 
     private var trackingAreaRef: NSTrackingArea?
-    private var isMouseInside = false
-    private var isCursorHidden = false
     var hidesLocalCursor = false {
-        didSet { updateCursorVisibility() }
+        didSet {
+            guard oldValue != hidesLocalCursor else { return }
+            window?.invalidateCursorRects(for: self)
+        }
     }
+
+    private static let invisibleCursor: NSCursor = {
+        let image = NSImage(size: NSSize(width: 1, height: 1))
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(x: 0, y: 0, width: 1, height: 1).fill()
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: .zero)
+    }()
 
     private weak var embeddedVideoView: RTCMTLNSVideoView?
     private var embeddedConstraints: [NSLayoutConstraint] = []
@@ -313,7 +323,12 @@ final class TrackingContainerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
-        if window == nil { restoreCursorIfNeeded() }
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: hidesLocalCursor ? Self.invisibleCursor : .arrow)
     }
 
     override func updateTrackingAreas() {
@@ -327,41 +342,10 @@ final class TrackingContainerView: NSView {
             .activeInKeyWindow,
             .inVisibleRect,
             .mouseMoved,
-            .mouseEnteredAndExited,
         ]
         let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingAreaRef = area
-    }
-
-    override func mouseEntered(with event: NSEvent) {
-        isMouseInside = true
-        updateCursorVisibility()
-    }
-
-    override func mouseExited(with event: NSEvent) {
-        isMouseInside = false
-        restoreCursorIfNeeded()
-    }
-
-    private func updateCursorVisibility() {
-        if hidesLocalCursor && isMouseInside {
-            guard !isCursorHidden else { return }
-            NSCursor.hide()
-            isCursorHidden = true
-        } else {
-            restoreCursorIfNeeded()
-        }
-    }
-
-    private func restoreCursorIfNeeded() {
-        guard isCursorHidden else { return }
-        NSCursor.unhide()
-        isCursorHidden = false
-    }
-
-    deinit {
-        restoreCursorIfNeeded()
     }
 
     func embedVideoViewIfNeeded(_ videoView: RTCMTLNSVideoView) {
