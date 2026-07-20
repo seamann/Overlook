@@ -17,6 +17,7 @@ struct VideoSurfaceView: View {
     @Binding var isShowingOCRResult: Bool
 
     let onReconnect: () -> Void
+    let hidesLocalCursor: Bool
 
     @State private var ocrDragStart: CGPoint?
     @State private var ocrDragCurrent: CGPoint?
@@ -40,7 +41,7 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
-                        hidesLocalCursor: inputManager.isMouseCaptureEnabled && !isOCRModeEnabled,
+                        hidesLocalCursor: hidesLocalCursor,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
                             inputManager.handleVideoMouseMove(
@@ -282,48 +283,142 @@ struct VideoViewRepresentable: NSViewRepresentable {
 }
 
 final class TrackingContainerView: NSView {
+    var onMouseMove: ((CGPoint, CGSize) -> Void)? {
+        get { inputSurface.onMouseMove }
+        set { inputSurface.onMouseMove = newValue }
+    }
+    var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)? {
+        get { inputSurface.onMouseButton }
+        set { inputSurface.onMouseButton = newValue }
+    }
+    var onScrollWheel: ((CGFloat, CGFloat) -> Void)? {
+        get { inputSurface.onScrollWheel }
+        set { inputSurface.onScrollWheel = newValue }
+    }
+    var hidesLocalCursor: Bool {
+        get { inputSurface.hidesLocalCursor }
+        set { inputSurface.hidesLocalCursor = newValue }
+    }
+
+    private weak var embeddedVideoView: RTCMTLNSVideoView?
+    private var embeddedConstraints: [NSLayoutConstraint] = []
+    private let inputSurface = RemoteInputSurfaceView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        configureInputSurface()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureInputSurface()
+    }
+
+    private func configureInputSurface() {
+        wantsLayer = true
+        inputSurface.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(inputSurface)
+        NSLayoutConstraint.activate([
+            inputSurface.leadingAnchor.constraint(equalTo: leadingAnchor),
+            inputSurface.trailingAnchor.constraint(equalTo: trailingAnchor),
+            inputSurface.topAnchor.constraint(equalTo: topAnchor),
+            inputSurface.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    func embedVideoViewIfNeeded(_ videoView: RTCMTLNSVideoView) {
+        guard embeddedVideoView !== videoView else { return }
+
+        if !embeddedConstraints.isEmpty {
+            NSLayoutConstraint.deactivate(embeddedConstraints)
+            embeddedConstraints.removeAll()
+        }
+
+        embeddedVideoView?.removeFromSuperview()
+        embeddedVideoView = videoView
+
+        videoView.removeFromSuperview()
+        addSubview(videoView, positioned: .below, relativeTo: inputSurface)
+
+        videoView.translatesAutoresizingMaskIntoConstraints = false
+        embeddedConstraints = [
+            videoView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            videoView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            videoView.topAnchor.constraint(equalTo: topAnchor),
+            videoView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(embeddedConstraints)
+    }
+}
+
+/// Topmost, transparent owner of local mouse input. Keeping this separate from
+/// the WebRTC renderer prevents AppKit from restoring the renderer's cursor
+/// after a click or a cursor-rectangle rebuild.
+final class RemoteInputSurfaceView: NSView {
     var onMouseMove: ((CGPoint, CGSize) -> Void)?
     var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)?
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
 
-    private var trackingAreaRef: NSTrackingArea?
     var hidesLocalCursor = false {
         didSet {
             guard oldValue != hidesLocalCursor else { return }
             window?.invalidateCursorRects(for: self)
+            refreshPointerState()
         }
     }
 
+    private var trackingAreaRef: NSTrackingArea?
+    private var notificationObservers: [NSObjectProtocol] = []
+    private var isMouseInside = false
+    private var ownsCursorHideLease = false
+
     private static let invisibleCursor: NSCursor = {
-        let image = NSImage(size: NSSize(width: 1, height: 1))
+        let image = NSImage(size: NSSize(width: 16, height: 16))
         image.lockFocus()
         NSColor.clear.setFill()
-        NSRect(x: 0, y: 0, width: 1, height: 1).fill()
+        NSRect(x: 0, y: 0, width: 16, height: 16).fill()
         image.unlockFocus()
         return NSCursor(image: image, hotSpot: .zero)
     }()
 
-    private weak var embeddedVideoView: RTCMTLNSVideoView?
-    private var embeddedConstraints: [NSLayoutConstraint] = []
-
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     required init?(coder: NSCoder) {
         super.init(coder: coder)
         wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    deinit {
+        removeNotificationObservers()
+        forceShowCursor()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        self
+        guard !isHidden, alphaValue > 0, bounds.contains(point) else { return nil }
+        return self
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        removeNotificationObservers()
+        forceShowCursor()
+        super.viewWillMove(toWindow: newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        installNotificationObservers()
         window?.invalidateCursorRects(for: self)
+        refreshPointerState()
     }
 
     override func resetCursorRects() {
@@ -342,98 +437,85 @@ final class TrackingContainerView: NSView {
             .activeInKeyWindow,
             .inVisibleRect,
             .mouseMoved,
+            .mouseEnteredAndExited,
+            .enabledDuringMouseDrag,
+            .cursorUpdate,
         ]
         let area = NSTrackingArea(rect: .zero, options: options, owner: self, userInfo: nil)
         addTrackingArea(area)
         trackingAreaRef = area
     }
 
-    func embedVideoViewIfNeeded(_ videoView: RTCMTLNSVideoView) {
-        guard embeddedVideoView !== videoView else { return }
+    override func cursorUpdate(with event: NSEvent) {
+        updatePointerState(with: event)
+    }
 
-        if !embeddedConstraints.isEmpty {
-            NSLayoutConstraint.deactivate(embeddedConstraints)
-            embeddedConstraints.removeAll()
+    override func mouseEntered(with event: NSEvent) {
+        updatePointerState(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshPointerState()
         }
-
-        embeddedVideoView?.removeFromSuperview()
-        embeddedVideoView = videoView
-
-        videoView.removeFromSuperview()
-        addSubview(videoView)
-
-        videoView.translatesAutoresizingMaskIntoConstraints = false
-        embeddedConstraints = [
-            videoView.leadingAnchor.constraint(equalTo: leadingAnchor),
-            videoView.trailingAnchor.constraint(equalTo: trailingAnchor),
-            videoView.topAnchor.constraint(equalTo: topAnchor),
-            videoView.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ]
-        NSLayoutConstraint.activate(embeddedConstraints)
     }
 
     override func mouseMoved(with event: NSEvent) {
-        super.mouseMoved(with: event)
+        updatePointerState(with: event)
         emitMouseMove(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
-        super.mouseDown(with: event)
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.left, true, flipped)
+        emitMouseButton(.left, isPressed: true, event: event)
     }
 
     override func mouseUp(with event: NSEvent) {
-        super.mouseUp(with: event)
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.left, false, flipped)
+        emitMouseButton(.left, isPressed: false, event: event)
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        super.rightMouseDown(with: event)
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.right, true, flipped)
+        emitMouseButton(.right, isPressed: true, event: event)
     }
 
     override func rightMouseUp(with event: NSEvent) {
-        super.rightMouseUp(with: event)
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.right, false, flipped)
+        emitMouseButton(.right, isPressed: false, event: event)
     }
 
     override func otherMouseDown(with event: NSEvent) {
-        super.otherMouseDown(with: event)
         guard event.buttonNumber == 2 else { return }
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.middle, true, flipped)
+        emitMouseButton(.middle, isPressed: true, event: event)
     }
 
     override func otherMouseUp(with event: NSEvent) {
-        super.otherMouseUp(with: event)
         guard event.buttonNumber == 2 else { return }
-        let p = convert(event.locationInWindow, from: nil)
-        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(.middle, false, flipped)
+        emitMouseButton(.middle, isPressed: false, event: event)
     }
 
     override func mouseDragged(with event: NSEvent) {
-        super.mouseDragged(with: event)
+        updatePointerState(with: event)
         emitMouseMove(with: event)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        super.rightMouseDragged(with: event)
+        updatePointerState(with: event)
+        emitMouseMove(with: event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        updatePointerState(with: event)
         emitMouseMove(with: event)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        super.scrollWheel(with: event)
+        updatePointerState(with: event)
         onScrollWheel?(event.scrollingDeltaX, event.scrollingDeltaY)
+    }
+
+    private func emitMouseButton(_ button: MouseButton, isPressed: Bool, event: NSEvent) {
+        updatePointerState(with: event)
+        let p = convert(event.locationInWindow, from: nil)
+        let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
+        onMouseButton?(button, isPressed, flipped)
     }
 
     private func emitMouseMove(with event: NSEvent) {
@@ -441,6 +523,80 @@ final class TrackingContainerView: NSView {
         let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
         let delta = CGSize(width: event.deltaX, height: -event.deltaY)
         onMouseMove?(flipped, delta)
+    }
+
+    private func updatePointerState(with event: NSEvent) {
+        let localPoint = convert(event.locationInWindow, from: nil)
+        isMouseInside = visibleRect.contains(localPoint)
+        updateCursorVisibility()
+    }
+
+    private func refreshPointerState() {
+        isMouseInside = pointerIsActuallyInside()
+        updateCursorVisibility()
+    }
+
+    private func pointerIsActuallyInside() -> Bool {
+        guard let window, !isHidden, alphaValue > 0 else { return false }
+        let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let localPoint = convert(windowPoint, from: nil)
+        return visibleRect.contains(localPoint)
+    }
+
+    private func updateCursorVisibility() {
+        let shouldHide = hidesLocalCursor
+            && isMouseInside
+            && window?.isKeyWindow == true
+            && NSApp.isActive
+
+        if shouldHide {
+            acquireCursorHideLease()
+            Self.invisibleCursor.set()
+        } else {
+            forceShowCursor()
+        }
+    }
+
+    private func acquireCursorHideLease() {
+        guard !ownsCursorHideLease else { return }
+        NSCursor.hide()
+        ownsCursorHideLease = true
+    }
+
+    private func releaseCursorHideLease() {
+        guard ownsCursorHideLease else { return }
+        NSCursor.unhide()
+        ownsCursorHideLease = false
+    }
+
+    private func forceShowCursor() {
+        releaseCursorHideLease()
+        NSCursor.arrow.set()
+    }
+
+    private func installNotificationObservers() {
+        guard let window else { return }
+        let center = NotificationCenter.default
+        notificationObservers = [
+            center.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                self?.forceShowCursor()
+            },
+            center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
+                self?.refreshPointerState()
+            },
+            center.addObserver(forName: NSApplication.didResignActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
+                self?.forceShowCursor()
+            },
+            center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
+                self?.refreshPointerState()
+            },
+        ]
+    }
+
+    private func removeNotificationObservers() {
+        let center = NotificationCenter.default
+        notificationObservers.forEach(center.removeObserver)
+        notificationObservers.removeAll()
     }
 }
 #endif

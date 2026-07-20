@@ -11,6 +11,7 @@ struct ReliabilityPolicyTests {
         testReconnectIsSingleFlightAndGenerationSafe()
         testScanResultsRequireCurrentGeneration()
         testRemoteCoordinatesAreValidatedWithoutClamping()
+        testLocalCursorVisibilityPolicy()
         print("ReliabilityPolicyTests passed")
     }
 
@@ -101,5 +102,41 @@ struct ReliabilityPolicyTests {
         precondition(!RemoteCoordinateValidator.isValid(signedX: 0, signedY: 32_768))
         precondition(RemoteCoordinateValidator.validated(signedX: 12, signedY: -34) == .init(x: 12, y: -34))
         precondition(RemoteCoordinateValidator.validated(signedX: Int.max, signedY: 0) == nil)
+    }
+
+    private static func testLocalCursorVisibilityPolicy() {
+        let activeManualSession = CursorVisibilityContext(
+            mode: .manual,
+            isConnected: true,
+            hasVideo: true,
+            isMouseCaptureEnabled: true,
+            showingSettings: false,
+            showingConnections: false,
+            showingManualConnect: false,
+            showingPasswordPrompt: false,
+            showingOCRResult: false,
+            isOCRModeEnabled: false,
+            hasConnectionError: false
+        )
+
+        precondition(CursorVisibilityPolicy.shouldHideLocalCursor(in: activeManualSession))
+
+        let blockedSessions = [
+            CursorVisibilityContext(copying: activeManualSession, mode: .codexHeadless),
+            CursorVisibilityContext(copying: activeManualSession, isConnected: false),
+            CursorVisibilityContext(copying: activeManualSession, hasVideo: false),
+            CursorVisibilityContext(copying: activeManualSession, isMouseCaptureEnabled: false),
+            CursorVisibilityContext(copying: activeManualSession, showingSettings: true),
+            CursorVisibilityContext(copying: activeManualSession, showingConnections: true),
+            CursorVisibilityContext(copying: activeManualSession, showingManualConnect: true),
+            CursorVisibilityContext(copying: activeManualSession, showingPasswordPrompt: true),
+            CursorVisibilityContext(copying: activeManualSession, showingOCRResult: true),
+            CursorVisibilityContext(copying: activeManualSession, isOCRModeEnabled: true),
+            CursorVisibilityContext(copying: activeManualSession, hasConnectionError: true),
+        ]
+
+        precondition(blockedSessions.allSatisfy {
+            !CursorVisibilityPolicy.shouldHideLocalCursor(in: $0)
+        })
     }
 }

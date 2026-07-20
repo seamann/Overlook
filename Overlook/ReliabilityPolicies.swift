@@ -57,6 +57,91 @@ enum ControlMutationPolicy {
     }
 }
 
+struct CursorVisibilityContext: Equatable, Sendable {
+    let mode: OverlookControlMode
+    let isConnected: Bool
+    let hasVideo: Bool
+    let isMouseCaptureEnabled: Bool
+    let showingSettings: Bool
+    let showingConnections: Bool
+    let showingManualConnect: Bool
+    let showingPasswordPrompt: Bool
+    let showingOCRResult: Bool
+    let isOCRModeEnabled: Bool
+    let hasConnectionError: Bool
+
+    init(
+        mode: OverlookControlMode,
+        isConnected: Bool,
+        hasVideo: Bool,
+        isMouseCaptureEnabled: Bool,
+        showingSettings: Bool,
+        showingConnections: Bool,
+        showingManualConnect: Bool,
+        showingPasswordPrompt: Bool,
+        showingOCRResult: Bool,
+        isOCRModeEnabled: Bool,
+        hasConnectionError: Bool
+    ) {
+        self.mode = mode
+        self.isConnected = isConnected
+        self.hasVideo = hasVideo
+        self.isMouseCaptureEnabled = isMouseCaptureEnabled
+        self.showingSettings = showingSettings
+        self.showingConnections = showingConnections
+        self.showingManualConnect = showingManualConnect
+        self.showingPasswordPrompt = showingPasswordPrompt
+        self.showingOCRResult = showingOCRResult
+        self.isOCRModeEnabled = isOCRModeEnabled
+        self.hasConnectionError = hasConnectionError
+    }
+
+    init(
+        copying context: CursorVisibilityContext,
+        mode: OverlookControlMode? = nil,
+        isConnected: Bool? = nil,
+        hasVideo: Bool? = nil,
+        isMouseCaptureEnabled: Bool? = nil,
+        showingSettings: Bool? = nil,
+        showingConnections: Bool? = nil,
+        showingManualConnect: Bool? = nil,
+        showingPasswordPrompt: Bool? = nil,
+        showingOCRResult: Bool? = nil,
+        isOCRModeEnabled: Bool? = nil,
+        hasConnectionError: Bool? = nil
+    ) {
+        self.init(
+            mode: mode ?? context.mode,
+            isConnected: isConnected ?? context.isConnected,
+            hasVideo: hasVideo ?? context.hasVideo,
+            isMouseCaptureEnabled: isMouseCaptureEnabled ?? context.isMouseCaptureEnabled,
+            showingSettings: showingSettings ?? context.showingSettings,
+            showingConnections: showingConnections ?? context.showingConnections,
+            showingManualConnect: showingManualConnect ?? context.showingManualConnect,
+            showingPasswordPrompt: showingPasswordPrompt ?? context.showingPasswordPrompt,
+            showingOCRResult: showingOCRResult ?? context.showingOCRResult,
+            isOCRModeEnabled: isOCRModeEnabled ?? context.isOCRModeEnabled,
+            hasConnectionError: hasConnectionError ?? context.hasConnectionError
+        )
+    }
+}
+
+enum CursorVisibilityPolicy {
+    static func shouldHideLocalCursor(in context: CursorVisibilityContext) -> Bool {
+        context.mode == .manual
+            && context.isConnected
+            && context.hasVideo
+            && context.isMouseCaptureEnabled
+            && !context.showingSettings
+            && !context.showingConnections
+            && !context.showingManualConnect
+            && !context.showingPasswordPrompt
+            && !context.showingOCRResult
+            && !context.isOCRModeEnabled
+            && !context.hasConnectionError
+    }
+}
+
 /// A small, value-type state machine used to prevent overlapping reconnects and
 /// to reject completions from a connection attempt that has since been invalidated.
 struct ReconnectGenerationPolicy: Sendable {

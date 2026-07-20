@@ -26,6 +26,7 @@ struct ContentView: View {
     @State private var pendingPasswordDevice: KVMDevice?
     @State private var pendingPassword = ""
     @State private var connectionErrorMessage: String?
+    @State private var isEstablishingConnection = false
 
     @State private var suppressDeviceAutoConnect = false
 
@@ -60,6 +61,26 @@ struct ContentView: View {
         default:
             return nil
         }
+    }
+
+    private var shouldHideLocalCursor: Bool {
+        CursorVisibilityPolicy.shouldHideLocalCursor(
+            in: CursorVisibilityContext(
+                mode: controlMode,
+                isConnected: isConnected,
+                hasVideo: webRTCManager.videoSize != nil
+                    && webRTCManager.isConnected
+                    && !webRTCManager.isStreamStalled,
+                isMouseCaptureEnabled: inputManager.isMouseCaptureEnabled,
+                showingSettings: showingSettings,
+                showingConnections: showingConnections,
+                showingManualConnect: showingManualConnect,
+                showingPasswordPrompt: showingPasswordPrompt,
+                showingOCRResult: isShowingOCRResult,
+                isOCRModeEnabled: isOCRModeEnabled,
+                hasConnectionError: connectionErrorMessage != nil
+            )
+        )
     }
 
     private var windowTitle: String {
@@ -106,7 +127,8 @@ struct ContentView: View {
                         Task { @MainActor in
                             await webRTCManager.reconnect(to: device)
                         }
-                    }
+                    },
+                    hidesLocalCursor: shouldHideLocalCursor
                 )
                 .ignoresSafeArea()
                 .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
@@ -120,7 +142,8 @@ struct ContentView: View {
                         Task { @MainActor in
                             await webRTCManager.reconnect(to: device)
                         }
-                    }
+                    },
+                    hidesLocalCursor: shouldHideLocalCursor
                 )
                 .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
             }
@@ -222,6 +245,7 @@ struct ContentView: View {
                 ConnectionsPopoverView(
                     selectedDevice: $selectedDevice,
                     isConnected: isConnected,
+                    isConnecting: isEstablishingConnection,
                     isScanning: kvmDeviceManager.isScanning,
                     devices: kvmDeviceManager.availableDevices,
                     connectedDeviceName: kvmDeviceManager.connectedDevice?.name,
@@ -247,6 +271,11 @@ struct ContentView: View {
                     },
                     onToggleConnection: {
                         toggleConnection()
+                    },
+                    onClose: {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showingConnections = false
+                        }
                     },
                     onForgetSelectedDevice: {
                         guard let device = selectedDevice else { return }
@@ -429,24 +458,24 @@ struct ContentView: View {
     }
 
     private func connectToDevice(_ device: KVMDevice, password: String? = nil) {
-        Task {
+        guard !isEstablishingConnection else { return }
+        isEstablishingConnection = true
+
+        Task { @MainActor in
+            defer { isEstablishingConnection = false }
             do {
                 let connectedDevice = try await kvmDeviceManager.connectToDevice(device, password: password)
-                await MainActor.run {
-                    suppressDeviceAutoConnect = true
-                    selectedDevice = connectedDevice
-                    isConnected = true
-                    showingConnections = false
-                }
+                suppressDeviceAutoConnect = true
+                selectedDevice = connectedDevice
+                isConnected = true
+                showingConnections = false
                 DispatchQueue.main.async {
                     suppressDeviceAutoConnect = false
                 }
 
                 if let client = kvmDeviceManager.glkvmClient {
-                    await MainActor.run {
-                        inputManager.setGLKVMClient(client)
-                        inputManager.startFullInputCapture()
-                    }
+                    inputManager.setGLKVMClient(client)
+                    inputManager.startFullInputCapture()
                     try? await client.setHidConnected(true)
                 }
 
@@ -459,16 +488,12 @@ struct ContentView: View {
  #endif
             } catch {
                 if let kvmError = error as? KVMError, kvmError == .authenticationFailed {
-                    await MainActor.run {
-                        pendingPasswordDevice = device
-                        showingPasswordPrompt = true
-                    }
+                    pendingPasswordDevice = device
+                    showingPasswordPrompt = true
                 } else {
                     print("Failed to connect: \(error)")
-                    await MainActor.run {
-                        isConnected = false
-                        connectionErrorMessage = describeConnectionError(error)
-                    }
+                    isConnected = false
+                    connectionErrorMessage = describeConnectionError(error)
                 }
                 return
             }
@@ -516,6 +541,8 @@ struct ContentView: View {
     }
 
     private func toggleConnection() {
+        guard !isEstablishingConnection else { return }
+
         if isConnected {
             webRTCManager.disconnect()
 
@@ -946,6 +973,7 @@ struct ConnectionsPopoverView: View {
     @Binding var selectedDevice: KVMDevice?
 
     let isConnected: Bool
+    let isConnecting: Bool
     let isScanning: Bool
     let devices: [KVMDevice]
     let connectedDeviceName: String?
@@ -969,6 +997,7 @@ struct ConnectionsPopoverView: View {
     let onScan: () -> Void
     let onManualConnect: () -> Void
     let onToggleConnection: () -> Void
+    let onClose: () -> Void
     let onForgetSelectedDevice: () -> Void
 
     var body: some View {
@@ -996,11 +1025,12 @@ struct ConnectionsPopoverView: View {
                 Text("Connections")
                     .font(.headline)
                 Spacer()
-                Button(action: onToggleConnection) {
-                    Image(systemName: isConnected ? "personalhotspot.slash" : "personalhotspot")
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
                 }
-                .disabled(!isConnected && selectedDevice == nil)
-                .help(isConnected ? "Disconnect" : "Connect")
+                .buttonStyle(.plain)
+                .help("Close Connections")
+                .accessibilityLabel("Close Connections")
             }
 
             Picker("Device", selection: $selectedDevice) {
@@ -1010,15 +1040,41 @@ struct ConnectionsPopoverView: View {
                 }
             }
             .frame(maxWidth: .infinity)
+            .disabled(isConnected || isConnecting)
+
+            if isConnected {
+                Button(role: .destructive, action: onToggleConnection) {
+                    Text("Disconnect")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            } else {
+                Button(action: onToggleConnection) {
+                    HStack(spacing: 8) {
+                        if isConnecting {
+                            ProgressView()
+                                .controlSize(.small)
+                        }
+                        Text(isConnecting ? "Connecting…" : "Connect")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .disabled(selectedDevice == nil || isConnecting)
+                .keyboardShortcut(.defaultAction)
+            }
 
             HStack {
                 Button("Scan") { onScan() }
-                    .disabled(isScanning)
+                    .disabled(isScanning || isConnecting)
 
                 Button("Manual Connect…") { onManualConnect() }
+                    .disabled(isConnected || isConnecting)
 
                 Button("Forget") { onForgetSelectedDevice() }
-                    .disabled(isConnected || selectedDevice?.id.hasPrefix("saved-") != true)
+                    .disabled(isConnected || isConnecting || selectedDevice?.id.hasPrefix("saved-") != true)
 
                 Spacer()
 
