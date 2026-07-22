@@ -10,6 +10,7 @@ struct ReliabilityPolicyTests {
         testControlMutationsRequireHeadlessMode()
         testReconnectIsSingleFlightAndGenerationSafe()
         testScanResultsRequireCurrentGeneration()
+        testAutomaticScanRequiresReachableTCP443AndPreservesPinnedDevices()
         testRemoteCoordinatesAreValidatedWithoutClamping()
         testLocalCursorVisibilityPolicy()
         print("ReliabilityPolicyTests passed")
@@ -93,6 +94,34 @@ struct ReliabilityPolicyTests {
         precondition(ScanGenerationPolicy.accepts(resultGeneration: 7, currentGeneration: 7))
         precondition(!ScanGenerationPolicy.accepts(resultGeneration: 6, currentGeneration: 7))
         precondition(!ScanGenerationPolicy.accepts(resultGeneration: 8, currentGeneration: 7))
+    }
+
+    private static func testAutomaticScanRequiresReachableTCP443AndPreservesPinnedDevices() {
+        precondition(ScanPortPolicy.requiredPort == 443)
+        precondition(ScanPortPolicy.maximumAutomaticCandidates == 256)
+        precondition(ScanPortPolicy.maximumConcurrentProbes == 16)
+        precondition(ScanPortPolicy.portsToProbe(from: [80, 443, 8443, 8080, 443]) == [443])
+        precondition(ScanPortPolicy.allows(port: 443, isOpen: true))
+        precondition(!ScanPortPolicy.allows(port: 443, isOpen: false))
+        precondition(!ScanPortPolicy.allows(port: 8443, isOpen: true))
+        precondition(ScanPortPolicy.isPinned(deviceID: "manual-device"))
+        precondition(ScanPortPolicy.isPinned(deviceID: "saved-kvm.local-80"))
+        precondition(!ScanPortPolicy.isPinned(deviceID: "scanned-192.168.1.5-443"))
+        precondition(!ScanPortPolicy.isPinned(deviceID: "generic-device"))
+
+        let endpoints = [
+            ScanPortPolicy.Endpoint(host: "kvm.local", port: 443),
+            ScanPortPolicy.Endpoint(host: "kvm.local", port: 443),
+            ScanPortPolicy.Endpoint(host: "legacy.local", port: 8443),
+            ScanPortPolicy.Endpoint(host: "", port: 443),
+        ] + (0..<300).map {
+            ScanPortPolicy.Endpoint(host: "192.168.1.\($0)", port: 443)
+        }
+        let selectedEndpoints = ScanPortPolicy.endpointsToProbe(from: endpoints)
+        precondition(selectedEndpoints.count == ScanPortPolicy.maximumAutomaticCandidates)
+        precondition(selectedEndpoints.first == .init(host: "kvm.local", port: 443))
+        precondition(Set(selectedEndpoints).count == selectedEndpoints.count)
+        precondition(selectedEndpoints.allSatisfy { $0.port == 443 && !$0.host.isEmpty })
     }
 
     private static func testRemoteCoordinatesAreValidatedWithoutClamping() {

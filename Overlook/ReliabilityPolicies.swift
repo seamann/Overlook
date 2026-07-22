@@ -178,6 +178,44 @@ enum ScanGenerationPolicy {
     }
 }
 
+enum ScanPortPolicy {
+    struct Endpoint: Hashable, Sendable {
+        let host: String
+        let port: Int
+    }
+
+    static let requiredPort = 443
+    static let maximumAutomaticCandidates = 256
+    static let maximumConcurrentProbes = 16
+
+    static func portsToProbe(from candidates: [Int]) -> [Int] {
+        candidates.contains(requiredPort) ? [requiredPort] : []
+    }
+
+    static func allows(port: Int, isOpen: Bool) -> Bool {
+        port == requiredPort && isOpen
+    }
+
+    static func isPinned(deviceID: String) -> Bool {
+        deviceID.hasPrefix("manual-") || deviceID.hasPrefix("saved-")
+    }
+
+    static func endpointsToProbe(from candidates: [Endpoint]) -> [Endpoint] {
+        var selectedEndpoints: [Endpoint] = []
+        var seenEndpoints: Set<Endpoint> = []
+        selectedEndpoints.reserveCapacity(min(candidates.count, maximumAutomaticCandidates))
+
+        for endpoint in candidates {
+            guard !endpoint.host.isEmpty, endpoint.port == requiredPort else { continue }
+            guard seenEndpoints.insert(endpoint).inserted else { continue }
+            selectedEndpoints.append(endpoint)
+            if selectedEndpoints.count == maximumAutomaticCandidates { break }
+        }
+
+        return selectedEndpoints
+    }
+}
+
 enum RemoteCoordinateValidator {
     struct Coordinates: Equatable, Sendable {
         let x: Int

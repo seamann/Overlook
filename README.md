@@ -102,6 +102,7 @@ Overlook uses the Swift Package:
 ### 1) Discover or add a device
 
 Overlook supports multiple discovery methods (mDNS + network scanning + common target probes) and also manual entry.
+Automatic scan results are shown only when TCP port 443 is reachable. Manually added and saved devices remain available regardless of their configured port.
 
 From the main window:
 
@@ -247,6 +248,7 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
 ### “I can’t find my device when scanning”
 
 - Make sure your Mac is on the same network as the KVM.
+- Confirm that TCP port 443 is reachable from the Mac.
 - Try **Manual Connect…** with the host/IP and port.
 - Some networks block mDNS; Overlook also does a best-effort port scan and probes common targets.
 

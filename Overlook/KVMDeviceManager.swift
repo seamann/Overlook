@@ -42,9 +42,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }()
 
     private let commonProbeTargets: [(host: String, port: Int)] = [
-        ("192.168.200.5", 443),
-        ("192.168.200.1", 443),
-        ("192.168.200.1", 80),
+        ("192.168.200.5", ScanPortPolicy.requiredPort),
+        ("192.168.200.1", ScanPortPolicy.requiredPort),
     ]
 
     private static let savedDevicesKey = "overlook.saved_devices.v1"
@@ -56,6 +55,25 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         let type: KVMDeviceType
         let authToken: String?
         let capabilities: Set<KVMCapability>
+    }
+
+    private struct ScanProbeResult: Sendable {
+        let candidateIndex: Int
+        let isOpen: Bool
+    }
+
+    private actor DiscoveredDeviceCollector {
+        private var devicesByEndpoint: [String: KVMDevice] = [:]
+
+        func add(_ device: KVMDevice) {
+            let endpointKey = "\(device.host):\(device.port)"
+            guard devicesByEndpoint[endpointKey] == nil else { return }
+            devicesByEndpoint[endpointKey] = device
+        }
+
+        func all() -> [KVMDevice] {
+            Array(devicesByEndpoint.values)
+        }
     }
     
     override init() {
@@ -87,7 +105,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         
         isScanning = true
         scanProgress = 0.0
-        let pinnedDevices = availableDevices.filter { $0.id.hasPrefix("manual-") || $0.id.hasPrefix("saved-") }
+        let pinnedDevices = availableDevices.filter { ScanPortPolicy.isPinned(deviceID: $0.id) }
         availableDevices = pinnedDevices
         
         // Start multiple discovery methods
@@ -120,21 +138,22 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 }
                 
                 // Collect results
-                var allDevices: [KVMDevice] = []
-                let pinnedDevices = await MainActor.run {
-                    self.availableDevices.filter { $0.id.hasPrefix("manual-") || $0.id.hasPrefix("saved-") }
-                }
+                var allCandidates: [KVMDevice] = []
 
                 for await devices in group {
                     guard !Task.isCancelled else { group.cancelAll(); return }
-                    allDevices.append(contentsOf: devices)
+                    allCandidates.append(contentsOf: devices)
+                }
 
-                    let uniqueDevices = self.removeDuplicates(from: allDevices)
-                    await MainActor.run {
-                        guard self.scanGeneration == generation else { return }
-                        let combined = self.removeDuplicates(from: pinnedDevices + uniqueDevices)
-                        self.availableDevices = combined.sorted { $0.name < $1.name }
+                let eligibleDevices = await self.devicesWithOpenRequiredScanPort(allCandidates)
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard self.scanGeneration == generation else { return }
+                    let pinnedDevices = self.availableDevices.filter {
+                        ScanPortPolicy.isPinned(deviceID: $0.id)
                     }
+                    let combined = self.removeDuplicates(from: pinnedDevices + eligibleDevices)
+                    self.availableDevices = combined.sorted { $0.name < $1.name }
                 }
 
                 await MainActor.run {
@@ -167,17 +186,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     private func discoverGLiNetDevices() async -> [KVMDevice] {
-        actor DeviceCollector {
-            private var devices: [KVMDevice] = []
-            func add(_ device: KVMDevice) {
-                devices.append(device)
-            }
-            func all() -> [KVMDevice] {
-                devices
-            }
-        }
-
-        let collector = DeviceCollector()
+        let collector = DiscoveredDeviceCollector()
         
         // GL.iNet Comet uses mDNS/Bonjour discovery
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_comet._tcp", domain: nil), using: .tcp)
@@ -208,7 +217,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     nonisolated private static func createGLiNetDevice(from endpoint: NWEndpoint) -> KVMDevice {
         var name = "GL.iNet Comet"
         var host = ""
-        let port = 443
+        let port = ScanPortPolicy.requiredPort
         
         if case .service(let serviceName, let type, let domain, _) = endpoint {
             name = serviceName
@@ -227,17 +236,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     private func discoverGenericKVMDevices() async -> [KVMDevice] {
-        actor DeviceCollector {
-            private var devices: [KVMDevice] = []
-            func add(_ device: KVMDevice) {
-                devices.append(device)
-            }
-            func all() -> [KVMDevice] {
-                devices
-            }
-        }
-
-        let collector = DeviceCollector()
+        let collector = DiscoveredDeviceCollector()
         
         // Generic KVM discovery via mDNS
         let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_kvm._tcp", domain: nil), using: .tcp)
@@ -267,7 +266,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     nonisolated private static func createGenericKVMDevice(from endpoint: NWEndpoint) -> KVMDevice {
         var name = "Generic KVM"
         var host = ""
-        let port = 8080
+        let port = ScanPortPolicy.requiredPort
         
         if case .service(let serviceName, let type, let domain, _) = endpoint {
             name = serviceName
@@ -288,11 +287,10 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private func scanKnownPorts() async -> [KVMDevice] {
         var devices: [KVMDevice] = []
         
-        // Common KVM ports to scan
-        let knownPorts = [443, 8443, 80, 8080]
+        let knownPorts = ScanPortPolicy.portsToProbe(from: [443, 8443, 80, 8080])
         let localNetwork = getLocalNetworkRange()
 
-        let maxConcurrent = 64
+        let maxConcurrent = ScanPortPolicy.maximumConcurrentProbes
         var targets: [(host: String, port: Int)] = []
         targets.reserveCapacity(localNetwork.count * knownPorts.count)
         for host in localNetwork {
@@ -401,7 +399,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             // If the port is open but the HTTP probe didn't identify the service,
             // still surface it for the common/default targets (helps with devices
             // that redirect/behave oddly on probe endpoints).
-            if await probeTCPPortOpen(host: target.host, port: target.port) {
+            if await Self.probeTCPPortOpen(host: target.host, port: target.port) {
                 devices.append(
                     KVMDevice(
                         id: "scanned-\(target.host)-\(target.port)",
@@ -418,7 +416,73 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         return devices
     }
 
-    private func probeTCPPortOpen(host: String, port: Int) async -> Bool {
+    private func devicesWithOpenRequiredScanPort(_ devices: [KVMDevice]) async -> [KVMDevice] {
+        let endpoints = ScanPortPolicy.endpointsToProbe(
+            from: devices.map {
+                ScanPortPolicy.Endpoint(host: $0.host, port: $0.port)
+            }
+        )
+        let selectedEndpoints = Set(endpoints)
+        var firstDeviceByEndpoint: [ScanPortPolicy.Endpoint: KVMDevice] = [:]
+        firstDeviceByEndpoint.reserveCapacity(endpoints.count)
+        for device in devices {
+            let endpoint = ScanPortPolicy.Endpoint(host: device.host, port: device.port)
+            guard selectedEndpoints.contains(endpoint), firstDeviceByEndpoint[endpoint] == nil else {
+                continue
+            }
+            firstDeviceByEndpoint[endpoint] = device
+            if firstDeviceByEndpoint.count == endpoints.count { break }
+        }
+        let candidates = endpoints.compactMap { firstDeviceByEndpoint[$0] }
+        guard !candidates.isEmpty else { return [] }
+
+        var openCandidateIndices: Set<Int> = []
+        await withTaskGroup(of: ScanProbeResult.self) { group in
+            var nextCandidateIndex = 0
+            var inFlightProbeCount = 0
+
+            while nextCandidateIndex < candidates.count || inFlightProbeCount > 0 {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+
+                while inFlightProbeCount < ScanPortPolicy.maximumConcurrentProbes,
+                      nextCandidateIndex < candidates.count {
+                    let candidateIndex = nextCandidateIndex
+                    let host = candidates[candidateIndex].host
+                    nextCandidateIndex += 1
+                    inFlightProbeCount += 1
+
+                    group.addTask {
+                        let isOpen = await Self.probeTCPPortOpen(
+                            host: host,
+                            port: ScanPortPolicy.requiredPort
+                        )
+                        return ScanProbeResult(
+                            candidateIndex: candidateIndex,
+                            isOpen: isOpen
+                        )
+                    }
+                }
+
+                guard let result = await group.next() else { break }
+                inFlightProbeCount -= 1
+                if ScanPortPolicy.allows(
+                    port: candidates[result.candidateIndex].port,
+                    isOpen: result.isOpen
+                ) {
+                    openCandidateIndices.insert(result.candidateIndex)
+                }
+            }
+        }
+
+        return candidates.enumerated().compactMap { index, device in
+            openCandidateIndices.contains(index) ? device : nil
+        }
+    }
+
+    nonisolated private static func probeTCPPortOpen(host: String, port: Int) async -> Bool {
         guard let endpointPort = NWEndpoint.Port(rawValue: UInt16(port)) else {
             return false
         }
@@ -578,8 +642,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     private func checkTailscaleKVM(host: String) async -> KVMDevice? {
-        // Check common KVM ports on Tailscale hosts
-        let ports = [8443, 8080, 443]
+        let ports = ScanPortPolicy.portsToProbe(from: [8443, 8080, 443])
         
         for port in ports {
             if let device = await checkKVMService(host: host, port: port) {
