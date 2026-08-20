@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 enum HIDCommand: Equatable, Sendable {
     case key(String, isPressed: Bool)
@@ -139,6 +140,56 @@ enum CursorVisibilityPolicy {
             && !context.showingOCRResult
             && !context.isOCRModeEnabled
             && !context.hasConnectionError
+    }
+}
+
+enum RemotePointerOwnershipPolicy {
+    static func ownsCursor(
+        localPoint: CGPoint,
+        visibleRect: CGRect,
+        isTopmostInteractiveSurface: Bool
+    ) -> Bool {
+        visibleRect.contains(localPoint) && isTopmostInteractiveSurface
+    }
+}
+
+struct RemotePointerPresenceState: Equatable, Sendable {
+    private(set) var isInsideRemoteSurface = false
+
+    mutating func update(isOwnedByRemoteSurface: Bool) {
+        isInsideRemoteSurface = isOwnedByRemoteSurface
+    }
+
+    mutating func exit() {
+        isInsideRemoteSurface = false
+    }
+}
+
+enum ConnectSubmissionPolicy {
+    static func canSubmitPassword(_ password: String) -> Bool {
+        !password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func canSubmitManualConnection(hostPort: String) -> Bool {
+        !hostPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+struct ConnectSubmissionGate: Equatable, Sendable {
+    private(set) var hasSubmitted = false
+
+    mutating func begin(when canSubmit: Bool) -> Bool {
+        guard canSubmit, !hasSubmitted else { return false }
+        hasSubmitted = true
+        return true
+    }
+}
+
+enum ConnectCredentialSnapshot {
+    static func takeAndClear(_ password: inout String) -> String {
+        let snapshot = password
+        password = ""
+        return snapshot
     }
 }
 

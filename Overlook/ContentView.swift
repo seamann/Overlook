@@ -372,8 +372,8 @@ struct ContentView: View {
                 hostPort: $manualHostPort,
                 port: $manualPort,
                 password: $manualPassword,
-                onConnect: {
-                    manualConnect()
+                onConnect: { password in
+                    manualConnect(password: password)
                 }
             )
         }
@@ -385,9 +385,9 @@ struct ContentView: View {
                     pendingPasswordDevice = nil
                     pendingPassword = ""
                 },
-                onConnect: {
+                onConnect: { password in
                     if let device = pendingPasswordDevice {
-                        connectToDevice(device, password: pendingPassword)
+                        connectToDevice(device, password: password)
                     }
                     pendingPasswordDevice = nil
                     pendingPassword = ""
@@ -500,7 +500,7 @@ struct ContentView: View {
         }
     }
 
-    private func manualConnect() {
+    private func manualConnect(password: String) {
         let trimmed = manualHostPort.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -529,8 +529,8 @@ struct ContentView: View {
             suppressDeviceAutoConnect = false
         }
 
-        let password = manualPassword.trimmingCharacters(in: .whitespacesAndNewlines)
-        connectToDevice(device, password: password.isEmpty ? nil : password)
+        let normalizedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        connectToDevice(device, password: normalizedPassword.isEmpty ? nil : normalizedPassword)
     }
 
     private func describeConnectionError(_ error: Error) -> String {

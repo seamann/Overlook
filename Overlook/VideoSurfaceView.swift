@@ -369,7 +369,7 @@ final class RemoteInputSurfaceView: NSView {
 
     private var trackingAreaRef: NSTrackingArea?
     private var notificationObservers: [NSObjectProtocol] = []
-    private var isMouseInside = false
+    private var pointerPresence = RemotePointerPresenceState()
     private var ownsCursorHideLease = false
 
     private static let invisibleCursor: NSCursor = {
@@ -455,9 +455,8 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshPointerState()
-        }
+        pointerPresence.exit()
+        updateCursorVisibility()
     }
 
     override func mouseMoved(with event: NSEvent) {
@@ -527,12 +526,18 @@ final class RemoteInputSurfaceView: NSView {
 
     private func updatePointerState(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
-        isMouseInside = visibleRect.contains(localPoint)
+        pointerPresence.update(
+            isOwnedByRemoteSurface: RemotePointerOwnershipPolicy.ownsCursor(
+                localPoint: localPoint,
+                visibleRect: visibleRect,
+                isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: event.locationInWindow)
+            )
+        )
         updateCursorVisibility()
     }
 
     private func refreshPointerState() {
-        isMouseInside = pointerIsActuallyInside()
+        pointerPresence.update(isOwnedByRemoteSurface: pointerIsActuallyInside())
         updateCursorVisibility()
     }
 
@@ -540,12 +545,23 @@ final class RemoteInputSurfaceView: NSView {
         guard let window, !isHidden, alphaValue > 0 else { return false }
         let windowPoint = window.convertPoint(fromScreen: NSEvent.mouseLocation)
         let localPoint = convert(windowPoint, from: nil)
-        return visibleRect.contains(localPoint)
+        return RemotePointerOwnershipPolicy.ownsCursor(
+            localPoint: localPoint,
+            visibleRect: visibleRect,
+            isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: windowPoint)
+        )
+    }
+
+    private func isTopmostInteractiveSurface(at windowPoint: NSPoint) -> Bool {
+        guard let contentView = window?.contentView else { return false }
+        let contentPoint = contentView.convert(windowPoint, from: nil)
+        guard let hitView = contentView.hitTest(contentPoint) else { return false }
+        return hitView === self || hitView.isDescendant(of: self)
     }
 
     private func updateCursorVisibility() {
         let shouldHide = hidesLocalCursor
-            && isMouseInside
+            && pointerPresence.isInsideRemoteSurface
             && window?.isKeyWindow == true
             && NSApp.isActive
 

@@ -6,7 +6,13 @@ struct ManualConnectSheet: View {
     @Binding var port: String
     @Binding var password: String
 
-    let onConnect: () -> Void
+    let onConnect: (String) -> Void
+
+    @State private var submissionGate = ConnectSubmissionGate()
+
+    private var canConnect: Bool {
+        ConnectSubmissionPolicy.canSubmitManualConnection(hostPort: hostPort)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -21,21 +27,31 @@ struct ManualConnectSheet: View {
 
             SecureField("Password", text: $password)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit(submitConnection)
 
             HStack {
                 Spacer()
                 Button("Cancel") {
+                    password = ""
                     isPresented = false
                 }
-                Button("Connect") {
-                    onConnect()
-                    isPresented = false
-                }
-                .disabled(hostPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Connect", action: submitConnection)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canConnect)
             }
         }
         .padding()
         .frame(width: 420)
+        .onDisappear {
+            password = ""
+        }
+    }
+
+    private func submitConnection() {
+        guard submissionGate.begin(when: canConnect) else { return }
+        let passwordSnapshot = ConnectCredentialSnapshot.takeAndClear(&password)
+        onConnect(passwordSnapshot)
+        isPresented = false
     }
 }
 
@@ -44,7 +60,13 @@ struct PasswordPromptSheet: View {
     @Binding var password: String
 
     let onCancel: () -> Void
-    let onConnect: () -> Void
+    let onConnect: (String) -> Void
+
+    @State private var submissionGate = ConnectSubmissionGate()
+
+    private var canConnect: Bool {
+        ConnectSubmissionPolicy.canSubmitPassword(password)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -53,21 +75,31 @@ struct PasswordPromptSheet: View {
 
             SecureField("Password", text: $password)
                 .textFieldStyle(.roundedBorder)
+                .onSubmit(submitConnection)
 
             HStack {
                 Spacer()
                 Button("Cancel") {
                     onCancel()
+                    password = ""
                     isPresented = false
                 }
-                Button("Connect") {
-                    onConnect()
-                    isPresented = false
-                }
-                .disabled(password.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button("Connect", action: submitConnection)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(!canConnect)
             }
         }
         .padding()
         .frame(width: 420)
+        .onDisappear {
+            password = ""
+        }
+    }
+
+    private func submitConnection() {
+        guard submissionGate.begin(when: canConnect) else { return }
+        let passwordSnapshot = ConnectCredentialSnapshot.takeAndClear(&password)
+        onConnect(passwordSnapshot)
+        isPresented = false
     }
 }

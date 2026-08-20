@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 @main
 struct ReliabilityPolicyTests {
@@ -13,6 +14,11 @@ struct ReliabilityPolicyTests {
         testAutomaticScanRequiresReachableTCP443AndPreservesPinnedDevices()
         testRemoteCoordinatesAreValidatedWithoutClamping()
         testLocalCursorVisibilityPolicy()
+        testRemoteCursorOwnershipRequiresTopmostVideoSurface()
+        testRemotePointerExitReleasesOwnershipImmediately()
+        testConnectSubmissionRequiresUsableInput()
+        testConnectSubmissionGateAllowsOnlyOneAttempt()
+        testCredentialSnapshotClearsSourceImmediately()
         print("ReliabilityPolicyTests passed")
     }
 
@@ -167,5 +173,66 @@ struct ReliabilityPolicyTests {
         precondition(blockedSessions.allSatisfy {
             !CursorVisibilityPolicy.shouldHideLocalCursor(in: $0)
         })
+    }
+
+    private static func testRemoteCursorOwnershipRequiresTopmostVideoSurface() {
+        let visibleRemoteArea = CGRect(x: 0, y: 0, width: 1_280, height: 720)
+
+        precondition(
+            RemotePointerOwnershipPolicy.ownsCursor(
+                localPoint: CGPoint(x: 640, y: 360),
+                visibleRect: visibleRemoteArea,
+                isTopmostInteractiveSurface: true
+            )
+        )
+        precondition(
+            !RemotePointerOwnershipPolicy.ownsCursor(
+                localPoint: CGPoint(x: 640, y: 360),
+                visibleRect: visibleRemoteArea,
+                isTopmostInteractiveSurface: false
+            )
+        )
+        precondition(
+            !RemotePointerOwnershipPolicy.ownsCursor(
+                localPoint: CGPoint(x: 640, y: 721),
+                visibleRect: visibleRemoteArea,
+                isTopmostInteractiveSurface: true
+            )
+        )
+    }
+
+    private static func testRemotePointerExitReleasesOwnershipImmediately() {
+        var state = RemotePointerPresenceState()
+        state.update(isOwnedByRemoteSurface: true)
+        precondition(state.isInsideRemoteSurface)
+
+        state.exit()
+        precondition(!state.isInsideRemoteSurface)
+
+        state.exit()
+        precondition(!state.isInsideRemoteSurface)
+    }
+
+    private static func testConnectSubmissionRequiresUsableInput() {
+        precondition(ConnectSubmissionPolicy.canSubmitPassword("entered test value"))
+        precondition(!ConnectSubmissionPolicy.canSubmitPassword(""))
+        precondition(!ConnectSubmissionPolicy.canSubmitPassword(" \n\t "))
+
+        precondition(ConnectSubmissionPolicy.canSubmitManualConnection(hostPort: "kvm.local"))
+        precondition(!ConnectSubmissionPolicy.canSubmitManualConnection(hostPort: " \n "))
+    }
+
+    private static func testConnectSubmissionGateAllowsOnlyOneAttempt() {
+        var gate = ConnectSubmissionGate()
+        precondition(!gate.begin(when: false))
+        precondition(gate.begin(when: true))
+        precondition(!gate.begin(when: true))
+    }
+
+    private static func testCredentialSnapshotClearsSourceImmediately() {
+        var inputField = "  entered test value  "
+        let snapshot = ConnectCredentialSnapshot.takeAndClear(&inputField)
+        precondition(snapshot == "  entered test value  ")
+        precondition(inputField.isEmpty)
     }
 }
