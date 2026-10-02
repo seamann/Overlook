@@ -1,0 +1,3693 @@
+--- a/Overlook/ContentView.swift
++++ b/Overlook/ContentView.swift
+@@ -444,6 +444,12 @@
+         .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
+         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
+         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
++        .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
++            if let message { connectionErrorMessage = message }
++        }
++        .onChange(of: kvmDeviceManager.credentialStorageWarningGeneration, initial: true) { _, _ in
++            if let message = kvmDeviceManager.credentialStorageWarning { connectionErrorMessage = message }
++        }
+         .onDisappear {
+             inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
+         }
+@@ -538,7 +544,8 @@
+             )
+         }
+         .alert(
+-            "Connection Failed",
++            connectionErrorMessage == kvmDeviceManager.credentialStorageWarning
++                ? "Credentials Not Saved" : "Connection Failed",
+             isPresented: Binding(
+                 get: { connectionErrorMessage != nil },
+                 set: { if !$0 { connectionErrorMessage = nil } }
+@@ -632,7 +639,7 @@
+                 guard sessionCoordinator.isCurrent(attempt.id) else { return }
+                 selectedDevice = device
+                 showingConnections = false
+-                connectionErrorMessage = nil
++                connectionErrorMessage = kvmDeviceManager.credentialStorageWarning
+             } catch is CancellationError {
+                 return
+             } catch {
+@@ -744,14 +751,12 @@
+             defer {
+                 kvmDeviceManager.endHeadlessConfigurationTransition(lockOwner)
+                 isChangingControlMode = false
++                if controlModeStore.mode == .manual {
++                    controlModeStore.resumeManualCaptureIfNeeded()
++                }
+             }
+             do {
+-                if kvmDeviceManager.mouseJigglerSupported == true {
+-                    try await kvmDeviceManager.setMouseJigglerEnabled(false)
+-                    guard kvmDeviceManager.mouseJigglerEnabled == false else {
+-                        throw MouseJigglerError.readbackMismatch
+-                    }
+-                }
++                try await kvmDeviceManager.pauseMouseJigglerForHeadless()
+                 guard kvmDeviceManager.glkvmClient === expectedClient,
+                       !sessionCoordinator.isConnecting else { return }
+                 isOCRModeEnabled = false
+@@ -896,11 +901,18 @@
+ private struct WindowReferenceSetter: NSViewRepresentable {
+     @Binding var window: NSWindow?
+ 
+-    func makeNSView(context: Context) -> NSView {
+-        NSView(frame: .zero)
+-    }
+-
+-    func updateNSView(_ nsView: NSView, context: Context) {
++    func makeNSView(context: Context) -> MainWindowAttachmentView {
++        let view = MainWindowAttachmentView(frame: .zero)
++        let binding = $window
++        view.onWindowAttached = { attachedWindow in
++            DispatchQueue.main.async {
++                if binding.wrappedValue !== attachedWindow { binding.wrappedValue = attachedWindow }
++            }
++        }
++        return view
++    }
++
++    func updateNSView(_ nsView: MainWindowAttachmentView, context: Context) {
+         guard let w = nsView.window else { return }
+         if window !== w {
+             DispatchQueue.main.async {
+@@ -917,22 +929,16 @@
+         Coordinator()
+     }
+ 
+-    func makeNSView(context: Context) -> NSView {
+-        NSView(frame: .zero)
+-    }
+-
+-    func updateNSView(_ nsView: NSView, context: Context) {
++    func makeNSView(context: Context) -> MainWindowAttachmentView {
++        let view = MainWindowAttachmentView(frame: .zero)
++        let coordinator = context.coordinator
++        view.onWindowAttached = { coordinator.attach(to: $0) }
++        return view
++    }
++
++    func updateNSView(_ nsView: MainWindowAttachmentView, context: Context) {
+         guard let window = nsView.window else { return }
+-
+-        if context.coordinator.didConfigureWindow == false {
+-            context.coordinator.didConfigureWindow = true
+-            let coordinator = context.coordinator
+-            DispatchQueue.main.async {
+-                window.titlebarAppearsTransparent = false
+-                window.styleMask.remove(.fullSizeContentView)
+-                coordinator.attach(to: window)
+-            }
+-        }
++        context.coordinator.attach(to: window)
+ 
+         guard let videoSize, videoSize.width > 0, videoSize.height > 0 else {
+             if context.coordinator.lastAspect != nil {
+@@ -978,7 +984,6 @@
+     final class Coordinator: NSObject {
+         var lastAspect: NSSize?
+         var didInitialResizeForAspect: Bool = false
+-        var didConfigureWindow: Bool = false
+ 
+         weak var window: NSWindow?
+         weak var forwardedDelegate: NSWindowDelegate?
+@@ -989,21 +994,26 @@
+         private var storedWindowedTitleVisibility: NSWindow.TitleVisibility?
+         private var storedWindowedToolbarIsVisible: Bool?
+ 
+-        func attach(to window: NSWindow) {
++        @MainActor func attach(to window: NSWindow) {
+             if self.window === window {
+                 return
+             }
+ 
++            if let previous = self.window, previous.delegate === self {
++                previous.delegate = forwardedDelegate
++            }
++
+             self.window = window
++            window.titlebarAppearsTransparent = false
++            window.styleMask.remove(.fullSizeContentView)
++            MainWindowLifecycle.register(window)
+             forwardedDelegate = window.delegate
+             window.delegate = self
+ 
+-            if storedWindowedTitlebarAppearsTransparent == nil {
+-                storedWindowedTitlebarAppearsTransparent = window.titlebarAppearsTransparent
+-                storedWindowedStyleMaskHadFullSizeContentView = window.styleMask.contains(.fullSizeContentView)
+-                storedWindowedTitleVisibility = window.titleVisibility
+-                storedWindowedToolbarIsVisible = window.toolbar?.isVisible
+-            }
++            storedWindowedTitlebarAppearsTransparent = window.titlebarAppearsTransparent
++            storedWindowedStyleMaskHadFullSizeContentView = window.styleMask.contains(.fullSizeContentView)
++            storedWindowedTitleVisibility = window.titleVisibility
++            storedWindowedToolbarIsVisible = window.toolbar?.isVisible
+         }
+ 
+         private func applyFullscreenChrome(window: NSWindow) {
+@@ -1060,6 +1070,10 @@
+ }
+ 
+ extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
++    func windowShouldClose(_ sender: NSWindow) -> Bool {
++        MainWindowLifecycle.shouldClose(sender, forwardingTo: forwardedDelegate)
++    }
++
+     override func responds(to aSelector: Selector!) -> Bool {
+         if super.responds(to: aSelector) {
+             return true
+--- a/Overlook/ControlMode.swift
++++ b/Overlook/ControlMode.swift
+@@ -28,15 +28,16 @@
+ 
+     @Published private(set) var mode: OverlookControlMode
+     private(set) var generation = 0
+-    private let defaults: UserDefaults
++    private let defaults: UserDefaults?
+     private var inputCaptureHandler: ((Bool) -> Void)?
+     private var waitForRemoteMutations: @MainActor @Sendable () async -> Void = {}
++    private var didResumeManualCapture: @MainActor @Sendable () async -> Void = {}
+     private var manualCaptureTask: Task<Void, Never>?
+ 
+-    init(defaults: UserDefaults = .standard) {
++    init(defaults: UserDefaults? = .standard) {
+         self.defaults = defaults
+         mode = .manual
+-        defaults.set(OverlookControlMode.manual.rawValue, forKey: Self.defaultsKey)
++        defaults?.set(OverlookControlMode.manual.rawValue, forKey: Self.defaultsKey)
+     }
+ 
+     var snapshot: ControlModeSnapshot {
+@@ -45,10 +46,12 @@
+ 
+     func configureInputCapture(
+         _ handler: @escaping (Bool) -> Void,
+-        waitForRemoteMutations: @escaping @MainActor @Sendable () async -> Void = {}
++        waitForRemoteMutations: @escaping @MainActor @Sendable () async -> Void = {},
++        didResumeManualCapture: @escaping @MainActor @Sendable () async -> Void = {}
+     ) {
+         inputCaptureHandler = handler
+         self.waitForRemoteMutations = waitForRemoteMutations
++        self.didResumeManualCapture = didResumeManualCapture
+         handler(mode != .codexHeadless)
+     }
+ 
+@@ -63,17 +66,26 @@
+         }
+         generation += 1
+         mode = newMode
+-        defaults.set(newMode.rawValue, forKey: Self.defaultsKey)
++        defaults?.set(newMode.rawValue, forKey: Self.defaultsKey)
+         if newMode == .manual {
+-            let targetSnapshot = snapshot
+-            let waitForRemoteMutations = waitForRemoteMutations
+-            manualCaptureTask = Task { [weak self] in
+-                await waitForRemoteMutations()
+-                guard !Task.isCancelled, let self, self.snapshot == targetSnapshot else { return }
+-                self.inputCaptureHandler?(true)
+-                self.manualCaptureTask = nil
+-            }
++            resumeManualCaptureIfNeeded()
+         }
+         return true
+     }
++
++    func resumeManualCaptureIfNeeded() {
++        guard mode == .manual else { return }
++        manualCaptureTask?.cancel()
++        let targetSnapshot = snapshot
++        let waitForRemoteMutations = waitForRemoteMutations
++        let didResumeManualCapture = didResumeManualCapture
++        manualCaptureTask = Task { [weak self] in
++            await waitForRemoteMutations()
++            guard !Task.isCancelled, let self, self.snapshot == targetSnapshot else { return }
++            self.inputCaptureHandler?(true)
++            await didResumeManualCapture()
++            guard !Task.isCancelled, self.snapshot == targetSnapshot else { return }
++            self.manualCaptureTask = nil
++        }
++    }
+ }
+--- /dev/null
++++ b/Overlook/FrameDeliveryState.swift
+@@ -0,0 +1,113 @@
++import Foundation
++
++struct FrameDeliveryBatch<Payload: Sendable>: Sendable {
++    let payload: Payload?
++    let firstReceivedAt: TimeInterval
++    let receivedAt: TimeInterval
++    let frameCount: Int
++}
++
++final class LatestFrameDelivery<Payload: Sendable>: @unchecked Sendable {
++    private let lock = NSLock()
++    private var pending: FrameDeliveryBatch<Payload>?
++    private var invalidated = false
++
++    /// True grants the caller one consumer wakeup. A stalled consumer owns
++    /// only the latest payload; all arrivals still contribute to its FPS count.
++    func offer(_ payload: Payload?, receivedAt: TimeInterval) -> Bool {
++        lock.lock()
++        defer { lock.unlock() }
++        guard !invalidated, receivedAt.isFinite else { return false }
++        if let previous = pending {
++            let newest = receivedAt >= previous.receivedAt
++            pending = FrameDeliveryBatch(
++                payload: newest ? payload : previous.payload,
++                firstReceivedAt: min(previous.firstReceivedAt, receivedAt),
++                receivedAt: max(previous.receivedAt, receivedAt),
++                frameCount: previous.frameCount + 1
++            )
++            return false
++        }
++        pending = FrameDeliveryBatch(payload: payload, firstReceivedAt: receivedAt, receivedAt: receivedAt, frameCount: 1)
++        return true
++    }
++
++    /// Clearing the pending slot also returns wakeup ownership to producers.
++    /// A frame arriving during consumption gets exactly one subsequent wakeup.
++    func take() -> FrameDeliveryBatch<Payload>? {
++        lock.lock()
++        defer { lock.unlock() }
++        let batch = pending
++        pending = nil
++        return batch
++    }
++
++    func invalidate() {
++        lock.lock()
++        defer { lock.unlock() }
++        invalidated = true
++        pending = nil
++    }
++}
++
++struct StreamStatsRequest: Sendable {
++    let generation: Int
++    let requestID = UUID()
++    let videoPeerID: ObjectIdentifier
++    let audioPeerID: ObjectIdentifier?
++
++    init(generation: Int, videoPeer: AnyObject, audioPeer: AnyObject?) {
++        self.generation = generation
++        videoPeerID = ObjectIdentifier(videoPeer)
++        audioPeerID = audioPeer.map(ObjectIdentifier.init)
++    }
++
++    func isCurrent(generation: Int, requestID: UUID?, videoPeer: AnyObject?, audioPeer: AnyObject?) -> Bool {
++        generation == self.generation && requestID == self.requestID &&
++            videoPeer.map(ObjectIdentifier.init) == videoPeerID &&
++            audioPeer.map(ObjectIdentifier.init) == audioPeerID
++    }
++}
++
++#if canImport(WebRTC)
++@preconcurrency import WebRTC
++
++/// Each renderer keeps the identity of the track to which it was attached.
++/// A late callback can never acquire the identity of a newer connection.
++final class SnapshotVideoRenderer: NSObject, RTCVideoRenderer, @unchecked Sendable {
++    private let sourceID: String
++    private let delivery = LatestFrameDelivery<SnapshotFrame>()
++    private let onFrame: @MainActor @Sendable (FrameDeliveryBatch<SnapshotFrame>) -> Void
++    private let onSize: @Sendable (CGSize) -> Void
++
++    init(
++        sourceID: String,
++        onFrame: @escaping @MainActor @Sendable (FrameDeliveryBatch<SnapshotFrame>) -> Void,
++        onSize: @escaping @Sendable (CGSize) -> Void
++    ) {
++        self.sourceID = sourceID
++        self.onFrame = onFrame
++        self.onSize = onSize
++    }
++
++    func renderFrame(_ frame: RTCVideoFrame?) {
++        guard let frame else { return }
++        let receivedAt = ProcessInfo.processInfo.systemUptime
++        let captured = SnapshotNativeFrame.capture(frame, sourceID: sourceID, receivedAt: receivedAt)
++        guard delivery.offer(captured, receivedAt: receivedAt) else { return }
++        Task { @MainActor [weak self] in
++            guard let self, let batch = self.delivery.take() else { return }
++            self.onFrame(batch)
++        }
++    }
++
++    func invalidate() {
++        delivery.invalidate()
++    }
++
++    func setSize(_ size: CGSize) {
++        onSize(size)
++    }
++}
++
++#endif
+--- a/Overlook/GLKVMClient.swift
++++ b/Overlook/GLKVMClient.swift
+@@ -71,6 +71,9 @@
+     var fingerbotStrength: Int
+     var videoProcessing: String
+ 
++    private var originalValues: GLKVMJSONObject = [:]
++    private var originalKnownValues: GLKVMJSONObject = [:]
++
+     enum CodingKeys: String, CodingKey {
+         case shortcuts
+         case orientation
+@@ -106,8 +109,9 @@
+         reverseScrolling = (try? container.decode(String.self, forKey: .reverseScrolling)) ?? "STANDARD"
+         keyboardControl = (try? container.decode(Bool.self, forKey: .keyboardControl)) ?? true
+         themeMode = (try? container.decode(String.self, forKey: .themeMode)) ?? "auto"
+-        if let decodedMouseJiggle = try? container.decode(Bool.self, forKey: .mouseJiggle) {
+-            mouseJiggle = decodedMouseJiggle
++        if container.contains(.mouseJiggle) {
++            // Present but malformed cannot be treated as safely unsupported.
++            mouseJiggle = try container.decode(Bool.self, forKey: .mouseJiggle)
+             supportsMouseJiggle = true
+         } else {
+             mouseJiggle = false
+@@ -118,30 +122,57 @@
+         isAbsoluteMouse = (try? container.decode(Bool.self, forKey: .isAbsoluteMouse)) ?? true
+         fingerbotStrength = (try? container.decode(Int.self, forKey: .fingerbotStrength)) ?? 0
+         videoProcessing = (try? container.decode(String.self, forKey: .videoProcessing)) ?? ""
++        originalValues = try GLKVMJSONObject(from: decoder)
++        originalKnownValues = knownValues
+     }
+ 
+     func encode(to encoder: Encoder) throws {
+-        var container = encoder.container(keyedBy: CodingKeys.self)
+-        try container.encode(shortcuts, forKey: .shortcuts)
+-        try container.encode(orientation, forKey: .orientation)
+-        try container.encode(streamQuality, forKey: .streamQuality)
+-        try container.encode(videoMode, forKey: .videoMode)
+-        try container.encode(showCursor, forKey: .showCursor)
+-        try container.encode(mousePolling, forKey: .mousePolling)
+-        try container.encode(mouseControl, forKey: .mouseControl)
+-        try container.encode(relativeSense, forKey: .relativeSense)
+-        try container.encode(scrollRate, forKey: .scrollRate)
+-        try container.encode(reverseScrolling, forKey: .reverseScrolling)
+-        try container.encode(keyboardControl, forKey: .keyboardControl)
+-        try container.encode(themeMode, forKey: .themeMode)
+-        if supportsMouseJiggle {
+-            try container.encode(mouseJiggle, forKey: .mouseJiggle)
+-        }
+-        try container.encode(keymap, forKey: .keymap)
+-        try container.encode(gotMutedPanelTip, forKey: .gotMutedPanelTip)
+-        try container.encode(isAbsoluteMouse, forKey: .isAbsoluteMouse)
+-        try container.encode(fingerbotStrength, forKey: .fingerbotStrength)
+-        try container.encode(videoProcessing, forKey: .videoProcessing)
++        try serializedValues.encode(to: encoder)
++    }
++
++    // The API accepts a complete object. Preserve unrecognized values and absence;
++    // typed defaults are only a UI view and must not become unsolicited writes.
++    private var serializedValues: GLKVMJSONObject {
++        originalValues.merging(knownValues.filter { originalKnownValues[$0.key] != $0.value }) { _, edited in edited }
++    }
++
++    func settingsEditKeys(relativeTo baseline: Self) -> Set<String> {
++        Set(knownValues.filter {
++            $0.key != CodingKeys.mouseJiggle.rawValue && baseline.knownValues[$0.key] != $0.value
++        }.map { $0.key })
++    }
++
++    func mergingSettingsEdits(from draft: Self, editedFields: Set<String>) throws -> Self {
++        let edits = draft.knownValues.filter {
++            $0.key != CodingKeys.mouseJiggle.rawValue && editedFields.contains($0.key)
++        }
++        let values = serializedValues.merging(edits) { _, edited in edited }
++        return try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(values))
++    }
++
++    private var knownValues: GLKVMJSONObject {
++        let values: GLKVMJSONObject = [
++            "shortcuts": .array(shortcuts.map { .object(["keys": .array($0.keys.map(JSONValue.string)), "label": .string($0.label)]) }),
++            "orientation": .int(orientation),
++            "stream_quality": .int(streamQuality),
++            "video_mode": .string(videoMode),
++            "show_cursor": .bool(showCursor),
++            "mouse_polling": .int(mousePolling),
++            "mouse_control": .bool(mouseControl),
++            "relative_sense": .int(relativeSense),
++            "scroll_rate": .int(scrollRate),
++            "reverse_scrolling": .string(reverseScrolling),
++            "keyboard_control": .bool(keyboardControl),
++            "theme_mode": .string(themeMode),
++            "keymap": .string(keymap),
++            "got_muted_panel_tip": .bool(gotMutedPanelTip),
++            "is_absolute_mouse": .bool(isAbsoluteMouse),
++            "fingerbot_strength": .int(fingerbotStrength),
++            "video_processing": .string(videoProcessing),
++        ]
++        return supportsMouseJiggle
++            ? values.merging([CodingKeys.mouseJiggle.rawValue: .bool(mouseJiggle)]) { _, edited in edited }
++            : values
+     }
+ }
+ 
+@@ -465,24 +496,28 @@
+         request.httpBody = body
+         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
+ 
+-        let (data, response) = try await session.data(for: request)
+-        guard let http = response as? HTTPURLResponse else {
++        let (data, response): (Data, URLResponse)
++        do {
++            try Task.checkCancellation()
++            (data, response) = try await session.data(for: request)
++            try Task.checkCancellation()
++        } catch {
++            if Task.isCancelled || error is CancellationError { throw CancellationError() }
++            throw ClientError.transportFailed
++        }
++        guard let http = response as? HTTPURLResponse else { throw ClientError.decodingFailed }
++        guard (200...299).contains(http.statusCode) else {
++            throw ClientError.httpError(statusCode: http.statusCode, body: nil)
++        }
++
++        let decoder = JSONDecoder()
++        guard let status = try? decoder.decode(GLKVMResponseStatus.self, from: data) else {
+             throw ClientError.decodingFailed
+         }
+-
+-        guard (200...299).contains(http.statusCode) else {
+-            let bodyString = String(data: data, encoding: .utf8)
+-            throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
+-        }
+-
+-        if let wrapped = try? JSONDecoder().decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data) {
+-            if let token = wrapped.result.token, !token.isEmpty {
+-                return token
+-            }
+-            if wrapped.ok == false {
+-                let bodyString = String(data: data, encoding: .utf8)
+-                throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
+-            }
++        guard status.ok else { throw ClientError.requestRejected }
++        if let wrapped = try? decoder.decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data),
++           let token = wrapped.result.token, !token.isEmpty {
++            return token
+         }
+ 
+         if let token = authTokenFromSetCookieHeaders(in: http, for: url) {
+@@ -593,7 +628,7 @@
+ 
+     return HTTPCookie
+         .cookies(withResponseHeaderFields: headerFields, for: url)
+-        .first(where: { $0.name == "auth_token" })?
++        .first(where: { $0.name == "auth_token" && !$0.value.isEmpty })?
+         .value
+ }
+ 
+@@ -1106,6 +1141,7 @@
+             case encodingFailed
+             case decodingFailed
+             case sendTimedOut
++            case sendCancelled
+ 
+             var errorDescription: String? {
+                 switch self {
+@@ -1117,6 +1153,8 @@
+                     return "WebSocket message decoding failed."
+                 case .sendTimedOut:
+                     return "WebSocket send timed out."
++                case .sendCancelled:
++                    return "WebSocket send was cancelled; remote outcome is unknown."
+                 }
+             }
+         }
+@@ -1138,6 +1176,15 @@
+             }
+         }
+ 
++        private struct PendingSend {
++            let transport: TransportState
++            let continuation: CheckedContinuation<Void, Error>
++            let deadline: Task<Void, Never>
++        }
++
++        // Actor isolation arbitrates callback, timeout, cancellation and disconnect.
++        // Foundation may never call a stalled handshake's send completion after cancel.
++        private var pendingSends: [UUID: PendingSend] = [:]
+         private var transport: TransportState?
+         private var receiveTask: Task<Void, Never>?
+         private var pingTask: Task<Void, Never>?
+@@ -1188,6 +1235,9 @@
+         }
+ 
+         func disconnect() {
++            if let transport {
++                settlePendingSends(through: transport, error: WebSocketError.sendCancelled)
++            }
+             receiveTask?.cancel()
+             receiveTask = nil
+ 
+@@ -1256,20 +1306,69 @@
+             _ message: URLSessionWebSocketTask.Message,
+             through capturedTransport: TransportState
+         ) async throws {
++            try Task.checkCancellation()
+             guard transport === capturedTransport else {
+                 throw CancellationError()
+             }
+-            let deadline = scheduleSendAbort(for: capturedTransport)
+-            defer { deadline.cancel() }
++            let operationID = UUID()
++            var didDispatch = false
+             do {
+-                try await capturedTransport.task.send(message)
++                try await withTaskCancellationHandler {
++                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
++                        guard !Task.isCancelled else {
++                            continuation.resume(throwing: CancellationError())
++                            return
++                        }
++                        let deadline = scheduleSendAbort(for: capturedTransport)
++                        pendingSends[operationID] = PendingSend(
++                            transport: capturedTransport, continuation: continuation, deadline: deadline
++                        )
++                        didDispatch = true
++                        capturedTransport.task.send(message) { [weak self] error in
++                            Task { await self?.finishSend(operationID, error: error) }
++                        }
++                    }
++                } onCancel: { [weak self] in
++                    Task { await self?.cancelSend(operationID) }
++                }
+                 try throwIfTransportTimedOut(capturedTransport)
+                 try markConnected(capturedTransport)
+             } catch {
+                 if capturedTransport.timedOut {
+                     throw WebSocketError.sendTimedOut
+                 }
++                if didDispatch && Task.isCancelled {
++                    throw WebSocketError.sendCancelled
++                }
+                 throw error
++            }
++        }
++
++        private func finishSend(_ operationID: UUID, error: Error?) {
++            guard let pending = pendingSends.removeValue(forKey: operationID) else { return }
++            pending.deadline.cancel()
++            if let error {
++                pending.continuation.resume(throwing: error)
++            } else {
++                pending.continuation.resume()
++            }
++        }
++
++        private func cancelSend(_ operationID: UUID) {
++            guard let pending = pendingSends[operationID] else { return }
++            // Once dispatched, cancellation cannot establish remote non-delivery.
++            // Retire only this transport; callers retain the uncertain outcome.
++            if transport === pending.transport {
++                markDisconnected(sendError: WebSocketError.sendCancelled)
++            } else {
++                settlePendingSends(through: pending.transport, error: WebSocketError.sendCancelled)
++            }
++        }
++
++        private func settlePendingSends(through retiredTransport: TransportState, error: Error) {
++            let operationIDs = pendingSends.filter { $0.value.transport === retiredTransport }.map(\.key)
++            for operationID in operationIDs {
++                finishSend(operationID, error: error)
+             }
+         }
+ 
+@@ -1293,7 +1392,7 @@
+             if timedOut {
+                 capturedTransport.timedOut = true
+             }
+-            markDisconnected()
++            markDisconnected(sendError: timedOut ? WebSocketError.sendTimedOut : WebSocketError.sendCancelled)
+         }
+ 
+         private func throwIfTransportTimedOut(_ completedTransport: TransportState) throws {
+@@ -1331,7 +1430,10 @@
+             try await sendHidMouseButton(button: "middle", state: false)
+         }
+ 
+-        private func markDisconnected() {
++        private func markDisconnected(sendError: Error = WebSocketError.sendCancelled) {
++            if let transport {
++                settlePendingSends(through: transport, error: sendError)
++            }
+             receiveTask?.cancel()
+             receiveTask = nil
+             pingTask?.cancel()
+--- a/Overlook/InputManager.swift
++++ b/Overlook/InputManager.swift
+@@ -1343,9 +1343,13 @@
+                 completion?(.success(()))
+             } catch {
+                 if let self {
+-                    if let webSocketError = error as? GLKVMClient.WebSocketClient.WebSocketError,
+-                       case .sendTimedOut = webSocketError {
+-                        self.latchUnconfirmedInput()
++                    if let webSocketError = error as? GLKVMClient.WebSocketClient.WebSocketError {
++                        switch webSocketError {
++                        case .sendTimedOut, .sendCancelled:
++                            self.latchUnconfirmedInput()
++                        default:
++                            break
++                        }
+                     }
+                     let errorDescription = error.localizedDescription
+                     if let feedback = HIDCommandFeedbackPolicy.failureUpdate(
+--- a/Overlook/KVMDeviceManager.swift
++++ b/Overlook/KVMDeviceManager.swift
+@@ -16,7 +16,10 @@
+     @Published private(set) var mouseJigglerEnabled: Bool?
+     @Published private(set) var mouseJigglerSupported: Bool?
+     @Published private(set) var isMouseJigglerUpdating = false
++    @Published private(set) var mouseJigglerErrorMessage: String?
+     @Published private(set) var connectionSessionID: UUID?
++    @Published private(set) var credentialStorageWarning: String?
++    @Published private(set) var credentialStorageWarningGeneration: UInt64 = 0
+     
+     private var networkMonitor: NWPathMonitor?
+     private var scanTimer: Timer?
+@@ -27,9 +30,20 @@
+     private var connectionGeneration = 0
+     private var configurationGeneration = 0
+     private var mouseJigglerRefreshTask: Task<Void, Never>?
++    private var mouseJigglerRefreshOwner: UUID?
++    private var mouseJigglerResumeIntent: MouseJigglerResumeIntent?
+     private var headlessConfigurationLockState = HeadlessConfigurationLockState()
+     private var mouseJigglerOperationState = OperationOwnershipState()
+     private let systemConfigMutationGate = RemoteMutationGate(maximumPendingMutations: 4)
++    private let persistsConnections: Bool
++    private let persistence: KVMDevicePersistence
++
++    private struct MouseJigglerResumeIntent {
++        let id = UUID()
++        let client: GLKVMClient
++        let deviceID: String
++        let connectionGeneration: Int
++    }
+ 
+     private final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
+         func urlSession(
+@@ -58,8 +72,6 @@
+         ("192.168.200.1", ScanPortPolicy.requiredPort),
+     ]
+ 
+-    private static let savedDevicesKey = "overlook.saved_devices.v1"
+-
+     private struct PersistedDevice: Codable, Hashable, Sendable {
+         let host: String
+         let port: Int
+@@ -88,10 +100,18 @@
+         }
+     }
+     
+-    override init() {
++    override convenience init() {
++        self.init(startsServices: true, persistsConnections: true)
++    }
++
++    init(startsServices: Bool, persistsConnections: Bool, persistence: KVMDevicePersistence = .live) {
++        self.persistsConnections = persistsConnections
++        self.persistence = persistence
+         super.init()
+-        setupNetworkMonitoring()
+-        loadPersistedDevices()
++        if startsServices {
++            setupNetworkMonitoring()
++            loadPersistedDevices()
++        }
+     }
+     
+     private func setupNetworkMonitoring() {
+@@ -782,11 +802,12 @@
+ 
+     @discardableResult
+     func commitConnection(_ prepared: PreparedKVMConnection) -> KVMDevice {
+-        let persisted = persistDevice(prepared.device)
++        let persisted = persistsConnections ? persistDevice(prepared.device) : prepared.device
+         connectionGeneration &+= 1
+         configurationGeneration &+= 1
+-        mouseJigglerRefreshTask?.cancel()
+-        mouseJigglerRefreshTask = nil
++        invalidateMouseJigglerRefresh()
++        mouseJigglerResumeIntent = nil
++        mouseJigglerErrorMessage = nil
+         mouseJigglerOperationState.reset()
+         connectionSessionID = UUID()
+         connectedDevice = persisted
+@@ -805,14 +826,24 @@
+             return
+         }
+ 
++        invalidateMouseJigglerRefresh()
++        let owner = UUID()
++        mouseJigglerRefreshOwner = owner
+         await refreshMouseJigglerState(
+             client: client,
+             deviceID: deviceID,
+-            generation: connectionGeneration
++            generation: connectionGeneration,
++            configurationGeneration: configurationGeneration,
++            owner: owner
+         )
++        if mouseJigglerRefreshOwner == owner { mouseJigglerRefreshOwner = nil }
+     }
+ 
+     func setMouseJigglerEnabled(_ enabled: Bool) async throws {
++        try await setMouseJigglerEnabled(enabled, preservesResumeIntent: false)
++    }
++
++    private func setMouseJigglerEnabled(_ enabled: Bool, preservesResumeIntent: Bool) async throws {
+         guard MouseJigglerPolicy.allowsRequestedState(
+             enabled,
+             isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
+@@ -822,6 +853,9 @@
+         guard let client = glkvmClient, let deviceID = connectedDevice?.id else {
+             throw MouseJigglerError.unavailable
+         }
++        if !preservesResumeIntent { mouseJigglerResumeIntent = nil }
++        mouseJigglerErrorMessage = nil
++        invalidateMouseJigglerRefresh()
+ 
+         let generation = connectionGeneration
+         configurationGeneration &+= 1
+@@ -865,7 +899,21 @@
+                 }
+ 
+                 current.mouseJiggle = enabled
+-                _ = try await client.setSystemConfig(current)
++                do {
++                    _ = try await client.setSystemConfig(current)
++                } catch {
++                    if enabled {
++                        _ = try await self.disableInterruptedHeadlessJiggler(
++                            client: client, deviceID: deviceID, generation: generation, config: current
++                        )
++                    }
++                    throw error
++                }
++                if enabled, try await self.disableInterruptedHeadlessJiggler(
++                    client: client, deviceID: deviceID, generation: generation, config: current
++                ) {
++                    throw CancellationError()
++                }
+                 guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                       self.configurationGeneration == operationGeneration
+                 else {
+@@ -878,7 +926,22 @@
+                     throw MouseJigglerError.settingsLockedForHeadless
+                 }
+ 
+-                return try await client.getSystemConfig()
++                let readback: GLKVMSystemConfig
++                do { readback = try await client.getSystemConfig() }
++                catch {
++                    if enabled {
++                        _ = try await self.disableInterruptedHeadlessJiggler(
++                            client: client, deviceID: deviceID, generation: generation, config: current
++                        )
++                    }
++                    throw error
++                }
++                if enabled, try await self.disableInterruptedHeadlessJiggler(
++                    client: client, deviceID: deviceID, generation: generation, config: readback
++                ) {
++                    throw CancellationError()
++                }
++                return readback
+             }
+ 
+             guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+@@ -910,8 +973,35 @@
+         }
+     }
+ 
++    private func disableInterruptedHeadlessJiggler(
++        client: GLKVMClient, deviceID: String, generation: Int, config: GLKVMSystemConfig
++    ) async throws -> Bool {
++        guard headlessConfigurationLockState.isLocked,
++              isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
++        // Sent firmware writes can outlive cancellation. Keep the mutation gate
++        // occupied until the non-cancelled recovery completes.
++        return try await Task { @MainActor in
++            guard self.headlessConfigurationLockState.isLocked,
++                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
++            var disabledConfig = config
++            disabledConfig.mouseJiggle = false
++            _ = try await client.setSystemConfig(disabledConfig)
++            guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return true }
++            let disabled = try await client.getSystemConfig()
++            guard disabled.supportsMouseJiggle, !disabled.mouseJiggle else {
++                throw MouseJigglerError.readbackMismatch
++            }
++            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
++               self.headlessConfigurationLockState.isLocked {
++                self.mouseJigglerEnabled = false
++            }
++            return true
++        }.value
++    }
++
+     func applySystemConfig(
+         _ config: GLKVMSystemConfig,
++        editedFields: Set<String>,
+         connectionSessionID expectedSessionID: UUID
+     ) async throws -> GLKVMSystemConfig {
+         guard MouseJigglerPolicy.allowsSettingsApply(
+@@ -953,9 +1043,7 @@
+             ) else {
+                 throw MouseJigglerError.settingsLockedForHeadless
+             }
+-            var merged = config
+-            merged.mouseJiggle = current.mouseJiggle
+-            merged.supportsMouseJiggle = current.supportsMouseJiggle
++            let merged = try current.mergingSettingsEdits(from: config, editedFields: editedFields)
+             let updated = try await client.setSystemConfig(merged)
+             guard self.connectionSessionID == expectedSessionID,
+                   self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+@@ -983,8 +1071,45 @@
+     }
+ 
+     func beginHeadlessConfigurationTransition() -> UUID {
++        if mouseJigglerResumeIntent == nil, mouseJigglerEnabled == true,
++           let client = glkvmClient, let deviceID = connectedDevice?.id {
++            mouseJigglerResumeIntent = MouseJigglerResumeIntent(
++                client: client, deviceID: deviceID, connectionGeneration: connectionGeneration
++            )
++        }
+         configurationGeneration &+= 1
++        invalidateMouseJigglerRefresh()
+         return headlessConfigurationLockState.beginTransition()
++    }
++
++    func pauseMouseJigglerForHeadless() async throws {
++        guard let supported = mouseJigglerSupported else { throw MouseJigglerError.unavailable }
++        if supported {
++            try await setMouseJigglerEnabled(false, preservesResumeIntent: true)
++            guard mouseJigglerEnabled == false else { throw MouseJigglerError.readbackMismatch }
++        }
++    }
++
++    func resumeMouseJigglerAfterHeadless() async throws {
++        guard let intent = mouseJigglerResumeIntent else { return }
++        guard isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration) else {
++            mouseJigglerResumeIntent = nil
++            return
++        }
++        guard !headlessConfigurationLockState.isLocked else { return }
++        do {
++            try await setMouseJigglerEnabled(true, preservesResumeIntent: true)
++            if mouseJigglerResumeIntent?.id == intent.id { mouseJigglerResumeIntent = nil }
++        } catch is CancellationError {
++            throw CancellationError()
++        } catch {
++            if mouseJigglerResumeIntent?.id == intent.id,
++               isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration),
++               !headlessConfigurationLockState.isLocked {
++                mouseJigglerErrorMessage = "The KVM could not restore the mouse jiggler. Check its state before enabling it again."
++            }
++            throw error
++        }
+     }
+ 
+     func endHeadlessConfigurationTransition(_ owner: UUID) {
+@@ -993,36 +1118,70 @@
+ 
+     func setHeadlessModeActive(_ isActive: Bool) {
+         configurationGeneration &+= 1
++        invalidateMouseJigglerRefresh()
+         headlessConfigurationLockState.setHeadlessModeActive(isActive)
+     }
+ 
++    private func invalidateMouseJigglerRefresh() {
++        mouseJigglerRefreshOwner = nil
++        mouseJigglerRefreshTask?.cancel()
++        mouseJigglerRefreshTask = nil
++    }
++
+     private func scheduleMouseJigglerRefresh(client: GLKVMClient, deviceID: String, generation: Int) {
+-        mouseJigglerRefreshTask?.cancel()
++        invalidateMouseJigglerRefresh()
++        let owner = UUID()
++        let configurationGeneration = configurationGeneration
++        mouseJigglerRefreshOwner = owner
+         mouseJigglerRefreshTask = Task { [weak self] in
+             guard let self else { return }
+-            await self.refreshMouseJigglerState(client: client, deviceID: deviceID, generation: generation)
+-            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) {
++            await self.refreshMouseJigglerState(
++                client: client, deviceID: deviceID, generation: generation,
++                configurationGeneration: configurationGeneration, owner: owner
++            )
++            if self.mouseJigglerRefreshOwner == owner {
++                self.mouseJigglerRefreshOwner = nil
+                 self.mouseJigglerRefreshTask = nil
+             }
+         }
+     }
+ 
+-    private func refreshMouseJigglerState(client: GLKVMClient, deviceID: String, generation: Int) async {
+-        do {
+-            let config = try await systemConfigMutationGate.perform { [weak self] in
+-                guard let self,
+-                      self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
+-                else {
+-                    throw CancellationError()
+-                }
+-                return try await client.getSystemConfig()
+-            }
+-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+-            mouseJigglerSupported = config.supportsMouseJiggle
+-            mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
+-        } catch {
+-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+-            mouseJigglerEnabled = nil
++    private func refreshMouseJigglerState(
++        client: GLKVMClient, deviceID: String, generation: Int,
++        configurationGeneration expectedConfigurationGeneration: Int, owner: UUID
++    ) async {
++        func isCurrentRefresh() -> Bool {
++            !Task.isCancelled && mouseJigglerRefreshOwner == owner
++                && configurationGeneration == expectedConfigurationGeneration
++                && isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
++        }
++        for attempt in 0..<3 {
++            guard isCurrentRefresh() else { return }
++            do {
++                let config = try await systemConfigMutationGate.perform {
++                    guard isCurrentRefresh() else { throw CancellationError() }
++                    return try await client.getSystemConfig()
++                }
++                guard isCurrentRefresh() else { return }
++                mouseJigglerSupported = config.supportsMouseJiggle
++                mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
++                return
++            } catch {
++                guard isCurrentRefresh(), !(error is CancellationError) else { return }
++                let isTransportFailure: Bool
++                if case GLKVMClient.ClientError.transportFailed = error { isTransportFailure = true }
++                else if let urlError = error as? URLError {
++                    isTransportFailure = [.timedOut, .networkConnectionLost, .cannotConnectToHost,
++                        .cannotFindHost, .notConnectedToInternet].contains(urlError.code)
++                } else { isTransportFailure = false }
++                if isTransportFailure, attempt < 2 {
++                    do { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 100_000_000) }
++                    catch { return }
++                    continue
++                }
++                mouseJigglerEnabled = nil
++                return
++            }
+         }
+     }
+ 
+@@ -1035,8 +1194,9 @@
+     private func clearConnectedDevice() {
+         connectionGeneration &+= 1
+         configurationGeneration &+= 1
+-        mouseJigglerRefreshTask?.cancel()
+-        mouseJigglerRefreshTask = nil
++        invalidateMouseJigglerRefresh()
++        mouseJigglerResumeIntent = nil
++        mouseJigglerErrorMessage = nil
+         mouseJigglerEnabled = nil
+         mouseJigglerSupported = nil
+         mouseJigglerOperationState.reset()
+@@ -1048,18 +1208,22 @@
+     }
+ 
+     private func persistDevice(_ device: KVMDevice) -> KVMDevice {
+-        let tokenStored = device.authToken.isEmpty || KVMTokenStore.save(device.authToken, host: device.host, port: device.port)
++        let existing = readPersistedDevices()
++        let previous = existing.last { $0.host == device.host && $0.port == device.port }
++        let tokenStored = !device.authToken.isEmpty && persistence.saveToken(device.authToken, device.host, device.port)
++        credentialStorageWarning = device.authToken.isEmpty || tokenStored ? nil : "Der Zugangstoken konnte nicht sicher im Schlüsselbund gespeichert werden. Die Verbindung funktioniert für diese Sitzung; bei der nächsten Anmeldung kann der Token erneut erforderlich sein."
++        if credentialStorageWarning != nil { credentialStorageWarningGeneration &+= 1 }
+         let record = PersistedDevice(
+             host: device.host,
+             port: device.port,
+             name: device.name,
+             type: device.type,
+-            authToken: tokenStored ? nil : device.authToken,
++            authToken: tokenStored ? nil : previous?.authToken,
+             capabilities: device.capabilities
+         )
+ 
+         let current = EndpointRecordPolicy.replacing(
+-            readPersistedDevices(),
++            existing,
+             with: record
+         ) { "\($0.host):\($0.port)" }
+         writePersistedDevices(current)
+@@ -1151,13 +1315,13 @@
+     }
+ 
+     private func readPersistedDevices() -> [PersistedDevice] {
+-        guard let data = UserDefaults.standard.data(forKey: Self.savedDevicesKey) else { return [] }
++        guard let data = persistence.readRecords() else { return [] }
+         return (try? JSONDecoder().decode([PersistedDevice].self, from: data)) ?? []
+     }
+ 
+     private func writePersistedDevices(_ devices: [PersistedDevice]) {
+         guard let data = try? JSONEncoder().encode(devices) else { return }
+-        UserDefaults.standard.set(data, forKey: Self.savedDevicesKey)
++        persistence.writeRecords(data)
+     }
+     
+     private func validateDeviceConnection(_ device: KVMDevice) async throws -> Bool {
+@@ -1225,6 +1389,19 @@
+     }
+ }
+ 
++// Injected in local tests to avoid reading or writing real credentials/defaults.
++struct KVMDevicePersistence {
++    let readRecords: () -> Data?
++    let writeRecords: (Data) -> Void
++    let saveToken: (String, String, Int) -> Bool
++
++    static let live = KVMDevicePersistence(
++        readRecords: { UserDefaults.standard.data(forKey: "overlook.saved_devices.v1") },
++        writeRecords: { UserDefaults.standard.set($0, forKey: "overlook.saved_devices.v1") },
++        saveToken: { KVMTokenStore.save($0, host: $1, port: $2) }
++    )
++}
++
+ private enum KVMTokenStore {
+     private static let service = "com.overlook.app.kvm-token"
+ 
+--- /dev/null
++++ b/Overlook/MainWindowLifecycle.swift
+@@ -0,0 +1,39 @@
++import AppKit
++
++@MainActor
++enum MainWindowLifecycle {
++    private static weak var mainWindow: NSWindow?
++
++    static func register(_ window: NSWindow) {
++        mainWindow = window
++        window.isReleasedWhenClosed = false
++    }
++
++    @discardableResult
++    static func show(in windows: [NSWindow]) -> NSWindow? {
++        guard let window = mainWindow, windows.contains(where: { $0 === window }) else { return nil }
++        if window.isMiniaturized { window.deminiaturize(nil) }
++        window.makeKeyAndOrderFront(nil)
++        return window
++    }
++
++    static func shouldClose(_ window: NSWindow, forwardingTo delegate: NSWindowDelegate?) -> Bool {
++        guard window === mainWindow else {
++            return delegate?.windowShouldClose?(window) ?? true
++        }
++        // A single scene owns the video renderer and UI/session state. Keep that
++        // scene alive for Menu Bar and Headless control when its window is hidden.
++        window.orderOut(nil)
++        return false
++    }
++}
++
++final class MainWindowAttachmentView: NSView {
++    var onWindowAttached: (@MainActor (NSWindow) -> Void)?
++
++    override func viewDidMoveToWindow() {
++        super.viewDidMoveToWindow()
++        guard let window else { return }
++        onWindowAttached?(window)
++    }
++}
+--- a/Overlook/OverlookApp.swift
++++ b/Overlook/OverlookApp.swift
+@@ -11,7 +11,7 @@
+     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+     
+     var body: some Scene {
+-        WindowGroup {
++        Window("Overlook", id: "main") {
+             ContentView()
+                 .environmentObject(appDelegate.webRTCManager)
+                 .environmentObject(appDelegate.inputManager)
+@@ -91,6 +91,16 @@
+             },
+             waitForRemoteMutations: { [weak self] in
+                 await self?.localControlServer.waitForMutationsToDrain()
++            },
++            didResumeManualCapture: { [weak self] in
++                guard !Task.isCancelled, let self else { return }
++                do {
++                    try await self.kvmDeviceManager.resumeMouseJigglerAfterHeadless()
++                } catch is CancellationError {
++                    return
++                } catch {
++                    // The manager publishes a bounded message for the UI.
++                }
+             }
+         )
+         localControlServer.setModeProvider { [weak self] in
+@@ -126,9 +136,16 @@
+         NSApp.setActivationPolicy(.regular)
+         NSApp.activate(ignoringOtherApps: true)
+ 
+-        let windows = NSApp.windows
+-        let candidate = windows.first(where: { $0.canBecomeKey && $0.isVisible }) ?? windows.first(where: { $0.canBecomeKey })
+-        candidate?.makeKeyAndOrderFront(nil)
++        MainWindowLifecycle.show(in: NSApp.windows)
++    }
++
++    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
++        showMainWindow()
++        return false
++    }
++
++    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
++        false
+     }
+     
+     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+--- a/Overlook/WebRTCManager.swift
++++ b/Overlook/WebRTCManager.swift
+@@ -116,6 +116,7 @@
+ 
+     private var lastInboundVideoBytesReceived: Int64?
+     private var lastInboundVideoBytesTimestamp: TimeInterval?
++    private var streamStatsRequestID: UUID?
+ 
+     private var lastInboundAudioBytesReceived: Int64?
+     private var lastInboundAudioBytesTimestamp: TimeInterval?
+@@ -179,6 +180,7 @@
+     }
+ 
+     private func invalidateSnapshotSource(endpointURL: URL? = nil) {
++        videoRenderer?.invalidate()
+         if let videoRenderer { videoTrack?.remove(videoRenderer) }
+         if let videoView { videoTrack?.remove(videoView) }
+         videoRenderer = nil
+@@ -186,6 +188,9 @@
+         snapshotProvider.resetSource(endpointURL: endpointURL)
+         currentFrame = nil
+         lastFrameCaptureTime = 0
++        fpsWindowStartTime = 0
++        fpsFrameCount = 0
++        lastFpsPublishTime = 0
+     }
+     
+     override init() {
+@@ -965,7 +970,9 @@
+ 
+     private func measureStreamStats() async {
+         guard let peerConnection else {
++            streamStatsRequestID = nil
+             await MainActor.run {
++                guard self.peerConnection == nil else { return }
+                 inboundVideoKbps = nil
+                 inboundVideoPlayoutDelayMs = nil
+                 inboundVideoJitterMs = nil
+@@ -981,6 +988,18 @@
+             return
+         }
+ 
++        let measuredAudioPeer = audioPeerConnection
++        let request = StreamStatsRequest(
++            generation: connectionGeneration, videoPeer: peerConnection, audioPeer: measuredAudioPeer
++        )
++        streamStatsRequestID = request.requestID
++        func requestIsCurrent() -> Bool {
++            request.isCurrent(
++                generation: connectionGeneration, requestID: streamStatsRequestID,
++                videoPeer: self.peerConnection, audioPeer: self.audioPeerConnection
++            )
++        }
++
+         if preferLowLatencyPlayout {
+             let now = Date().timeIntervalSince1970
+             if lastPlayoutHintApplyTime == nil || (now - (lastPlayoutHintApplyTime ?? 0)) > 2.0 {
+@@ -993,6 +1012,7 @@
+         let lastTs = lastInboundVideoBytesTimestamp
+ 
+         let report = await peerConnection.statistics()
++        guard requestIsCurrent() else { return }
+         func numberValue(_ any: Any?) -> NSNumber? {
+             any as? NSNumber
+         }
+@@ -1054,6 +1074,7 @@
+ 
+         guard let bytesReceived else {
+             await MainActor.run {
++                guard requestIsCurrent() else { return }
+                 self.lastInboundVideoBytesReceived = nil
+                 self.lastInboundVideoBytesTimestamp = nil
+                 self.inboundVideoKbps = nil
+@@ -1118,6 +1139,7 @@
+         }
+ 
+         await MainActor.run {
++            guard requestIsCurrent() else { return }
+             self.lastInboundVideoBytesReceived = bytesReceived
+             self.lastInboundVideoBytesTimestamp = now
+             self.lastJitterBufferDelaySeconds = jitterBufferDelaySeconds
+@@ -1130,8 +1152,10 @@
+             self.iceCurrentRoundTripTimeMs = rttMs
+         }
+ 
+-        guard let audioPeerConnection else {
++        guard requestIsCurrent() else { return }
++        guard let audioPeerConnection = measuredAudioPeer else {
+             await MainActor.run {
++                guard requestIsCurrent() else { return }
+                 self.lastInboundAudioBytesReceived = nil
+                 self.lastInboundAudioBytesTimestamp = nil
+                 self.lastAudioJitterBufferDelaySeconds = nil
+@@ -1149,6 +1173,7 @@
+         let lastAudioTs = lastInboundAudioBytesTimestamp
+ 
+         let audioReport = await audioPeerConnection.statistics()
++        guard requestIsCurrent() else { return }
+         func audioNumberValue(_ any: Any?) -> NSNumber? {
+             any as? NSNumber
+         }
+@@ -1201,6 +1226,7 @@
+ 
+         guard let audioBytesReceived else {
+             await MainActor.run {
++                guard requestIsCurrent() else { return }
+                 self.lastInboundAudioBytesReceived = nil
+                 self.lastInboundAudioBytesTimestamp = nil
+                 self.lastAudioJitterBufferDelaySeconds = nil
+@@ -1257,6 +1283,7 @@
+         }
+ 
+         await MainActor.run {
++            guard requestIsCurrent() else { return }
+             self.lastInboundAudioBytesReceived = audioBytesReceived
+             self.lastInboundAudioBytesTimestamp = audioNow
+             self.lastAudioJitterBufferDelaySeconds = audioJitterBufferDelaySeconds
+@@ -1301,6 +1328,7 @@
+     private func tearDown(cancelReconnect: Bool) {
+         invalidateSnapshotSource()
+         connectionGeneration += 1
++        streamStatsRequestID = nil
+         signalingListenerTask?.cancel()
+         signalingListenerTask = nil
+         if cancelReconnect {
+@@ -1545,10 +1573,8 @@
+         let sourceID = snapshotSourceID
+         let renderer = SnapshotVideoRenderer(
+             sourceID: sourceID,
+-            onFrame: { [weak self] frame, receivedAt in
+-                Task { @MainActor in
+-                    self?.acceptVideoFrame(frame, receivedAt: receivedAt, sourceID: sourceID)
+-                }
++            onFrame: { [weak self] batch in
++                self?.acceptVideoFrame(batch, sourceID: sourceID)
+             },
+             onSize: { [weak self] size in
+                 Task { @MainActor in
+@@ -1600,17 +1626,21 @@
+ 
+ // MARK: - Source-bound video observation
+ extension WebRTCManager {
+-    fileprivate func acceptVideoFrame(_ frame: SnapshotFrame?, receivedAt now: TimeInterval, sourceID: String) {
++    fileprivate func acceptVideoFrame(_ batch: FrameDeliveryBatch<SnapshotFrame>, sourceID: String) {
+         guard sourceID == snapshotSourceID else { return }
+-
++        let frame = batch.payload
++        let now = batch.receivedAt
++
++        fpsFrameCount += batch.frameCount
++        // Delegate threads can arrive out of timestamp order after a drain.
++        // Their FPS count remains valid, but old frames cannot regress health.
++        if let lastReceivedAt = getLastVideoFrameTime(), now < lastReceivedAt { return }
+         setLastVideoFrameTime(now)
+ 
+         if fpsWindowStartTime == 0 {
+-            fpsWindowStartTime = now
+-            lastFpsPublishTime = now
+-        }
+-
+-        fpsFrameCount += 1
++            fpsWindowStartTime = batch.firstReceivedAt
++            lastFpsPublishTime = batch.firstReceivedAt
++        }
+ 
+         if now - lastFpsPublishTime >= 0.5 {
+             let dt = now - fpsWindowStartTime
+@@ -1641,35 +1671,6 @@
+         currentFrame = frame.pixelBuffer
+     }
+ 
+-}
+-
+-/// Each renderer keeps the identity of the track to which it was attached.
+-/// A late callback can never acquire the identity of a newer connection.
+-private final class SnapshotVideoRenderer: NSObject, RTCVideoRenderer, @unchecked Sendable {
+-    private let sourceID: String
+-    private let onFrame: @Sendable (SnapshotFrame?, TimeInterval) -> Void
+-    private let onSize: @Sendable (CGSize) -> Void
+-
+-    init(
+-        sourceID: String,
+-        onFrame: @escaping @Sendable (SnapshotFrame?, TimeInterval) -> Void,
+-        onSize: @escaping @Sendable (CGSize) -> Void
+-    ) {
+-        self.sourceID = sourceID
+-        self.onFrame = onFrame
+-        self.onSize = onSize
+-    }
+-
+-    func renderFrame(_ frame: RTCVideoFrame?) {
+-        guard let frame else { return }
+-        let receivedAt = ProcessInfo.processInfo.systemUptime
+-        let captured = SnapshotNativeFrame.capture(frame, sourceID: sourceID, receivedAt: receivedAt)
+-        onFrame(captured, receivedAt)
+-    }
+-
+-    func setSize(_ size: CGSize) {
+-        onSize(size)
+-    }
+ }
+ 
+ // MARK: - Supporting Types
+--- a/Overlook/WebUISettingsPanel.swift
++++ b/Overlook/WebUISettingsPanel.swift
+@@ -14,6 +14,8 @@
+     @AppStorage("overlook.audio.outputDeviceUID") private var audioOutputDeviceUID: String = ""
+ 
+     @State private var config: GLKVMSystemConfig?
++    @State private var editedConfigFields: Set<String> = []
++    @State private var configDraftGeneration = 0
+     @State private var configConnectionSessionID: UUID?
+     @State private var keymaps: GLKVMHidKeymapsState?
+     @State private var streamerState: GLKVMStreamerState?
+@@ -721,6 +723,7 @@
+             applyStreamerTask?.cancel()
+             applyStreamerTask = nil
+             config = nil
++            editedConfigFields = []
+             configConnectionSessionID = nil
+             isLoading = false
+             isApplying = false
+@@ -732,6 +735,7 @@
+             applyTask?.cancel()
+             applyStreamerTask?.cancel()
+             config = nil
++            editedConfigFields = []
+             configConnectionSessionID = nil
+             isLoading = false
+             isApplying = false
+@@ -883,6 +887,7 @@
+         else {
+             await MainActor.run {
+                 config = nil
++                editedConfigFields = []
+                 configConnectionSessionID = nil
+                 keymaps = nil
+                 streamerState = nil
+@@ -911,6 +916,8 @@
+                     return
+                 }
+                 self.config = config
++                editedConfigFields = []
++                configDraftGeneration &+= 1
+                 configConnectionSessionID = connectionSessionID
+                 inputManager.setGLKVMAbsoluteMouseMode(config.isAbsoluteMouse)
+                 webRTCManager.setPreferLowLatencyPlayout(config.videoProcessing == "low_latency_first")
+@@ -1203,13 +1210,18 @@
+     }
+ 
+     private func updateConfig(_ mutate: (inout GLKVMSystemConfig) -> Void) {
+-        guard var config else { return }
+-        mutate(&config)
+-        self.config = config
+-        scheduleApply(config)
++        guard let previous = config else { return }
++        var updated = previous
++        mutate(&updated)
++        self.config = updated
++        editedConfigFields = editedConfigFields.union(updated.settingsEditKeys(relativeTo: previous))
++        scheduleApply(updated)
+     }
+ 
+     private func scheduleApply(_ config: GLKVMSystemConfig) {
++        let editedFields = editedConfigFields
++        configDraftGeneration &+= 1
++        let generation = configDraftGeneration
+         applyTask?.cancel()
+         applyTask = Task {
+             do {
+@@ -1218,11 +1230,11 @@
+                 return
+             }
+             guard !Task.isCancelled, isPresented else { return }
+-            await apply(config)
+-        }
+-    }
+-
+-    private func apply(_ config: GLKVMSystemConfig) async {
++            await apply(config, editedFields: editedFields, generation: generation)
++        }
++    }
++
++    private func apply(_ config: GLKVMSystemConfig, editedFields: Set<String>, generation: Int) async {
+         guard let connectionSessionID = configConnectionSessionID,
+               kvmDeviceManager.connectionSessionID == connectionSessionID
+         else { return }
+@@ -1230,23 +1242,23 @@
+         do {
+             let updated = try await kvmDeviceManager.applySystemConfig(
+                 config,
++                editedFields: editedFields,
+                 connectionSessionID: connectionSessionID
+             )
+             await MainActor.run {
+-                guard isPresented,
+-                      kvmDeviceManager.connectionSessionID == connectionSessionID
+-                else {
+-                    isApplying = false
+-                    return
+-                }
++                guard !Task.isCancelled, generation == configDraftGeneration,
++                      isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID
++                else { return }
+                 self.config = updated
++                editedConfigFields = []
+                 inputManager.setGLKVMAbsoluteMouseMode(updated.isAbsoluteMouse)
+                 isApplying = false
+             }
+         } catch {
+             await MainActor.run {
++                guard generation == configDraftGeneration else { return }
+                 isApplying = false
+-                if isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
++                if !Task.isCancelled, isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
+                     recordError("Failed to apply settings: \(error)")
+                 }
+             }
+--- a/Overlook.xcodeproj/project.pbxproj
++++ b/Overlook.xcodeproj/project.pbxproj
+@@ -37,6 +37,8 @@
+ 		01000025 /* KVMDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000027 /* KVMDevice.swift */; };
+ 		01000026 /* SessionConnectionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000028 /* SessionConnectionCoordinator.swift */; };
+ 		01000027 /* LocalInputCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000029 /* LocalInputCapture.swift */; };
++		01000028 /* FrameDeliveryState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002A /* FrameDeliveryState.swift */; };
++		01000029 /* MainWindowLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002B /* MainWindowLifecycle.swift */; };
+ /* End PBXBuildFile section */
+ 
+ /* Begin PBXFileReference section */
+@@ -74,6 +76,8 @@
+ 		02000027 /* KVMDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVMDevice.swift; sourceTree = "<group>"; };
+ 		02000028 /* SessionConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionConnectionCoordinator.swift; sourceTree = "<group>"; };
+ 		02000029 /* LocalInputCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInputCapture.swift; sourceTree = "<group>"; };
++		0200002A /* FrameDeliveryState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameDeliveryState.swift; sourceTree = "<group>"; };
++		0200002B /* MainWindowLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowLifecycle.swift; sourceTree = "<group>"; };
+ /* End PBXFileReference section */
+ 
+ /* Begin PBXFrameworksBuildPhase section */
+@@ -107,6 +111,8 @@
+ 				02000025 /* RemoteSnapshot.swift */,
+ 				02000026 /* RemoteActionState.swift */,
+ 				02000029 /* LocalInputCapture.swift */,
++				0200002A /* FrameDeliveryState.swift */,
++				0200002B /* MainWindowLifecycle.swift */,
+ 				02000028 /* SessionConnectionCoordinator.swift */,
+ 				02000027 /* KVMDevice.swift */,
+ 				02000019 /* ContentControlBar.swift */,
+@@ -228,6 +234,8 @@
+ 				01000023 /* RemoteSnapshot.swift in Sources */,
+ 				01000024 /* RemoteActionState.swift in Sources */,
+ 				01000027 /* LocalInputCapture.swift in Sources */,
++				01000028 /* FrameDeliveryState.swift in Sources */,
++				01000029 /* MainWindowLifecycle.swift in Sources */,
+ 				01000026 /* SessionConnectionCoordinator.swift in Sources */,
+ 				01000025 /* KVMDevice.swift in Sources */,
+ 				0100001A /* ContentControlBar.swift in Sources */,
+--- a/mcp/overlook-control/package-lock.json
++++ b/mcp/overlook-control/package-lock.json
+@@ -8,12 +8,12 @@
+       "name": "overlook-control-mcp",
+       "version": "1.0.0",
+       "dependencies": {
+-        "@modelcontextprotocol/server": "2.0.0",
+-        "zod": "4.4.3"
++        "@modelcontextprotocol/server": "2.2.0",
++        "zod": "4.6.5"
+       },
+       "devDependencies": {
+-        "@modelcontextprotocol/client": "^2.0.0",
+-        "@types/node": "26.2.0",
++        "@modelcontextprotocol/client": "2.2.0",
++        "@types/node": "26.6.4",
+         "typescript": "7.0.2"
+       },
+       "engines": {
+@@ -21,13 +21,13 @@
+       }
+     },
+     "node_modules/@modelcontextprotocol/client": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/client/-/client-2.0.0.tgz",
+-      "integrity": "sha512-8f1OghQ2rjzIOfqgUCP+8GiUWqRs89njoWLNqAe8kWmDePv3s1fZXseej+QXemssEuuOvLLmLO/kqM3IQHtISw==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "@modelcontextprotocol/core": "2.0.0",
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/client/-/client-2.2.0.tgz",
++      "integrity": "sha512-LxCou/CSYQ6dwEnjhLZY0KnEuc8V4UJ3IEQCl/uR2yHobSQIEdJKUlKLRYRF5i5FqRGHy1eK7une3aAWDHLtig==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@modelcontextprotocol/core": "2.2.0",
+         "cross-spawn": "^7.0.5",
+         "eventsource": "^3.0.2",
+         "eventsource-parser": "^3.0.0",
+@@ -40,9 +40,9 @@
+       }
+     },
+     "node_modules/@modelcontextprotocol/core": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/core/-/core-2.0.0.tgz",
+-      "integrity": "sha512-pJCEwGG7Lfr/+PQp9ZTwKXNeO5wzbfKL7H3MYpCorM4oFBoQrdjnBgEoqG+RjhsvS1FKrDbKux+M1HhlnGWqcA==",
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/core/-/core-2.2.0.tgz",
++      "integrity": "sha512-iLhmprRmWI8EcosOA3wVvww22z02NkgqhV4fBH6f/odQBsi7xnJc0HGmi21yWO+/iKw2yzqVE127Zhna5/+JXw==",
+       "license": "MIT",
+       "dependencies": {
+         "zod": "^4.2.0"
+@@ -52,12 +52,12 @@
+       }
+     },
+     "node_modules/@modelcontextprotocol/server": {
+-      "version": "2.0.0",
+-      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/server/-/server-2.0.0.tgz",
+-      "integrity": "sha512-YhHWdHfpFMQfd0prsEnxKeS3Qz3ytIGmsS0sth4KDjnacIT7hxk6hXHkJ9KysxlkvTM+WZAtQbbcUhdoP4Hvtw==",
+-      "license": "MIT",
+-      "dependencies": {
+-        "@modelcontextprotocol/core": "2.0.0",
++      "version": "2.2.0",
++      "resolved": "https://registry.npmjs.org/@modelcontextprotocol/server/-/server-2.2.0.tgz",
++      "integrity": "sha512-qFnltjus6Gk8Lx6J1w2RXmr3YPN22MNT6qD6zjAkaiWIlFIFxWClz0rXHNuJF/KSUyn5YGhkSvXkWDbQHVLFEQ==",
++      "license": "MIT",
++      "dependencies": {
++        "@modelcontextprotocol/core": "2.2.0",
+         "zod": "^4.2.0"
+       },
+       "engines": {
+@@ -65,13 +65,13 @@
+       }
+     },
+     "node_modules/@types/node": {
+-      "version": "26.2.0",
+-      "resolved": "https://registry.npmjs.org/@types/node/-/node-26.2.0.tgz",
+-      "integrity": "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg==",
+-      "dev": true,
+-      "license": "MIT",
+-      "dependencies": {
+-        "undici-types": "~8.3.0"
++      "version": "26.6.4",
++      "resolved": "https://registry.npmjs.org/@types/node/-/node-26.6.4.tgz",
++      "integrity": "sha512-ldVPDCzj7fsaGZrLB0NuHuTvJcsNasysBAqMolr/cgxrLd1xbqxIr3XJiPnHHJUCxj5sNF1vnRj9aWnrVh5Jcg==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "undici-types": "~8.9.0"
+       }
+     },
+     "node_modules/@typescript/typescript-aix-ppc64": {
+@@ -548,9 +548,9 @@
+       }
+     },
+     "node_modules/undici-types": {
+-      "version": "8.3.0",
+-      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-8.3.0.tgz",
+-      "integrity": "sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ==",
++      "version": "8.9.0",
++      "resolved": "https://registry.npmjs.org/undici-types/-/undici-types-8.9.0.tgz",
++      "integrity": "sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==",
+       "dev": true,
+       "license": "MIT"
+     },
+@@ -571,9 +571,9 @@
+       }
+     },
+     "node_modules/zod": {
+-      "version": "4.4.3",
+-      "resolved": "https://registry.npmjs.org/zod/-/zod-4.4.3.tgz",
+-      "integrity": "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==",
++      "version": "4.6.5",
++      "resolved": "https://registry.npmjs.org/zod/-/zod-4.6.5.tgz",
++      "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
+       "license": "MIT",
+       "funding": {
+         "url": "https://github.com/sponsors/colinhacks"
+--- a/mcp/overlook-control/package.json
++++ b/mcp/overlook-control/package.json
+@@ -12,12 +12,12 @@
+     "start": "node dist/index.js"
+   },
+   "dependencies": {
+-    "@modelcontextprotocol/server": "2.0.0",
+-    "zod": "4.4.3"
++    "@modelcontextprotocol/server": "2.2.0",
++    "zod": "4.6.5"
+   },
+   "devDependencies": {
+-    "@modelcontextprotocol/client": "^2.0.0",
+-    "@types/node": "26.2.0",
++    "@modelcontextprotocol/client": "2.2.0",
++    "@types/node": "26.6.4",
+     "typescript": "7.0.2"
+   }
+ }
+--- /dev/null
++++ b/mcp/overlook-control/tests/stdio-lifecycle.integration.test.mjs
+@@ -0,0 +1,85 @@
++import assert from "node:assert/strict";
++import { spawn } from "node:child_process";
++import { once } from "node:events";
++import path from "node:path";
++import { createInterface } from "node:readline";
++import test from "node:test";
++import { Client } from "@modelcontextprotocol/client";
++import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
++import { fakeControl, reply, settledWithin } from "./fake-control.mjs";
++
++async function legacyStdio(t, fixture) {
++  const child = spawn(process.execPath, [path.resolve("tests/stdio-fixture.mjs"), fixture.tokenPath, String(fixture.port)], { stdio: ["pipe", "pipe", "pipe"] });
++  const lines = createInterface({ input: child.stdout });
++  const replies = new Map();
++  const waiters = new Map();
++  lines.on("line", (line) => {
++    const message = JSON.parse(line);
++    replies.set(message.id, message);
++    waiters.get(message.id)?.(message);
++  });
++  child.stderr.resume();
++  const exited = once(child, "exit");
++  t.after(async () => {
++    lines.close();
++    if (child.exitCode === null && child.signalCode === null) child.kill();
++    await exited;
++  });
++  const send = (message) => child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", ...message })}\n`);
++  const response = (id) => replies.has(id) ? Promise.resolve(replies.get(id)) : new Promise((resolve) => waiters.set(id, resolve));
++  send({ id: "initialize", method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "stdio-lifecycle-test", version: "1" } } });
++  assert.equal((await response("initialize")).error, undefined);
++  send({ method: "notifications/initialized" });
++  return { child, exited, send, response };
++}
++
++test("stdio cancellation of request id zero stops a pending preflight before input dispatch", { timeout: 5000 }, async (t) => {
++  let sawPreflight;
++  const preflight = new Promise((resolve) => { sawPreflight = resolve; });
++  let sawClose;
++  const closed = new Promise((resolve) => { sawClose = resolve; });
++  const fixture = await fakeControl(t, (request, socket) => {
++    socket.once("close", sawClose);
++    sawPreflight();
++    assert.equal(request.command, "status");
++  });
++  const wire = await legacyStdio(t, fixture);
++  wire.send({ id: 0, method: "tools/call", params: { name: "overlook_send_text", arguments: { text: "synthetic" } } });
++  await preflight;
++  wire.send({ method: "notifications/cancelled", params: { requestId: 0, reason: "test stop" } });
++  assert.equal((await settledWithin(closed, 250)).unsettled, undefined, "request id zero must abort before the 500 ms TCP deadline");
++  assert.deepEqual(fixture.requests.map((request) => request.command), ["status"]);
++});
++
++test("stdio EOF cancels an in-flight action once and exits without replaying input", { timeout: 5000 }, async (t) => {
++  let sawAct;
++  const acted = new Promise((resolve) => { sawAct = resolve; });
++  let sawCancel;
++  const cancelled = new Promise((resolve) => { sawCancel = resolve; });
++  const fixture = await fakeControl(t, (request, socket) => {
++    if (request.command === "act") { sawAct(); return; }
++    assert.equal(request.command, "cancel");
++    reply(socket, { ok: true, protocol_version: 2, session_id: request.session_id, action_seq: request.action_seq, state: "not_started", error_code: "cancelled" });
++    sawCancel();
++  });
++  const wire = await legacyStdio(t, fixture);
++  wire.send({ id: 1, method: "tools/call", params: { name: "overlook_act", arguments: { session_id: "session-1", action_seq: 1, frame_id: "frame-1", action: { type: "text", value: "synthetic" } } } });
++  await acted;
++  wire.child.stdin.end();
++  assert.equal((await settledWithin(cancelled, 250)).unsettled, undefined, "stdin EOF must abort the action before its TCP deadline");
++  assert.deepEqual(fixture.requests.map((request) => request.command), ["act", "cancel"]);
++  const exit = await settledWithin(wire.exited, 500);
++  assert.deepEqual(exit.value, [0, null], "EOF cleanup must exit cleanly after the cancellation receipt");
++});
++
++test("a tool request after SDK connection close rejects promptly without TCP dispatch", { timeout: 5000 }, async (t) => {
++  const fixture = await fakeControl(t, () => assert.fail("closed MCP client must not dispatch TCP"));
++  const client = new Client({ name: "closed-connection-test", version: "1" });
++  const transport = new StdioClientTransport({ command: process.execPath, args: [path.resolve("tests/stdio-fixture.mjs"), fixture.tokenPath, String(fixture.port)], stderr: "pipe" });
++  t.after(() => client.close());
++  await client.connect(transport);
++  await client.close();
++  const result = await settledWithin(client.callTool({ name: "overlook_status", arguments: {} }), 250);
++  assert.ok(result.error instanceof Error, "closed connection must reject instead of hanging");
++  assert.deepEqual(fixture.requests, []);
++});
+--- a/scripts/test-agent-control.sh
++++ b/scripts/test-agent-control.sh
+@@ -13,17 +13,31 @@
+ }
+ trap cleanup EXIT
+ 
++swiftc_bin="${OVERLOOK_SWIFTC:-swiftc}"
++swift_flags=(-swift-version 5 -target "${OVERLOOK_SWIFT_TARGET:-$(uname -m)-apple-macos14.0}")
++if [[ -n "${OVERLOOK_SWIFT_SDK:-}" ]]; then
++  swift_flags+=(-sdk "$OVERLOOK_SWIFT_SDK")
++fi
++
+ run_swift() {
+   local name="$1"
+   shift
+-  swiftc -parse-as-library "$@" -o "$test_dir/$name"
++  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "$@" -o "$test_dir/$name"
+   "$test_dir/$name"
+ }
+ 
+ if [[ "$suite" != mcp ]]; then
+   run_swift ControlMode Overlook/ControlMode.swift tests/ControlModeTests.swift
+   run_swift ReliabilityPolicy Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift tests/ReliabilityPolicyTests.swift
++  run_swift MouseJigglerLifecycle Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
++    Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
++    Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
+   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
++  run_swift CredentialConfig Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
++    Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
++    Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
++  run_swift StatsGeneration Overlook/FrameDeliveryState.swift tests/StatsGenerationTests.swift
++  run_swift MainWindowLifecycle Overlook/MainWindowLifecycle.swift tests/MainWindowLifecycleTests.swift
+   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
+   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
+     Overlook/KVMDevice.swift Overlook/SessionConnectionCoordinator.swift tests/SessionConnectionCoordinatorTests.swift
+@@ -33,7 +47,7 @@
+   run_swift LocalInputCapture "${capture_sources[@]}" tests/LocalInputCaptureTests.swift
+   run_swift InputManagerCapture "${capture_sources[@]}" tests/InputManagerCaptureTests.swift
+   run_swift InputManagerGLKVM "${capture_sources[@]}" tests/InputManagerGLKVMTests.swift
+-  swiftc -parse-as-library "${capture_sources[@]}" tests/InputManagerHIDQueueTests.swift -o "$test_dir/HIDQueue"
++  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "${capture_sources[@]}" tests/InputManagerHIDQueueTests.swift -o "$test_dir/HIDQueue"
+   node tests/hid-capture-fixture.mjs --self-test
+   node tests/hid-capture-fixture.mjs "$test_dir/hid-port" &
+   fixture_pid=$!
+@@ -42,7 +56,7 @@
+   kill "$fixture_pid" 2>/dev/null || true
+   wait "$fixture_pid" || true
+   fixture_pid=''
+-  swiftc -parse-as-library "${capture_sources[@]}" tests/GLKVMWebSocketSettlementTests.swift -o "$test_dir/WebSocketSettlement"
++  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "${capture_sources[@]}" tests/GLKVMWebSocketSettlementTests.swift -o "$test_dir/WebSocketSettlement"
+   node --check tests/ws-settlement-fixture.mjs
+   node tests/ws-settlement-fixture.mjs "$test_dir/settlement-port" &
+   fixture_pid=$!
+@@ -56,6 +70,9 @@
+     printf 'Set OVERLOOK_WEBRTC_FRAMEWORK_DIR to the resolved macOS framework parent.\n' >&2
+     exit 1
+   fi
++  run_swift FrameDelivery -F "$framework_parent" -framework WebRTC \
++    -Xlinker -rpath -Xlinker "$framework_parent" \
++    Overlook/FrameDeliveryState.swift Overlook/RemoteSnapshot.swift tests/FrameDeliveryTests.swift
+   run_swift RemoteSnapshot -F "$framework_parent" -framework WebRTC \
+     -Xlinker -rpath -Xlinker "$framework_parent" \
+     Overlook/RemoteSnapshot.swift tests/RemoteSnapshotTests.swift
+@@ -63,7 +80,7 @@
+     Overlook/RemoteActionState.swift Overlook/RemoteSnapshot.swift Overlook/LocalControlServer.swift \
+     tests/LocalControlServerStubs.swift tests/LocalControlServerTests.swift
+ 
+-  swiftc -parse-as-library Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
++  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
+     tests/GLKVMWebSocketTests.swift -o "$test_dir/WebSocketReadiness"
+   node tests/ws-readiness-fixture.mjs "$test_dir/port" &
+   fixture_pid=$!
+--- /dev/null
++++ b/tests/CredentialConfigIntegrationTests.swift
+@@ -0,0 +1,381 @@
++import Foundation
++
++@main
++struct CredentialConfigIntegrationTests {
++    private static let currentFixtureToken = "fixture-current-token"
++    @MainActor static func main() async throws {
++        let tests: [(String, @MainActor () async throws -> Void)] = [
++            ("settings edit preserves fresh firmware fields", testFreshMerge),
++            ("reverted setting survives an earlier pending write", testRevertedSettingDuringPendingWrite),
++            ("invalid jiggler prevents Headless approval", testInvalidJiggler),
++            ("Headless settings are rejected without HTTP", testLockedSettings),
++            ("obsolete settings session is rejected", testObsoleteSession),
++            ("disconnect during fresh GET prevents POST", testDisconnectDuringGET),
++            ("Headless during fresh GET prevents POST", testHeadlessDuringGET),
++            ("disconnect during sent POST cannot publish", testDisconnectDuringPOST),
++            ("Keychain warning clears after secure retry", testSecureRetry),
++            ("identical storage failures emit distinct warning events", testRepeatedStorageWarning),
++            ("failed Keychain save keeps a new token in session only", testFailedPersistence),
++            ("successful Keychain save stores no plaintext", testSuccessfulPersistence),
++            ("empty token never invokes credential store", testEmptyPersistence),
++            ("existing legacy records are not migrated on failed save", testLegacyPersistence),
++            ("empty session token preserves existing legacy record", testEmptyLegacyPersistence),
++        ]
++        var failures: [String] = []
++        for (name, test) in tests {
++            do { try await test(); print("PASS: \(name)") }
++            catch { failures.append("\(name): \(error)") }
++        }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw Failure.message("\(failures.count) contract regressions") }
++        print("CredentialConfigIntegrationTests: \(tests.count) scenarios passed; in-memory records and URLProtocol only")
++    }
++
++    @MainActor private static func testFreshMerge() async throws {
++        let fixture = ConfigFixture(payload: #"{"keymap":"de","stream_quality":1,"mouse_jiggle":false,"future":{"mode":"old"}}"#)
++        let client = try makeClient(fixture)
++        let baseline = try await client.getSystemConfig()
++        var draft = baseline
++        draft.keymap = "en-us"
++        fixture.setPayload(#"{"keymap":"de","stream_quality":3,"mouse_jiggle":true,"future":{"mode":"new"},"added_after_open":42}"#)
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        manager.commitConnection(PreparedKVMConnection(device: device(fixture.host), client: client))
++        let updated = try await manager.applySystemConfig(draft, editedFields: ["keymap"], connectionSessionID: manager.connectionSessionID!)
++        let expected = try values(#"{"keymap":"en-us","stream_quality":3,"mouse_jiggle":true,"future":{"mode":"new"},"added_after_open":42}"#)
++        try expect(fixture.postedPayloads.last == expected, "Full config POST overwrote newer firmware data")
++        try expect(updated.streamQuality == 3, "Updated state lost fresh setting")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testRevertedSettingDuringPendingWrite() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        let id = manager.connectionSessionID!
++        var firstDraft = baseline
++        firstDraft.keymap = "en-us"
++        fixture.holdNextPost()
++        let first = Task { try await manager.applySystemConfig(firstDraft, editedFields: ["keymap"], connectionSessionID: id) }
++        try await eventually { fixture.hasHeldRequest }
++        let revertedDraft = baseline
++        let second = Task { try await manager.applySystemConfig(revertedDraft, editedFields: ["keymap"], connectionSessionID: id) }
++        fixture.release()
++        _ = try await first.value
++        let updated = try await second.value
++        try expect(fixture.postedPayloads.count == 2, "Revert did not use both real POSTs")
++        try expect(fixture.postedPayloads.last?["keymap"] == .string("de") && updated.keymap == "de", "Second user intent was lost after the pending write")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testInvalidJiggler() async throws {
++        let fixture = ConfigFixture(payload: #"{"mouse_jiggle":"true"}"#)
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        manager.commitConnection(PreparedKVMConnection(device: device(fixture.host), client: try makeClient(fixture)))
++        await manager.refreshMouseJigglerState()
++        let owner = manager.beginHeadlessConfigurationTransition()
++        defer { manager.endHeadlessConfigurationTransition(owner); manager.disconnectFromDevice() }
++        do {
++            try await manager.pauseMouseJigglerForHeadless()
++            throw Failure.message("Invalid firmware value granted Headless safety approval")
++        } catch is MouseJigglerError {} catch is GLKVMClient.ClientError {}
++        try expect(fixture.postedPayloads.isEmpty, "Invalid config must not produce a firmware write")
++    }
++
++    @MainActor private static func testLockedSettings() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        let owner = manager.beginHeadlessConfigurationTransition()
++        defer { manager.endHeadlessConfigurationTransition(owner); manager.disconnectFromDevice() }
++        do {
++            _ = try await manager.applySystemConfig(baseline, editedFields: [], connectionSessionID: manager.connectionSessionID!)
++            throw Failure.message("Locked settings unexpectedly succeeded")
++        } catch MouseJigglerError.settingsLockedForHeadless {}
++        try expect(fixture.postedPayloads.isEmpty, "Locked settings wrote firmware")
++    }
++
++    @MainActor private static func testObsoleteSession() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        defer { manager.disconnectFromDevice() }
++        do {
++            _ = try await manager.applySystemConfig(baseline, editedFields: [], connectionSessionID: UUID())
++            throw Failure.message("Obsolete settings session succeeded")
++        } catch MouseJigglerError.unavailable {}
++        try expect(fixture.postedPayloads.isEmpty, "Obsolete session wrote firmware")
++    }
++
++    @MainActor private static func testDisconnectDuringGET() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        let id = manager.connectionSessionID!
++        fixture.holdNextGet()
++        let apply = Task { try await manager.applySystemConfig(baseline, editedFields: [], connectionSessionID: id) }
++        try await eventually { fixture.hasHeldRequest }
++        manager.disconnectFromDevice()
++        fixture.release()
++        do { _ = try await apply.value; throw Failure.message("Disconnected settings completed") }
++        catch is CancellationError {}
++        try expect(fixture.postedPayloads.isEmpty, "Old settings wrote after disconnect")
++    }
++
++    @MainActor private static func testHeadlessDuringGET() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        let id = manager.connectionSessionID!
++        fixture.holdNextGet()
++        let apply = Task { try await manager.applySystemConfig(baseline, editedFields: [], connectionSessionID: id) }
++        try await eventually { fixture.hasHeldRequest }
++        let owner = manager.beginHeadlessConfigurationTransition()
++        defer { manager.endHeadlessConfigurationTransition(owner); manager.disconnectFromDevice() }
++        fixture.release()
++        do { _ = try await apply.value; throw Failure.message("Stale settings crossed Headless transition") }
++        catch is CancellationError {}
++        try expect(fixture.postedPayloads.isEmpty, "Settings wrote after Headless invalidated request")
++    }
++
++    @MainActor private static func testDisconnectDuringPOST() async throws {
++        let (manager, fixture, baseline) = try await settingsSetup()
++        let id = manager.connectionSessionID!
++        var draft = baseline
++        draft.keymap = "en-us"
++        fixture.holdNextPost()
++        let apply = Task { try await manager.applySystemConfig(draft, editedFields: ["keymap"], connectionSessionID: id) }
++        try await eventually { fixture.hasHeldRequest }
++        try expect(fixture.postedPayloads.count == 1, "Expected the already-sent write")
++        manager.disconnectFromDevice()
++        fixture.release()
++        do { _ = try await apply.value; throw Failure.message("Disconnected response published") }
++        catch is CancellationError {}
++        try expect(manager.mouseJigglerEnabled == nil, "Old POST response restored disconnected state")
++    }
++
++    @MainActor private static func testSecureRetry() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        let manager = try persist(store, token: currentFixtureToken)
++        try expect(manager.credentialStorageWarning != nil, "Missing storage warning")
++        store.acceptsToken = true
++        let fixture = ConfigFixture(payload: "{}", host: "persist.invalid")
++        var candidate = device(fixture.host)
++        candidate.authToken = "fixture-retry-token"
++        manager.commitConnection(PreparedKVMConnection(device: candidate, client: try makeClient(fixture)))
++        try expect(manager.credentialStorageWarning == nil, "Secure retry kept error notice")
++        try expect(!store.recordsText.contains("fixture-retry-token"), "Secure retry wrote plaintext")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testRepeatedStorageWarning() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        let manager = try persist(store, token: currentFixtureToken)
++        let firstMessage = manager.credentialStorageWarning
++        let firstGeneration = manager.credentialStorageWarningGeneration
++        let fixture = ConfigFixture(payload: "{}", host: "persist.invalid")
++        var candidate = device(fixture.host)
++        candidate.authToken = "fixture-current-token"
++        manager.commitConnection(PreparedKVMConnection(device: candidate, client: try makeClient(fixture)))
++        try expect(manager.credentialStorageWarning == firstMessage && firstMessage != nil, "Repeated failure changed diagnostic text")
++        try expect(firstGeneration > 0 && manager.credentialStorageWarningGeneration > firstGeneration, "Identical warning cannot retrigger UI alert")
++        try expect(!store.recordsText.contains("fixture-current-token"), "Repeated failure leaked plaintext token")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func settingsSetup() async throws -> (KVMDeviceManager, ConfigFixture, GLKVMSystemConfig) {
++        let fixture = ConfigFixture(payload: #"{"mouse_jiggle":false,"keymap":"de"}"#)
++        let client = try makeClient(fixture)
++        let baseline = try await client.getSystemConfig()
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        manager.commitConnection(PreparedKVMConnection(device: device(fixture.host), client: client))
++        await manager.refreshMouseJigglerState()
++        return (manager, fixture, baseline)
++    }
++
++    @MainActor private static func eventually(_ condition: () -> Bool) async throws {
++        for _ in 0..<400 {
++            if condition() { return }
++            try await Task.sleep(nanoseconds: 5_000_000)
++        }
++        throw Failure.message("Local fixture timed out")
++    }
++
++    @MainActor private static func testFailedPersistence() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        let manager = try persist(store, token: currentFixtureToken)
++        try expect(manager.connectedDevice?.authToken == "fixture-current-token", "Session token was lost")
++        try expect(store.savedTokens == ["fixture-current-token"], "Secure save was not attempted")
++        try expect(!(store.recordsText.contains("fixture-current-token")), "Failed secure save leaked token into metadata")
++        try expect(manager.credentialStorageWarning != nil, "Secure store failure has no visible notice")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testSuccessfulPersistence() async throws {
++        let store = MemoryCredentialStore(acceptsToken: true)
++        let manager = try persist(store, token: currentFixtureToken)
++        try expect(store.savedTokens.count == 1, "Secure save was not attempted")
++        try expect(manager.credentialStorageWarning == nil, "Successful secure save kept an error notice")
++        try expect(!store.recordsText.contains("fixture-current-token"), "Secure save leaked plaintext metadata")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testEmptyPersistence() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        let manager = try persist(store, token: "")
++        try expect(store.savedTokens.isEmpty, "An empty token touched Keychain")
++        try expect(manager.credentialStorageWarning == nil, "Empty token generated an error notice")
++        try expect(!store.recordsText.contains("authToken"), "Empty token was persisted")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testLegacyPersistence() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        store.records = Data(#"[{"host":"persist.invalid","port":80,"name":"Prior device","type":"custom","authToken":"fixture-legacy-token","capabilities":[]}]"#.utf8)
++        let manager = try persist(store, token: currentFixtureToken)
++        try expect(store.recordsText.contains("fixture-legacy-token"), "Existing credential was changed without migration approval")
++        try expect(!store.recordsText.contains("fixture-current-token"), "New session token leaked into old record")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func testEmptyLegacyPersistence() async throws {
++        let store = MemoryCredentialStore(acceptsToken: false)
++        store.records = Data(#"[{"host":"persist.invalid","port":80,"name":"Prior device","type":"custom","authToken":"fixture-legacy-token","capabilities":[]}]"#.utf8)
++        let manager = try persist(store, token: "")
++        try expect(store.recordsText.contains("fixture-legacy-token"), "Empty session token deleted existing credential")
++        try expect(store.savedTokens.isEmpty, "Empty legacy reconnect touched secure store")
++        manager.disconnectFromDevice()
++    }
++
++    @MainActor private static func persist(_ store: MemoryCredentialStore, token: String) throws -> KVMDeviceManager {
++        let fixture = ConfigFixture(payload: "{}", host: "persist.invalid")
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: true, persistence: store.dependencies)
++        var candidate = device(fixture.host)
++        candidate.authToken = token
++        manager.commitConnection(PreparedKVMConnection(device: candidate, client: try makeClient(fixture)))
++        return manager
++    }
++
++    private static func makeClient(_ fixture: ConfigFixture) throws -> GLKVMClient {
++        let config = URLSessionConfiguration.ephemeral
++        config.protocolClasses = [ConfigURLProtocol.self]
++        config.httpCookieStorage = nil
++        return try GLKVMClient(host: fixture.host, allowInsecureTLS: false, sessionConfiguration: config)
++    }
++
++    private static func device(_ host: String) -> KVMDevice {
++        KVMDevice(id: host, name: "Synthetic KVM", host: host, port: 80, type: .custom, authToken: "", capabilities: [])
++    }
++
++    private static func values(_ text: String) throws -> GLKVMJSONObject {
++        try JSONDecoder().decode(GLKVMJSONObject.self, from: Data(text.utf8))
++    }
++    private static func expect(_ condition: Bool, _ message: String) throws {
++        guard condition else { throw Failure.message(message) }
++    }
++    private enum Failure: Error { case message(String) }
++}
++
++private final class MemoryCredentialStore {
++    var records: Data?
++    var savedTokens: [String] = []
++    var acceptsToken: Bool
++    init(acceptsToken: Bool) { self.acceptsToken = acceptsToken }
++    var recordsText: String { records.flatMap { String(data: $0, encoding: .utf8) } ?? "" }
++    var dependencies: KVMDevicePersistence {
++        KVMDevicePersistence(readRecords: { self.records }, writeRecords: { self.records = $0 }, saveToken: { token, _, _ in
++            self.savedTokens.append(token)
++            return self.acceptsToken
++        })
++    }
++}
++
++private final class ConfigFixture: @unchecked Sendable {
++    static let registryLock = NSLock()
++    static var registry: [String: ConfigFixture] = [:]
++    let host: String
++    private let lock = NSLock()
++    private var payload: Data
++    private var posts: [GLKVMJSONObject] = []
++    private var heldMethod: String?
++    private var held: [() -> Void] = []
++    init(payload: String, host: String = "config-\(UUID().uuidString.lowercased()).invalid") {
++        self.host = host
++        self.payload = Data(payload.utf8)
++        Self.registryLock.lock()
++        Self.registry[host] = self
++        Self.registryLock.unlock()
++    }
++    static func lookup(_ host: String) -> ConfigFixture? {
++        registryLock.lock(); defer { registryLock.unlock() }
++        return registry[host]
++    }
++    func setPayload(_ text: String) {
++        lock.lock(); defer { lock.unlock() }
++        payload = Data(text.utf8)
++    }
++    var postedPayloads: [GLKVMJSONObject] {
++        lock.lock(); defer { lock.unlock() }
++        return posts
++    }
++    func holdNextGet() {
++        lock.lock(); defer { lock.unlock() }
++        heldMethod = "GET"
++    }
++    func holdNextPost() {
++        lock.lock(); defer { lock.unlock() }
++        heldMethod = "POST"
++    }
++    var hasHeldRequest: Bool {
++        lock.lock(); defer { lock.unlock() }
++        return !held.isEmpty
++    }
++    func deliver(_ operation: @escaping () -> Void, method: String?) {
++        lock.lock()
++        if heldMethod != nil, heldMethod == method {
++            heldMethod = nil
++            held.append(operation)
++            lock.unlock()
++        } else {
++            lock.unlock()
++            operation()
++        }
++    }
++    func release() {
++        lock.lock()
++        let callbacks = held
++        held = []
++        lock.unlock()
++        callbacks.forEach { $0() }
++    }
++    func response(to request: URLRequest) throws -> Data {
++        lock.lock(); defer { lock.unlock() }
++        if request.httpMethod == "POST" {
++            var body = request.httpBody
++            if body == nil, let stream = request.httpBodyStream {
++                stream.open(); defer { stream.close() }
++                var data = Data()
++                let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
++                defer { buffer.deallocate() }
++                while stream.hasBytesAvailable {
++                    let count = stream.read(buffer, maxLength: 4096)
++                    guard count > 0 else { break }
++                    data.append(buffer, count: count)
++                }
++                body = data
++            }
++            guard let body else { throw URLError(.cannotDecodeContentData) }
++            posts.append(try JSONDecoder().decode(GLKVMJSONObject.self, from: body))
++            payload = body
++        }
++        let config = try JSONDecoder().decode(GLKVMJSONObject.self, from: payload)
++        return try JSONEncoder().encode(JSONValue.object(["ok": .bool(true), "result": .object(["config": .object(config)])]))
++    }
++}
++
++private final class ConfigURLProtocol: URLProtocol {
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        guard let url = request.url, let fixture = ConfigFixture.lookup(url.host ?? "") else { preconditionFailure("Missing local fixture") }
++        do {
++            let data = try fixture.response(to: request)
++            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
++            fixture.deliver({
++                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++                self.client?.urlProtocol(self, didLoad: data)
++                self.client?.urlProtocolDidFinishLoading(self)
++            }, method: request.httpMethod)
++        } catch { client?.urlProtocol(self, didFailWithError: error) }
++    }
++    override func stopLoading() {}
++}
+--- /dev/null
++++ b/tests/FrameDeliveryTests.swift
+@@ -0,0 +1,253 @@
++import Foundation
++import CoreVideo
++#if canImport(WebRTC)
++@preconcurrency import WebRTC
++#endif
++
++private struct FrameDeliveryFailure: Error, CustomStringConvertible {
++    let description: String
++}
++
++private final class RetainedFrame: @unchecked Sendable {
++    let identifier: Int
++    let buffer: CVPixelBuffer
++
++    init(_ identifier: Int) throws {
++        self.identifier = identifier
++        var buffer: CVPixelBuffer?
++        guard CVPixelBufferCreate(kCFAllocatorDefault, 320, 180, kCVPixelFormatType_32BGRA, nil, &buffer) == kCVReturnSuccess,
++              let buffer else { throw FrameDeliveryFailure(description: "Could not create native test frame") }
++        self.buffer = buffer
++    }
++}
++
++private final class WeakFrame {
++    weak var value: RetainedFrame?
++    init(_ value: RetainedFrame) { self.value = value }
++}
++
++#if canImport(WebRTC)
++private final class WeakNativeBuffer {
++    weak var value: AnyObject?
++    init(_ buffer: CVPixelBuffer) { value = buffer }
++}
++
++@MainActor
++private final class RenderedBatches {
++    var values: [FrameDeliveryBatch<SnapshotFrame>] = []
++}
++#endif
++
++private final class CallbackRecorder: @unchecked Sendable {
++    private let lock = NSLock()
++    private var scheduled = 0
++
++    func record(_ shouldSchedule: Bool) {
++        guard shouldSchedule else { return }
++        lock.lock()
++        scheduled += 1
++        lock.unlock()
++    }
++
++    var scheduledCount: Int {
++        lock.lock()
++        defer { lock.unlock() }
++        return scheduled
++    }
++}
++
++@main
++struct FrameDeliveryTests {
++    static func main() async {
++        var tests: [(String, () async throws -> Void)] = [
++            ("slow consumer retains only the newest native buffer", testNativeBufferRetention),
++            ("coalescing counts every frame for FPS", testCountsEveryFrame),
++            ("arrival during processing wakes the next consumer", testArrivalsDuringConsumption),
++            ("unsupported newest frame replaces earlier payload", testUnsupportedLatest),
++            ("concurrent callbacks retain one pending frame", testConcurrentCallbacks),
++            ("late timestamp cannot replace a newer frame", testTimestampOrdering),
++            ("disconnect releases retained buffer and rejects callbacks", testInvalidation),
++            ("invalid callback timestamps cannot affect health", testInvalidTimestamps),
++            ("legacy callback queues retain the entire stalled burst", testLegacyRetentionMeasurement),
++        ]
++#if canImport(WebRTC)
++        tests.append(("actual WebRTC renderer retains one native pending buffer", testNativeRenderer))
++        tests.append(("actual renderer disconnect cancels queued delivery", testRendererInvalidation))
++#endif
++        var failures = 0
++        for (name, test) in tests {
++            do { try await test(); print("PASS \(name)") }
++            catch { failures += 1; print("FAIL \(name): \(error)") }
++        }
++        print("FrameDeliveryTests: \(tests.count - failures)/\(tests.count) passed")
++        if failures > 0 { exit(1) }
++    }
++
++    private static func check(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        if !condition() { throw FrameDeliveryFailure(description: message) }
++    }
++
++    private static func offerNativeBurst(_ delivery: LatestFrameDelivery<RetainedFrame>, count: Int) throws -> (weak: [WeakFrame], wakeups: Int) {
++        var weakFrames: [WeakFrame] = []
++        var wakeups = 0
++        for identifier in 0..<count {
++            let frame = try RetainedFrame(identifier)
++            weakFrames.append(WeakFrame(frame))
++            if delivery.offer(frame, receivedAt: 100 + Double(identifier) / 60) { wakeups += 1 }
++        }
++        return (weakFrames, wakeups)
++    }
++
++    private static func testNativeBufferRetention() async throws {
++        let delivery = LatestFrameDelivery<RetainedFrame>()
++        let burst = try offerNativeBurst(delivery, count: 120)
++        let retained = burst.weak.filter { $0.value != nil }.count
++        print("MEASURE bounded stalled consumer: \(retained) native buffers, \(burst.wakeups) wakeups for 120 arrivals")
++        try check(retained == 1, "Stalled consumer retained \(retained) buffers instead of one")
++        try check(burst.wakeups == 1, "Stalled consumer queued \(burst.wakeups) wakeups")
++        let batch = delivery.take()
++        try check(batch?.payload?.identifier == 119, "Consumer received a stale frame")
++        try check(batch?.payload?.buffer === burst.weak.last?.value?.buffer, "Native pixel buffer was copied")
++        try check(delivery.take() == nil, "Consumer had additional retained frames")
++    }
++
++    private static func testCountsEveryFrame() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        for identifier in 0..<120 { _ = delivery.offer(identifier, receivedAt: 100 + Double(identifier) / 60) }
++        guard let batch = delivery.take() else { throw FrameDeliveryFailure(description: "Missing burst") }
++        try check(batch.frameCount == 120, "FPS lost coalesced arrivals")
++        try check(batch.firstReceivedAt == 100, "FPS window started at the delayed delivery time")
++        try check(abs(batch.receivedAt - (100 + 119.0 / 60)) < 0.0001, "Health timestamp lost the newest arrival")
++        let fps = Double(batch.frameCount) / (batch.receivedAt - batch.firstReceivedAt)
++        try check(abs(fps - 60.5042) < 0.01, "FPS measures consumer dispatches instead of decoded frame arrivals")
++    }
++
++    private static func testArrivalsDuringConsumption() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        try check(delivery.offer(1, receivedAt: 1), "First frame did not wake consumer")
++        let processing = delivery.take()
++        try check(delivery.offer(2, receivedAt: 2), "Frame arriving during processing was stranded")
++        try check(!delivery.offer(3, receivedAt: 3), "Second pending frame scheduled another wakeup")
++        try check(processing?.payload == 1, "In-flight delivery changed")
++        let next = delivery.take()
++        try check(next?.payload == 3 && next?.frameCount == 2, "Pending delivery lost latest frame or FPS count")
++        try check(delivery.take() == nil, "Empty delivery retained a wakeup")
++        try check(delivery.offer(4, receivedAt: 4), "Drained delivery could not wake again")
++    }
++
++    private static func testUnsupportedLatest() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        _ = delivery.offer(1, receivedAt: 1)
++        _ = delivery.offer(nil, receivedAt: 2)
++        let batch = delivery.take()
++        try check(batch?.payload == nil && batch?.receivedAt == 2 && batch?.frameCount == 2,
++                  "Unsupported latest frame left an earlier supported snapshot visible")
++    }
++
++    private static func testConcurrentCallbacks() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        let recorder = CallbackRecorder()
++        DispatchQueue.concurrentPerform(iterations: 2_000) { identifier in
++            recorder.record(delivery.offer(identifier, receivedAt: Double(identifier)))
++        }
++        try check(recorder.scheduledCount == 1, "Concurrent callbacks scheduled more than one pending consumer")
++        let batch = delivery.take()
++        try check(batch?.frameCount == 2_000, "Concurrent callbacks lost arrivals")
++        try check(batch?.payload == 1_999 && batch?.receivedAt == 1_999, "Callback lock order replaced newest timestamp with older frame")
++    }
++
++    private static func testTimestampOrdering() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        _ = delivery.offer(2, receivedAt: 2)
++        _ = delivery.offer(1, receivedAt: 1)
++        let batch = delivery.take()
++        try check(batch?.payload == 2 && batch?.receivedAt == 2 && batch?.firstReceivedAt == 1 && batch?.frameCount == 2,
++                  "Out-of-order callback regressed current frame or stream health")
++    }
++
++    private static func testInvalidation() async throws {
++        let delivery = LatestFrameDelivery<RetainedFrame>()
++        let burst = try offerNativeBurst(delivery, count: 3)
++        delivery.invalidate()
++        try check(burst.weak.allSatisfy { $0.value == nil }, "Disconnect retained a pending native frame")
++        try check(delivery.take() == nil, "Scheduled old-source consumer returned a frame after disconnect")
++        let lateFrame = try RetainedFrame(4)
++        try check(!delivery.offer(lateFrame, receivedAt: 4), "Old renderer accepted a frame after disconnect")
++        delivery.invalidate()
++        try check(delivery.take() == nil, "Repeated disconnect revived delivery")
++    }
++
++    private static func testInvalidTimestamps() async throws {
++        let delivery = LatestFrameDelivery<Int>()
++        for timestamp in [Double.nan, Double.infinity, -Double.infinity] {
++            try check(!delivery.offer(1, receivedAt: timestamp), "Non-finite timestamp accepted")
++        }
++        try check(delivery.take() == nil, "Invalid arrival poisoned pending frame")
++        try check(delivery.offer(nil, receivedAt: 0), "Valid unsupported frame could not wake consumer")
++    }
++
++    // This deliberately stalled callback queue reproduces the prior production
++    // closure: every queued MainActor task owned its received native buffer.
++    private static func testLegacyRetentionMeasurement() async throws {
++        var queuedCallbacks: [() -> Void] = []
++        var weakFrames: [WeakFrame] = []
++        for identifier in 0..<120 {
++            let frame = try RetainedFrame(identifier)
++            weakFrames.append(WeakFrame(frame))
++            queuedCallbacks.append { _ = frame.buffer }
++        }
++        let retained = weakFrames.filter { $0.value != nil }.count
++        print("MEASURE prior stalled callback queue: \(retained) native buffers, \(queuedCallbacks.count) callbacks for 120 arrivals")
++        try check(retained == 120, "Legacy experiment did not retain the received buffers")
++        queuedCallbacks.removeAll()
++        try check(weakFrames.allSatisfy { $0.value == nil }, "Fixture kept buffers after draining the old queue")
++    }
++
++#if canImport(WebRTC)
++    @MainActor
++    private static func nativeRendererBurst(_ renderer: SnapshotVideoRenderer) throws -> [WeakNativeBuffer] {
++        try (0..<120).map { identifier in
++            try autoreleasepool {
++                let frame = try RetainedFrame(identifier)
++                let weakBuffer = WeakNativeBuffer(frame.buffer)
++                renderer.renderFrame(RTCVideoFrame(
++                    buffer: RTCCVPixelBuffer(pixelBuffer: frame.buffer),
++                    rotation: ._0, timeStampNs: Int64(identifier)
++                ))
++                return weakBuffer
++            }
++        }
++    }
++
++    @MainActor
++    private static func testNativeRenderer() async throws {
++        let received = RenderedBatches()
++        let sizeChanges = CallbackRecorder()
++        let renderer = SnapshotVideoRenderer(sourceID: "test-source", onFrame: { received.values.append($0) }, onSize: { _ in sizeChanges.record(true) })
++        renderer.renderFrame(nil)
++        renderer.setSize(CGSize(width: 320, height: 180))
++        try check(sizeChanges.scheduledCount == 1, "Actual renderer lost video geometry callback")
++        let weakBuffers = try nativeRendererBurst(renderer)
++        try check(received.values.isEmpty, "MainActor consumer ran inside its synchronous producer")
++        let retained = weakBuffers.filter { $0.value != nil }.count
++        print("MEASURE actual WebRTC renderer before MainActor drain: \(retained) native buffers for 120 callbacks")
++        try check(retained == 1, "Actual renderer retained \(retained) pending native buffers")
++        for _ in 0..<100 where received.values.isEmpty { await Task.yield() }
++        try check(received.values.count == 1 && received.values.first?.frameCount == 120,
++                  "Actual renderer lost coalesced FPS count or scheduled redundant consumers")
++        try check(received.values.first?.payload?.sourceID == "test-source", "Actual renderer lost source identity")
++        renderer.invalidate()
++    }
++
++    @MainActor
++    private static func testRendererInvalidation() async throws {
++        let received = RenderedBatches()
++        let renderer = SnapshotVideoRenderer(sourceID: "old-source", onFrame: { received.values.append($0) }, onSize: { _ in })
++        let weakBuffers = try nativeRendererBurst(renderer)
++        renderer.invalidate()
++        try check(weakBuffers.allSatisfy { $0.value == nil }, "Invalidated renderer retained pending native buffers")
++        for _ in 0..<10 { await Task.yield() }
++        try check(received.values.isEmpty, "Queued old renderer published after disconnect")
++    }
++#endif
++}
+--- a/tests/GLKVMSystemConfigTests.swift
++++ b/tests/GLKVMSystemConfigTests.swift
+@@ -8,6 +8,7 @@
+ 
+ @main
+ struct GLKVMSystemConfigTests {
++    private static let fixtureLoginPassword = "fixture-password"
+     static func main() async throws {
+         let decoder = JSONDecoder()
+         let encoder = JSONEncoder()
+@@ -39,7 +40,117 @@
+         precondition(GLKVMHIDPrintRequestPolicy.contentType == "text/plain; charset=utf-8")
+ 
+         try await testResponseContract()
++        var failedContracts = 0
++        do { try testLosslessConfigContract() } catch { failedContracts += 1 }
++        do { try await testLoginContract() } catch { failedContracts += 1 }
++        do { try testConfigEditContract() } catch { failedContracts += 1 }
++        guard failedContracts == 0 else { throw ContractFailure.regressions(failedContracts) }
+         print("GLKVMSystemConfigTests passed")
++    }
++
++    private static func testLosslessConfigContract() throws {
++        let cases = [
++            "{}",
++            #"{"mouse_jiggle":true,"future":{"text":"Grüße 🖱️","flags":[true,null,17,2.5]},"show_cursor":"firmware-value","shortcuts":[{"keys":["Ctrl"],"label":"Test","new_option":true}]}"#,
++            #"{"orientation":0,"show_cursor":false,"keymap":"de","future":null}"#,
++        ]
++        var failures: [String] = []
++        for (index, payload) in cases.enumerated() {
++            let data = Data(payload.utf8)
++            let original = try JSONDecoder().decode(GLKVMJSONObject.self, from: data)
++            let config = try JSONDecoder().decode(GLKVMSystemConfig.self, from: data)
++            let roundtrip = try JSONDecoder().decode(GLKVMJSONObject.self, from: JSONEncoder().encode(config))
++            if original != roundtrip { failures.append("lossless roundtrip \(index)") }
++        }
++        for payload in [#"{"mouse_jiggle":"true"}"#, #"{"mouse_jiggle":null}"#, #"{"mouse_jiggle":1}"#] {
++            do {
++                _ = try JSONDecoder().decode(GLKVMSystemConfig.self, from: Data(payload.utf8))
++                failures.append("invalid present jiggler accepted")
++            } catch {}
++        }
++        var edited = try JSONDecoder().decode(GLKVMSystemConfig.self, from: Data("{}".utf8))
++        edited.keymap = "de"
++        let changed = try JSONDecoder().decode(GLKVMJSONObject.self, from: JSONEncoder().encode(edited))
++        if changed != ["keymap": .string("de")] { failures.append("edit inserted untouched default fields") }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw ContractFailure.regressions(failures.count) }
++        print("Lossless config contract: \(cases.count + 4) scenarios passed")
++    }
++
++    private static func testConfigEditContract() throws {
++        let decoder = JSONDecoder()
++        let baseline = try decoder.decode(GLKVMSystemConfig.self, from: Data("{}".utf8))
++        var draft = baseline
++        draft.shortcuts = [GLKVMSystemConfigShortcut(keys: ["Ctrl", "Enter"], label: "Grüße 🖱️")]
++        draft.orientation = 90
++        draft.streamQuality = 3
++        draft.videoMode = "stream"
++        draft.showCursor = false
++        draft.mousePolling = 20
++        draft.mouseControl = false
++        draft.relativeSense = 20
++        draft.scrollRate = 10
++        draft.reverseScrolling = "REVERSED"
++        draft.keyboardControl = false
++        draft.themeMode = "dark"
++        draft.keymap = "de"
++        draft.gotMutedPanelTip = true
++        draft.isAbsoluteMouse = false
++        draft.fingerbotStrength = 4
++        draft.videoProcessing = "low_latency_first"
++        let expected = try decoder.decode(GLKVMJSONObject.self, from: Data(#"{"shortcuts":[{"keys":["Ctrl","Enter"],"label":"Grüße 🖱️"}],"orientation":90,"stream_quality":3,"video_mode":"stream","show_cursor":false,"mouse_polling":20,"mouse_control":false,"relative_sense":20,"scroll_rate":10,"reverse_scrolling":"REVERSED","keyboard_control":false,"theme_mode":"dark","keymap":"de","got_muted_panel_tip":true,"is_absolute_mouse":false,"fingerbot_strength":4,"video_processing":"low_latency_first"}"#.utf8))
++        guard draft.settingsEditKeys(relativeTo: baseline) == Set(expected.keys) else { throw ContractFailure.regressions(1) }
++        let actual = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(draft))
++        guard actual == expected else { throw ContractFailure.regressions(1) }
++        let unchanged = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(baseline))
++        guard unchanged.isEmpty else { throw ContractFailure.regressions(1) }
++
++        let fresh = try decoder.decode(GLKVMSystemConfig.self, from: Data(#"{"keymap":"fr","mouse_jiggle":true,"stream_quality":3,"future":null}"#.utf8))
++        let unchangedMerge = try fresh.mergingSettingsEdits(from: baseline, editedFields: baseline.settingsEditKeys(relativeTo: baseline))
++        let unchangedPayload = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(unchangedMerge))
++        let freshPayload = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(fresh))
++        guard unchangedPayload == freshPayload else { throw ContractFailure.regressions(1) }
++        var jigglerOnly = fresh
++        jigglerOnly.mouseJiggle = false
++        let protected = try fresh.mergingSettingsEdits(from: jigglerOnly, editedFields: ["mouse_jiggle"])
++        guard protected.mouseJiggle else { throw ContractFailure.regressions(1) }
++
++        let large: GLKVMJSONObject = ["unknown_entries": .array((0..<10_000).map { .object(["value": .int($0)]) })]
++        let largeData = try JSONEncoder().encode(large)
++        let largeConfig = try decoder.decode(GLKVMSystemConfig.self, from: largeData)
++        let largeRoundtrip = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(largeConfig))
++        guard largeRoundtrip == large else { throw ContractFailure.regressions(1) }
++        print("Config edit contract: all 17 settings, unchanged/protected merge and 10k unknown entries passed")
++    }
++
++    private static func testLoginContract() async throws {
++        let cases: [(String, String?)] = [
++            ("login-token", nil), ("login-cookie", nil),
++            ("login-reject-token", "requestRejected"),
++            ("login-reject-cookie", "requestRejected"),
++            ("login-reject-empty", "requestRejected"),
++            ("login-http-error", "httpError(403)"),
++            ("login-malformed", "decodingFailed"),
++            ("login-invalid-ok-cookie", "decodingFailed"),
++            ("login-empty-cookie", "decodingFailed"),
++            ("login-transport-error", "transportFailed"),
++        ]
++        var failures: [String] = []
++        for (scenario, expected) in cases {
++            let configuration = URLSessionConfiguration.ephemeral
++            configuration.protocolClasses = [GLKVMResponseFixtureProtocol.self]
++            configuration.httpCookieStorage = nil
++            let client = try GLKVMClient(host: "\(scenario).invalid", allowInsecureTLS: false, sessionConfiguration: configuration)
++            do {
++                let token = try await client.authLogin(password: fixtureLoginPassword)
++                if expected != nil || token != "fixture-token" { failures.append("\(scenario): unexpected login success") }
++            } catch {
++                if String(describing: error) != expected { failures.append("\(scenario): wrong error category") }
++            }
++        }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw ContractFailure.regressions(failures.count) }
++        print("Login contract: \(cases.count) scenarios passed; synthetic credentials only")
+     }
+ 
+     private static func jsonObject(from data: Data) throws -> [String: Any] {
+@@ -112,7 +223,7 @@
+     override func startLoading() {
+         guard let url = request.url else { preconditionFailure("Fixture needs a URL") }
+         let scenario = url.host?.split(separator: ".").first.map(String.init) ?? ""
+-        if scenario == "transport-error" {
++        if scenario == "transport-error" || scenario == "login-transport-error" {
+             let error = URLError(.timedOut, userInfo: [
+                 NSLocalizedDescriptionKey: "synthetic-secret transport detail",
+                 NSURLErrorFailingURLErrorKey: URL(string: "https://synthetic-secret.invalid/private")!,
+@@ -121,9 +232,11 @@
+             return
+         }
+         let payload = Self.payload(for: scenario)
++        var headers = ["Content-Type": "application/json"]
++        if scenario.contains("cookie") { headers["Set-Cookie"] = scenario == "login-empty-cookie" ? "auth_token=; Path=/" : "auth_token=fixture-token; Path=/" }
+         let response = HTTPURLResponse(
+-            url: url, statusCode: scenario == "http-error" ? 403 : 200,
+-            httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]
++            url: url, statusCode: scenario.contains("http-error") ? 403 : 200,
++            httpVersion: "HTTP/1.1", headerFields: headers
+         )!
+         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+         client?.urlProtocol(self, didLoad: Data(payload.utf8))
+@@ -134,6 +247,14 @@
+ 
+     private static func payload(for scenario: String) -> String {
+         switch scenario {
++        case "login-token": return #"{"ok":true,"result":{"token":"fixture-token"}}"#
++        case "login-invalid-ok-cookie": return #"{"ok":"true"}"#
++        case "login-empty-cookie": return #"{"ok":true}"#
++        case "login-cookie": return #"{"ok":true}"#
++        case "login-reject-token": return #"{"ok":false,"result":{"token":"fixture-token"}}"#
++        case "login-reject-cookie", "login-reject-empty": return #"{"ok":false}"#
++        case "login-http-error": return #"{"ok":false,"result":{"token":"fixture-token"}}"#
++        case "login-malformed": return "invalid response"
+         case "accepted": return #"{"ok":true,"result":{}}"#
+         case "rejected": return #"{"ok":false,"result":{}}"#
+         case "no-result": return #"{"ok":false}"#
+@@ -148,3 +269,5 @@
+         }
+     }
+ }
++
++private enum ContractFailure: Error { case regressions(Int) }
+--- a/tests/GLKVMWebSocketSettlementTests.swift
++++ b/tests/GLKVMWebSocketSettlementTests.swift
+@@ -52,6 +52,7 @@
+ @MainActor
+ private final class SettlementProbe {
+     var completed = false
++    var dispatched = false
+     var error: Error?
+     var observedErrors: [String] = []
+ }
+@@ -66,6 +67,14 @@
+         do {
+             let health = try JSONSerialization.jsonObject(with: await control.request("/fixture/health")) as? [String: Any]
+             try expect(health?["fixture"] as? String == "overlook-ws-settlement", "Only the local settlement fixture is allowed")
++            try await testCancelledRemoteActionBlocksInputAndDrains(control)
++            print("PASS: cancellation after dispatch blocks actual input before bounded queue cleanup")
++            try await testStalledCallerCancellationDoesNotReplay(control)
++            print("PASS: caller cancellation settles an uncertain send and preserves its replacement")
++            try await testAlreadyCancelledSendDoesNotDispatch(control)
++            print("PASS: cancellation before dispatch never reaches the fixture")
++            try await testDisconnectSettlesPendingSend(control)
++            print("PASS: disconnect settles an uncertain send and preserves its replacement")
+             try await testShutdownDoesNotReconnect(control)
+             print("PASS: shutdown settles and never reconnects after an in-flight local key fails")
+             try await testLocalKeyTimeoutBlocksInput(control)
+@@ -78,11 +87,156 @@
+             print("PASS: stale abort preserves replacement task on the same client")
+             try await testReconnectAfterOldPingStarted(control)
+             print("PASS: reconnect remains usable after the old connection's regular ping started")
+-            print("GLKVMWebSocketSettlementTests passed (6 groups)")
++            print("GLKVMWebSocketSettlementTests passed (10 groups)")
+         } catch {
+             fputs("GLKVMWebSocketSettlementTests FAILED: \(error)\n", stderr)
+             exit(1)
+         }
++    }
++
++    @MainActor private static func testCancelledRemoteActionBlocksInputAndDrains(_ control: SettlementControl) async throws {
++        try await control.mode("stall-handshake")
++        let previous = try await control.status().count
++        let fixture = CaptureFixture()
++        defer { fixture.finish() }
++        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
++        fixture.manager.setGLKVMClient(client)
++        fixture.manager.setTransportMode(.glkvmWebSocket)
++        _ = try await control.waitForConnection(after: previous)
++        let probe = SettlementProbe()
++        let action = Task { @MainActor in
++            do {
++                try await fixture.manager.performRemoteAction(
++                    .scroll(x: 10, y: 10, deltaY: 1), width: 100, height: 100,
++                    authorization: { true }, willDispatch: { probe.dispatched = true }
++                )
++            } catch { probe.error = error }
++            probe.completed = true
++        }
++        try await Task.sleep(nanoseconds: 100_000_000)
++        try expect(probe.dispatched, "The real command must pass its dispatch boundary before cancellation")
++        action.cancel()
++        try await waitForCompletion(probe, "A cancelled actual HID action must release its waiting caller within one second")
++        await action.value
++        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
++                   "The real dispatched action must retain its unknown outcome")
++        try expect(fixture.manager.inputBlocked, "Cancellation after dispatch must block input before cleanup")
++        try expect(fixture.manager.lastInputError != nil, "Cancellation after dispatch must leave a visible error")
++        let cleanup = SettlementProbe()
++        let disconnect = Task { @MainActor in
++            await fixture.manager.disconnectInputForSession()
++            cleanup.completed = true
++        }
++        try await waitForCompletion(cleanup, "The uncertain command must not prevent the real HID queue from draining")
++        await disconnect.value
++        try expect(fixture.manager.inputBlocked, "Queue cleanup must never clear an uncertain action's input block")
++    }
++
++    @MainActor private static func testStalledCallerCancellationDoesNotReplay(_ control: SettlementControl) async throws {
++        try await control.mode("stall-handshake")
++        let previous = try await control.status().count
++        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
++        let socket = try client.makeWebSocketClient()
++        await socket.connect()
++        let oldConnection = try await control.waitForConnection(after: previous)
++        let probe = SettlementProbe()
++        let send = Task { @MainActor in
++            do { try await socket.send(eventType: "cancelled-stalled-probe") }
++            catch { probe.error = error }
++            probe.completed = true
++        }
++        try await Task.sleep(nanoseconds: 100_000_000)
++        send.cancel()
++        try await waitForCompletion(probe, "Cancellation must settle an actual pending send within one second")
++        await send.value
++        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
++                   "Cancellation after dispatch must never report success or a definitive not-started result")
++        try await verifyReplacement(socket, after: previous + 1, event: "replacement-after-cancel", control: control)
++        let records = try await control.status()
++        try expect(records.first(where: { $0.id == oldConnection.id })?.closed == true,
++                   "Cancellation must close only the affected stalled transport")
++        try expect(!records.contains(where: { $0.events.contains("cancelled-stalled-probe") }),
++                   "A cancelled uncertain send must never replay on a replacement")
++    }
++
++    @MainActor private static func testAlreadyCancelledSendDoesNotDispatch(_ control: SettlementControl) async throws {
++        try await control.mode("normal")
++        let previous = try await control.status().count
++        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
++        let socket = try client.makeWebSocketClient()
++        await socket.connect()
++        let connection = try await control.waitForConnection(after: previous)
++        try await waitUntilConnected(socket)
++        let probe = SettlementProbe()
++        // This MainActor task cannot run until the current actor turn yields.
++        let send = Task { @MainActor in
++            do { try await socket.send(eventType: "never-dispatched-cancelled-probe") }
++            catch { probe.error = error }
++            probe.completed = true
++        }
++        send.cancel()
++        try await waitForCompletion(probe, "An already cancelled send must settle without transport dispatch")
++        await send.value
++        try await Task.sleep(nanoseconds: 100_000_000)
++        let records = try await control.status()
++        let connected = await socket.isConnected
++        await socket.disconnect()
++        guard let record = records.first(where: { $0.id == connection.id }) else {
++            throw CaptureTestFailure(description: "Fixture lost the active connection record")
++        }
++        try expect(probe.error is CancellationError, "Cancellation before dispatch must retain its definitive cancellation result")
++        try expect(!record.events.contains("never-dispatched-cancelled-probe"),
++                   "Cancellation before dispatch must emit no command")
++        try expect(connected, "A send cancelled before dispatch must preserve the healthy transport")
++    }
++
++    @MainActor private static func testDisconnectSettlesPendingSend(_ control: SettlementControl) async throws {
++        try await control.mode("stall-handshake")
++        let previous = try await control.status().count
++        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
++        let socket = try client.makeWebSocketClient()
++        await socket.connect()
++        _ = try await control.waitForConnection(after: previous)
++        let probe = SettlementProbe()
++        let send = Task { @MainActor in
++            do { try await socket.send(eventType: "disconnected-stalled-probe") }
++            catch { probe.error = error }
++            probe.completed = true
++        }
++        try await Task.sleep(nanoseconds: 100_000_000)
++        await socket.disconnect()
++        try await waitForCompletion(probe, "Disconnect must settle an actual pending send within one second")
++        await send.value
++        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
++                   "Disconnect after dispatch must retain the uncertain remote outcome")
++        try await verifyReplacement(socket, after: previous + 1, event: "replacement-after-disconnect", control: control)
++        let records = try await control.status()
++        try expect(!records.contains(where: { $0.events.contains("disconnected-stalled-probe") }),
++                   "Disconnect must never replay an uncertain send")
++    }
++
++    @MainActor private static func waitForCompletion(_ probe: SettlementProbe, _ message: String) async throws {
++        let deadline = ProcessInfo.processInfo.systemUptime + 1
++        while !probe.completed, ProcessInfo.processInfo.systemUptime < deadline {
++            try await Task.sleep(nanoseconds: 10_000_000)
++        }
++        try expect(probe.completed, message)
++    }
++
++    private static func verifyReplacement(_ socket: GLKVMClient.WebSocketClient, after count: Int,
++                                          event: String, control: SettlementControl) async throws {
++        try await control.mode("normal")
++        await socket.connect()
++        let replacement = try await control.waitForConnection(after: count)
++        try await waitUntilConnected(socket)
++        // Cross the retired transport's former send deadline and late callbacks.
++        try await Task.sleep(nanoseconds: 2_200_000_000)
++        try await socket.send(eventType: event)
++        let record = try await waitForEvent(event, id: replacement.id, control: control)
++        let connected = await socket.isConnected
++        await socket.disconnect()
++        try expect(connected, "An old completion must not close a replacement transport")
++        try expect(record.events.filter { $0 == event }.count == 1, "The replacement must transmit its probe exactly once")
+     }
+ 
+     @MainActor private static func testShutdownDoesNotReconnect(_ control: SettlementControl) async throws {
+--- /dev/null
++++ b/tests/MainWindowLifecycleTests.swift
+@@ -0,0 +1,222 @@
++import AppKit
++
++@main
++struct MainWindowLifecycleTests {
++    @MainActor static func main() throws {
++        let application = NSApplication.shared
++        application.setActivationPolicy(.accessory)
++        application.finishLaunching()
++        let tests: [(String, @MainActor () throws -> Void)] = [
++            ("close and reopen preserve the video view", testCloseAndReopen),
++            ("menu reopen ignores a visible dialog", testDialogIsNotSelected),
++            ("menu reopen restores a minimized main window", testMinimizedMainWindow),
++            ("menu reopen without a main window is harmless", testMissingMainWindow),
++            ("foreign windows keep their delegate close decision", testForeignClose),
++            ("main window close does not close through its delegate", testMainCloseBypassesForwardedDelegate),
++            ("cold mount attaches lifecycle without a later view update", testColdMount),
++            ("registration preserves SwiftUI scene identity", testSceneIdentity),
++            ("attachment follows a view moving between windows", testMovedAttachment),
++        ]
++        var failures: [String] = []
++        for (name, test) in tests {
++            do { try test(); print("PASS: \(name)") }
++            catch { failures.append("\(name): \(error)") }
++        }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw WindowTestFailure.message("\(failures.count) window lifecycle regressions") }
++        print("MainWindowLifecycleTests: \(tests.count) scenarios passed; isolated offscreen AppKit windows")
++    }
++
++    @MainActor private static func makeWindow() -> NSWindow {
++        let window = NSWindow(
++            contentRect: NSRect(x: -10_000, y: -10_000, width: 320, height: 240),
++            styleMask: [.titled, .closable, .miniaturizable, .resizable],
++            backing: .buffered,
++            defer: false
++        )
++        window.alphaValue = 0
++        window.isReleasedWhenClosed = false
++        return window
++    }
++
++    @MainActor private static func testCloseAndReopen() throws {
++        let main = makeWindow()
++        MainWindowLifecycle.register(main)
++        let content = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
++        let renderer = NSView(frame: content.bounds)
++        content.addSubview(renderer)
++        main.contentView = content
++        let delegate = LifecycleDelegate()
++        main.delegate = delegate
++        defer { main.delegate = nil; main.orderOut(nil) }
++        MainWindowLifecycle.show(in: [main])
++        try expect(main.isVisible, "Main window did not become visible")
++
++        main.performClose(nil)
++        try expect(delegate.closeRequests == 1, "Native close did not reach lifecycle delegate")
++        try expect(!main.isVisible, "Closing main window did not hide it")
++        try expect(delegate.didCloseCount == 0, "Main window was closed instead of retained")
++        try expect(main.contentView === content && renderer.superview === content,
++                   "Closing main window detached the retained video view")
++
++        let reopened = MainWindowLifecycle.show(in: [main])
++        try expect(reopened === main && main.isVisible, "Menu reopen did not reuse the retained main window")
++        try expect(main.contentView === content && renderer.superview === content,
++                   "Menu reopen replaced the video view")
++    }
++
++    @MainActor private static func testDialogIsNotSelected() throws {
++        let dialog = makeWindow()
++        let main = makeWindow()
++        MainWindowLifecycle.register(main)
++        dialog.identifier = NSUserInterfaceItemIdentifier("SyntheticSettingsDialog")
++        dialog.orderFront(nil)
++        defer { dialog.orderOut(nil); main.orderOut(nil) }
++        try expect(MainWindowLifecycle.show(in: [dialog, main]) === main,
++                   "Menu reopen chose a dialog instead of the tagged main window")
++        try expect(main.isVisible, "Main window remained hidden behind dialog")
++    }
++
++    @MainActor private static func testMinimizedMainWindow() throws {
++        let main = makeWindow()
++        MainWindowLifecycle.register(main)
++        defer { main.orderOut(nil) }
++        main.orderFront(nil)
++        main.miniaturize(nil)
++        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
++        try expect(main.isMiniaturized, "Fixture main window did not minimize")
++        try expect(MainWindowLifecycle.show(in: [main]) === main, "Minimized main window was not selected")
++        try expect(!main.isMiniaturized && main.isVisible, "Menu reopen left main window minimized")
++    }
++
++    @MainActor private static func testMissingMainWindow() throws {
++        let dialog = makeWindow()
++        defer { dialog.orderOut(nil) }
++        try expect(MainWindowLifecycle.show(in: []) == nil, "Empty window list created a window")
++        try expect(MainWindowLifecycle.show(in: [dialog]) == nil,
++                   "Missing main window activated a foreign window")
++        try expect(!dialog.isVisible, "Foreign window was shown by menu reopen")
++    }
++
++    @MainActor private static func testForeignClose() throws {
++        let foreign = makeWindow()
++        let forwarded = ForwardedDelegate(allowsClose: false)
++        defer { foreign.orderOut(nil) }
++        try expect(!MainWindowLifecycle.shouldClose(foreign, forwardingTo: forwarded),
++                   "Foreign delegate refusal was ignored")
++        try expect(forwarded.closeRequests == 1, "Foreign close was not forwarded")
++        forwarded.allowsClose = true
++        try expect(MainWindowLifecycle.shouldClose(foreign, forwardingTo: forwarded),
++                   "Foreign delegate approval was ignored")
++        try expect(forwarded.closeRequests == 2, "Foreign close was not forwarded twice")
++        try expect(MainWindowLifecycle.shouldClose(foreign, forwardingTo: nil),
++                   "Unowned foreign window could not close")
++        try expect(MainWindowLifecycle.shouldClose(foreign, forwardingTo: NSObjectDelegate()),
++                   "Foreign delegate without a close hook could not close")
++    }
++
++    @MainActor private static func testMainCloseBypassesForwardedDelegate() throws {
++        let main = makeWindow()
++        MainWindowLifecycle.register(main)
++        let forwarded = ForwardedDelegate(allowsClose: true)
++        defer { main.orderOut(nil) }
++        main.orderFront(nil)
++        try expect(!MainWindowLifecycle.shouldClose(main, forwardingTo: forwarded),
++                   "Main window close delegated to SwiftUI and destroyed the scene")
++        try expect(!main.isVisible && forwarded.closeRequests == 0,
++                   "Main window close did not retain scene independently of foreign delegates")
++        try expect(!main.isReleasedWhenClosed, "Main window is not retained by AppKit")
++    }
++
++    @MainActor private static func testColdMount() throws {
++        let main = makeWindow()
++        main.identifier = NSUserInterfaceItemIdentifier("main")
++        let content = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 240))
++        main.contentView = content
++        let probe = MainWindowAttachmentView(frame: .zero)
++        let delegate = LifecycleDelegate()
++        var attachedWindows: [NSWindow] = []
++        probe.onWindowAttached = { window in
++            attachedWindows.append(window)
++            MainWindowLifecycle.register(window)
++            window.delegate = delegate
++        }
++        defer { main.delegate = nil; main.orderOut(nil) }
++        // SwiftUI can update the representable before AppKit mounts its NSView.
++        // The subsequent mount must work without another update or video frame.
++        try expect(probe.window == nil && attachedWindows.isEmpty, "Fixture was not a cold unattached view")
++        content.addSubview(probe)
++        try expect(attachedWindows.count == 1 && attachedWindows.first === main,
++                   "Cold mount never attached the lifecycle without a later SwiftUI update")
++        try expect(main.delegate === delegate, "Cold mount did not install the close delegate")
++        MainWindowLifecycle.show(in: NSApp.windows)
++        main.performClose(nil)
++        try expect(delegate.closeRequests == 1 && delegate.didCloseCount == 0 && !main.isVisible,
++                   "First cold window close destroyed its scene")
++        try expect(MainWindowLifecycle.show(in: NSApp.windows) === main && main.contentView === content,
++                   "Cold window could not reopen its retained scene")
++    }
++
++    @MainActor private static func testSceneIdentity() throws {
++        let main = makeWindow()
++        let dialog = makeWindow()
++        let sceneID = NSUserInterfaceItemIdentifier("main")
++        main.identifier = sceneID
++        dialog.identifier = sceneID
++        defer { main.orderOut(nil); dialog.orderOut(nil) }
++        MainWindowLifecycle.register(main)
++        try expect(main.identifier == sceneID, "Lifecycle registration overwrote SwiftUI scene identity")
++        try expect(MainWindowLifecycle.show(in: [dialog, main]) === main,
++                   "A matching scene identifier selected an unregistered dialog")
++        try expect(MainWindowLifecycle.shouldClose(dialog, forwardingTo: nil),
++                   "A foreign matching-identifier window was treated as the lifecycle owner")
++    }
++
++    @MainActor private static func testMovedAttachment() throws {
++        let first = makeWindow()
++        let second = makeWindow()
++        let probe = MainWindowAttachmentView(frame: .zero)
++        var attachedWindows: [NSWindow] = []
++        probe.onWindowAttached = { attachedWindows.append($0) }
++        defer { first.orderOut(nil); second.orderOut(nil) }
++        first.contentView?.addSubview(probe)
++        probe.removeFromSuperview()
++        try expect(probe.window == nil, "Detached probe still owns its old window")
++        second.contentView?.addSubview(probe)
++        try expect(attachedWindows.count == 2 && attachedWindows[0] === first && attachedWindows[1] === second,
++                   "Attachment callback did not follow the real window transition")
++        let quietProbe = MainWindowAttachmentView(frame: .zero)
++        second.contentView?.addSubview(quietProbe)
++        try expect(quietProbe.window === second, "Probe without callback did not mount safely")
++    }
++
++    private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        guard condition() else { throw WindowTestFailure.message(message) }
++    }
++}
++
++private enum WindowTestFailure: Error {
++    case message(String)
++}
++
++@MainActor private final class LifecycleDelegate: NSObject, NSWindowDelegate {
++    var closeRequests = 0
++    var didCloseCount = 0
++    func windowShouldClose(_ sender: NSWindow) -> Bool {
++        closeRequests += 1
++        return MainWindowLifecycle.shouldClose(sender, forwardingTo: nil)
++    }
++    func windowWillClose(_ notification: Notification) { didCloseCount += 1 }
++}
++
++@MainActor private final class ForwardedDelegate: NSObject, NSWindowDelegate {
++    var allowsClose: Bool
++    var closeRequests = 0
++    init(allowsClose: Bool) { self.allowsClose = allowsClose }
++    func windowShouldClose(_ sender: NSWindow) -> Bool {
++        closeRequests += 1
++        return allowsClose
++    }
++}
++
++@MainActor private final class NSObjectDelegate: NSObject, NSWindowDelegate {}
+--- /dev/null
++++ b/tests/MouseJigglerLifecycleTests.swift
+@@ -0,0 +1,511 @@
++import Foundation
++import Combine
++
++@main
++struct MouseJigglerLifecycleTests {
++    @MainActor static func main() async throws {
++        let tests: [(String, @MainActor () async throws -> Void)] = [
++            ("enabled jiggler resumes only after remote drain", testRestoreAfterDrain),
++            ("previously disabled jiggler stays disabled", testPriorOff),
++            ("failed disable recovers in Manual", testFailedDisable),
++            ("manual toggle supersedes pending restoration", testManualSupersession),
++            ("manual toggle supersedes a sent restore", testManualSupersessionAfterPost),
++            ("Headless interrupts restoration safely", testReheadless),
++            ("Headless interrupts delayed readback safely", testReheadlessDuringReadback),
++            ("Headless cancellation repairs sent firmware write", testCancelledRestoreInHeadless),
++            ("control store cancellation repairs sent firmware write", testStoreCancellation),
++            ("failed transition uses shared drain and capture hook", testFailedTransitionHook),
++            ("restore failure is visible and can recover", testRestoreFailure),
++            ("locked restore retains its pending intent", testLockedRestore),
++            ("disconnect invalidates restoration", testDisconnect),
++            ("stale refresh cannot publish old configuration", testStaleRefresh),
++            ("cancelled refresh preserves confirmed state", testCancelledRefresh),
++            ("newest refresh owns success and cleanup", testRefreshOwnership),
++            ("transient refresh retries are bounded", testTransientRefresh),
++            ("authentication rejection is never retried", testAuthenticationFailure),
++            ("unsupported firmware is never retried or enabled", testUnsupported),
++            ("replacement session never inherits restoration", testReplacementSession),
++            ("disconnected state rejects jiggler writes", testDisconnectedState),
++            ("cancelled retry backoff preserves state", testCancelledRetryBackoff),
++        ]
++        var failures: [String] = []
++        for (name, test) in tests {
++            do { try await test(); print("PASS: \(name)") }
++            catch { failures.append("\(name): \(error)") }
++        }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw TestFailure.message("\(failures.count) lifecycle regressions") }
++        print("MouseJigglerLifecycleTests: \(tests.count) scenarios passed; URLProtocol only, no KVM or persisted state")
++    }
++
++    @MainActor private static func setup(enabled: Bool = true, supported: Bool = true) async throws -> (KVMDeviceManager, JigglerFixture) {
++        let fixture = JigglerFixture(enabled: enabled, supported: supported)
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [JigglerURLProtocol.self]
++        let client = try GLKVMClient(host: fixture.host, authToken: "fixture-only", allowInsecureTLS: false, sessionConfiguration: configuration)
++        let device = KVMDevice(id: fixture.host, name: "Synthetic KVM", host: fixture.host, port: 80, type: .custom, authToken: "", capabilities: [])
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        manager.commitConnection(PreparedKVMConnection(device: device, client: client))
++        try await eventually { manager.mouseJigglerSupported != nil }
++        return (manager, fixture)
++    }
++
++    @MainActor private static func enterHeadless(_ manager: KVMDeviceManager) async throws {
++        let owner = manager.beginHeadlessConfigurationTransition()
++        defer { manager.endHeadlessConfigurationTransition(owner) }
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.setHeadlessModeActive(true)
++    }
++
++    @MainActor private static func testRestoreAfterDrain() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let modeBinding = store.$mode.sink { manager.setHeadlessModeActive($0 == .codexHeadless) }
++        defer { modeBinding.cancel() }
++        let drain = RemoteMutationGate()
++        let blocker = TestBarrier()
++        let mutation = Task { try await drain.perform { await blocker.wait() } }
++        try await eventually { drain.isBusy }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, waitForRemoteMutations: {
++            await drain.waitUntilIdle()
++        }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        store.setMode(.codexHeadless)
++        manager.endHeadlessConfigurationTransition(owner)
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Headless must confirm off")
++        store.setMode(.manual)
++        await spin()
++        try expect(fixture.posts == [false] && captures == [true, false], "Restore and capture must wait for real drain")
++        fixture.holdNextPost()
++        await blocker.release()
++        _ = try await mutation.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(captures == [true, false, true], "Firmware restore delayed Manual capture after drain")
++        fixture.releaseHeldRequests()
++        try await eventually { manager.mouseJigglerEnabled == true }
++        try expect(fixture.posts == [false, true] && manager.mouseJigglerEnabled == true, "Enabled state was not restored")
++    }
++
++    @MainActor private static func testPriorOff() async throws {
++        let (manager, fixture) = try await setup(enabled: false)
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && !fixture.posts.contains(true), "Prior off was enabled")
++    }
++
++    @MainActor private static func testFailedDisable() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextPostAfterApplying()
++        let owner = manager.beginHeadlessConfigurationTransition()
++        do { try await manager.pauseMouseJigglerForHeadless(); throw TestFailure.message("Rejected disable unexpectedly succeeded") }
++        catch is TestFailure { throw TestFailure.message("Rejected disable unexpectedly succeeded") }
++        catch { }
++        manager.endHeadlessConfigurationTransition(owner)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled && manager.mouseJigglerEnabled == true, "Manual failure recovery lost prior enabled state")
++    }
++
++    @MainActor private static func testManualSupersession() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextGet()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manual.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && !fixture.posts.contains(true), "Newer Manual choice was overwritten")
++    }
++
++    @MainActor private static func testReheadless() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try expect(!fixture.enabled, "Interrupted restore left firmware enabled in Headless")
++        try expect(manager.mouseJigglerEnabled != true, "Interrupted restore published enabled in Headless")
++    }
++
++    @MainActor private static func testManualSupersessionAfterPost() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manual.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && fixture.posts == [false, true, false], "Sent restore overrode newer Manual toggle")
++    }
++
++    @MainActor private static func testDisconnect() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextGet()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.disconnectFromDevice()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts == [false] && manager.mouseJigglerEnabled == nil, "Disconnected session was restored")
++    }
++
++    @MainActor private static func testReheadlessDuringReadback() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdGet(number: fixture.getCount + 2)
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Delayed readback left Headless enabled")
++    }
++
++    @MainActor private static func testCancelledRestoreInHeadless() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        restore.cancel()
++        _ = try? await restore.value
++        fixture.releaseHeldRequests()
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Cancellation left sent enable active")
++    }
++
++    @MainActor private static func testRestoreFailure() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.failNextPostAfterApplying()
++        do { try await manager.resumeMouseJigglerAfterHeadless(); throw TestFailure.message("Rejected restore succeeded") }
++        catch is TestFailure { throw TestFailure.message("Rejected restore succeeded") }
++        catch { }
++        try expect(manager.mouseJigglerErrorMessage != nil, "Restore failure was hidden")
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled && manager.mouseJigglerErrorMessage == nil, "Restore could not recover")
++    }
++
++    @MainActor private static func testStoreCancellation() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let binding = store.$mode.sink { manager.setHeadlessModeActive($0 == .codexHeadless) }
++        defer { binding.cancel() }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        store.setMode(.codexHeadless)
++        manager.endHeadlessConfigurationTransition(owner)
++        fixture.holdNextPost()
++        store.setMode(.manual)
++        try await eventually { fixture.hasHeldRequest }
++        store.setMode(.codexHeadless)
++        try await eventually { !fixture.enabled && !manager.isMouseJigglerUpdating }
++        fixture.releaseHeldRequests()
++        try expect(captures == [true, false, true, false], "Cancelled Manual task resumed local capture")
++        try expect(manager.mouseJigglerEnabled == false, "Store cancellation did not confirm safe firmware state")
++    }
++
++    @MainActor private static func testFailedTransitionHook() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let drain = RemoteMutationGate()
++        let blocker = TestBarrier()
++        let mutation = Task { try await drain.perform { await blocker.wait() } }
++        try await eventually { drain.isBusy }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, waitForRemoteMutations: {
++            await drain.waitUntilIdle()
++        }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.endHeadlessConfigurationTransition(owner)
++        store.resumeManualCaptureIfNeeded()
++        await spin()
++        try expect(fixture.posts == [false] && captures == [true], "Failed-transition recovery bypassed drain")
++        await blocker.release()
++        _ = try await mutation.value
++        try await eventually { fixture.enabled }
++        try expect(captures == [true, true], "Failure hook delayed Manual capture")
++        try expect(fixture.enabled, "Shared failure hook did not restore previous state")
++    }
++
++    @MainActor private static func testLockedRestore() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts == [false], "Locked restore sent enable")
++        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Locked Manual toggle succeeded") }
++        catch is TestFailure { throw TestFailure.message("Locked Manual toggle succeeded") }
++        catch { }
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled, "Locked request erased prior true intent")
++    }
++
++    @MainActor private static func testRefreshOwnership() async throws {
++        let (manager, fixture) = try await setup()
++        try await manager.setMouseJigglerEnabled(false)
++        fixture.simulateFirmwareEnabled(true)
++        fixture.holdNextGet()
++        let old = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        fixture.simulateFirmwareEnabled(false)
++        fixture.holdNextGet()
++        let newest = Task { await manager.refreshMouseJigglerState() }
++        await spin()
++        fixture.releaseHeldRequests()
++        await old.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(manager.mouseJigglerEnabled == false, "Old owner published stale success")
++        fixture.releaseHeldRequests()
++        await newest.value
++        try expect(manager.mouseJigglerEnabled == false, "Old cleanup invalidated newer refresh")
++    }
++
++    @MainActor private static func testStaleRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        try await manager.setMouseJigglerEnabled(false)
++        fixture.simulateFirmwareEnabled(true)
++        fixture.holdNextGet()
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        fixture.holdNextPost()
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        await refresh.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(manager.mouseJigglerEnabled != true, "Stale refresh published superseded configuration")
++        fixture.releaseHeldRequests()
++        try await manual.value
++        try expect(manager.mouseJigglerEnabled == false, "New state lost")
++    }
++
++    @MainActor private static func testCancelledRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.holdNextGet()
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        refresh.cancel()
++        await refresh.value
++        fixture.releaseHeldRequests()
++        try expect(manager.mouseJigglerEnabled == true, "Cancellation erased confirmed state")
++    }
++
++    @MainActor private static func testTransientRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 2, status: nil)
++        let before = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - before == 3 && manager.mouseJigglerEnabled == true, "Transient failures were not retried")
++        fixture.failNextGets(count: 4, status: nil)
++        let boundedBefore = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - boundedBefore == 3 && manager.mouseJigglerEnabled == nil, "Retries exceeded three or did not expose unavailable state")
++    }
++
++    @MainActor private static func testAuthenticationFailure() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 3, status: 401)
++        let before = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - before == 1, "Authentication failure was retried")
++    }
++
++    @MainActor private static func testUnsupported() async throws {
++        let (manager, fixture) = try await setup(supported: false)
++        try expect(manager.mouseJigglerSupported == false && manager.mouseJigglerEnabled == nil, "Unsupported firmware was misrepresented")
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.setHeadlessModeActive(true)
++        manager.endHeadlessConfigurationTransition(owner)
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts.isEmpty, "Unsupported firmware received a configuration write")
++    }
++
++    @MainActor private static func testReplacementSession() async throws {
++        let (manager, first) = try await setup()
++        try await enterHeadless(manager)
++        let (replacement, second) = try await setup(enabled: false)
++        manager.commitConnection(PreparedKVMConnection(device: replacement.connectedDevice!, client: replacement.glkvmClient!))
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(first.posts == [false] && second.posts.isEmpty, "Restoration crossed session boundary")
++    }
++
++    @MainActor private static func testDisconnectedState() async throws {
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        await manager.refreshMouseJigglerState()
++        try await manager.resumeMouseJigglerAfterHeadless()
++        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Disconnected write succeeded") }
++        catch is TestFailure { throw TestFailure.message("Disconnected write succeeded") }
++        catch { }
++        try expect(manager.mouseJigglerEnabled == nil && manager.mouseJigglerSupported == nil, "Disconnected state was available")
++    }
++
++    @MainActor private static func testCancelledRetryBackoff() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 3, status: nil)
++        let before = fixture.getCount
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.getCount > before }
++        refresh.cancel()
++        await refresh.value
++        try expect(fixture.getCount - before == 1 && manager.mouseJigglerEnabled == true, "Cancelled backoff retried or erased state")
++    }
++
++    @MainActor private static func eventually(_ condition: () -> Bool) async throws {
++        for _ in 0..<1000 {
++            if condition() { return }
++            try await Task.sleep(nanoseconds: 1_000_000)
++        }
++        throw TestFailure.message("Timed out awaiting in-process fixture")
++    }
++    private static func spin() async { for _ in 0..<20 { await Task.yield() } }
++    private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        if !condition() { throw TestFailure.message(message) }
++    }
++}
++
++private enum TestFailure: Error { case message(String) }
++private actor TestBarrier {
++    private var released = false
++    private var waiters: [CheckedContinuation<Void, Never>] = []
++    func wait() async {
++        if released { return }
++        await withCheckedContinuation { waiters.append($0) }
++    }
++    func release() { released = true; let current = waiters; waiters = []; current.forEach { $0.resume() } }
++}
++
++private final class JigglerFixture: @unchecked Sendable {
++    let host = "jiggler-\(UUID().uuidString.lowercased()).invalid"
++    private let lock = NSLock()
++    private var currentEnabled: Bool
++    private let supported: Bool
++    private var writes: [Bool] = []
++    private var gets = 0
++    private var held: [() -> Void] = []
++    private var holdGet = false
++    private var holdGetNumber: Int?
++    private var holdPost = false
++    private var rejectPost = false
++    private var remainingFailures = 0
++    private var failureStatus: Int?
++    init(enabled: Bool, supported: Bool) {
++        currentEnabled = enabled; self.supported = supported
++        JigglerURLProtocol.register(self)
++    }
++    var enabled: Bool { lock.withLock { currentEnabled } }
++    var posts: [Bool] { lock.withLock { writes } }
++    var getCount: Int { lock.withLock { gets } }
++    var hasHeldRequest: Bool { lock.withLock { !held.isEmpty } }
++    func holdNextGet() { lock.withLock { holdGet = true } }
++    func holdGet(number: Int) { lock.withLock { holdGetNumber = number } }
++    func simulateFirmwareEnabled(_ enabled: Bool) { lock.withLock { currentEnabled = enabled } }
++    func holdNextPost() { lock.withLock { holdPost = true } }
++    func failNextPostAfterApplying() { lock.withLock { rejectPost = true } }
++    func failNextGets(count: Int, status: Int?) { lock.withLock { remainingFailures = count; failureStatus = status } }
++    func releaseHeldRequests() {
++        let callbacks = lock.withLock { let callbacks = held; held = []; return callbacks }
++        callbacks.forEach { $0() }
++    }
++    func handle(_ request: URLRequest, reply: @escaping (Int?, String?) -> Void) {
++        let body = Self.bodyData(request)
++        let callback: (() -> Void)? = lock.withLock {
++            let isPost = request.httpMethod == "POST"
++            if isPost {
++                guard let body, let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any], let enabled = object["mouse_jiggle"] as? Bool else {
++                    return { reply(400, #"{"ok":false}"#) }
++                }
++                currentEnabled = enabled; writes.append(enabled)
++            } else { gets += 1 }
++            let shouldHold = isPost ? holdPost : (holdGet || holdGetNumber == gets)
++            if isPost { holdPost = false } else { holdGet = false }
++            let failedPost = isPost && rejectPost
++            if isPost { rejectPost = false }
++            let failedGet = !isPost && remainingFailures > 0
++            if failedGet { remainingFailures -= 1 }
++            let status = failedGet ? failureStatus : 200
++            let config = supported ? "\"mouse_jiggle\":\(currentEnabled)" : ""
++            let payload = failedPost ? #"{"ok":false}"# : "{\"ok\":true,\"result\":{\"config\":{\(config)}}}"
++            let callback = { reply(status, status == nil ? nil : payload) }
++            if shouldHold { held.append(callback); return nil }
++            return callback
++        }
++        callback?()
++    }
++
++    private static func bodyData(_ request: URLRequest) -> Data? {
++        if let body = request.httpBody { return body }
++        guard let stream = request.httpBodyStream else { return nil }
++        stream.open()
++        defer { stream.close() }
++        var data = Data()
++        var buffer = [UInt8](repeating: 0, count: 4096)
++        while stream.hasBytesAvailable {
++            let count = stream.read(&buffer, maxLength: buffer.count)
++            guard count > 0 else { break }
++            data.append(contentsOf: buffer.prefix(count))
++        }
++        return data
++    }
++}
++
++private final class JigglerURLProtocol: URLProtocol, @unchecked Sendable {
++    private static let lock = NSLock()
++    private static var fixtures: [String: JigglerFixture] = [:]
++    private let stateLock = NSLock()
++    private var stopped = false
++    static func register(_ fixture: JigglerFixture) { lock.withLock { fixtures[fixture.host] = fixture } }
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        guard let url = request.url, let fixture = Self.lock.withLock({ Self.fixtures[url.host ?? ""] }) else {
++            preconditionFailure("Unexpected URL: fixture cannot contact network")
++        }
++        fixture.handle(request) { [weak self] status, payload in
++            guard let self else { return }
++            self.stateLock.withLock {
++                guard !self.stopped else { return }
++                guard let status else { self.client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return }
++                let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
++                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++                self.client?.urlProtocol(self, didLoad: Data((payload ?? "").utf8))
++                self.client?.urlProtocolDidFinishLoading(self)
++            }
++        }
++    }
++    override func stopLoading() { stateLock.withLock { stopped = true } }
++}
+--- /dev/null
++++ b/tests/StatsGenerationTests.swift
+@@ -0,0 +1,128 @@
++import Foundation
++
++private struct StatsGenerationFailure: Error, CustomStringConvertible {
++    let description: String
++}
++
++private actor SuspendedReport {
++    private var continuation: CheckedContinuation<Int, Never>?
++    private var requested = false
++    func read() async -> Int {
++        requested = true
++        return await withCheckedContinuation { continuation = $0 }
++    }
++    func hasRequest() -> Bool { requested }
++    func complete() { continuation?.resume(returning: 42); continuation = nil }
++}
++
++@MainActor
++private final class StatsConsumer {
++    var generation = 1
++    var videoPeer: NSObject? = NSObject()
++    var audioPeer: NSObject? = NSObject()
++    var activeRequestID: UUID?
++    var published: Int?
++
++    func read(_ report: SuspendedReport) async {
++        guard let videoPeer else { return }
++        let request = StreamStatsRequest(generation: generation, videoPeer: videoPeer, audioPeer: audioPeer)
++        activeRequestID = request.requestID
++        let result = await report.read()
++        guard request.isCurrent(generation: generation, requestID: activeRequestID, videoPeer: self.videoPeer, audioPeer: audioPeer) else { return }
++        published = result
++    }
++}
++
++@main
++struct StatsGenerationTests {
++    @MainActor
++    static func main() async {
++        let tests: [(String, @MainActor () async throws -> Void)] = [
++            ("current peer and request publish", testCurrentRequest),
++            ("disconnect rejects suspended report", testDisconnect),
++            ("reconnect rejects earlier generation", testReconnect),
++            ("replacement video peer rejects old report", testVideoPeerReplacement),
++            ("replacement audio peer rejects old report", testAudioPeerReplacement),
++            ("newer same-peer request supersedes earlier report", testOverlappingRequests),
++            ("video-only session has stable identity", testVideoOnlyIdentity),
++        ]
++        var failures = 0
++        for (name, test) in tests {
++            do { try await test(); print("PASS \(name)") }
++            catch { failures += 1; print("FAIL \(name): \(error)") }
++        }
++        print("StatsGenerationTests: \(tests.count - failures)/\(tests.count) passed")
++        if failures > 0 { exit(1) }
++    }
++
++    private static func check(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        if !condition() { throw StatsGenerationFailure(description: message) }
++    }
++
++    @MainActor
++    private static func withSuspendedRequest(_ change: @MainActor (StatsConsumer) -> Void) async throws -> StatsConsumer {
++        let consumer = StatsConsumer()
++        let report = SuspendedReport()
++        let task = Task { await consumer.read(report) }
++        while !(await report.hasRequest()) { await Task.yield() }
++        change(consumer)
++        await report.complete()
++        await task.value
++        return consumer
++    }
++
++    @MainActor
++    private static func testCurrentRequest() async throws {
++        let consumer = try await withSuspendedRequest { _ in }
++        try check(consumer.published == 42, "Current report was discarded")
++    }
++
++    @MainActor
++    private static func testDisconnect() async throws {
++        let consumer = try await withSuspendedRequest { $0.videoPeer = nil; $0.audioPeer = nil; $0.activeRequestID = nil }
++        try check(consumer.published == nil, "Disconnected session received old statistics")
++    }
++
++    @MainActor
++    private static func testReconnect() async throws {
++        let consumer = try await withSuspendedRequest { $0.generation += 1 }
++        try check(consumer.published == nil, "New generation received old statistics")
++    }
++
++    @MainActor
++    private static func testVideoPeerReplacement() async throws {
++        let consumer = try await withSuspendedRequest { $0.videoPeer = NSObject() }
++        try check(consumer.published == nil, "Replacement video peer received old statistics")
++    }
++
++    @MainActor
++    private static func testAudioPeerReplacement() async throws {
++        let consumer = try await withSuspendedRequest { $0.audioPeer = NSObject() }
++        try check(consumer.published == nil, "Replacement audio peer received old statistics")
++    }
++
++    @MainActor
++    private static func testOverlappingRequests() async throws {
++        let consumer = StatsConsumer()
++        let older = SuspendedReport()
++        let newer = SuspendedReport()
++        let first = Task { await consumer.read(older) }
++        while !(await older.hasRequest()) { await Task.yield() }
++        let second = Task { await consumer.read(newer) }
++        while !(await newer.hasRequest()) { await Task.yield() }
++        await newer.complete()
++        await second.value
++        consumer.published = 99
++        await older.complete()
++        await first.value
++        try check(consumer.published == 99, "Older same-peer request overwrote newer statistics")
++    }
++
++    private static func testVideoOnlyIdentity() async throws {
++        let video = NSObject()
++        let request = StreamStatsRequest(generation: 5, videoPeer: video, audioPeer: nil)
++        try check(request.isCurrent(generation: 5, requestID: request.requestID, videoPeer: video, audioPeer: nil), "Video-only current report discarded")
++        try check(!request.isCurrent(generation: 5, requestID: request.requestID, videoPeer: video, audioPeer: NSObject()), "New audio peer matched earlier video-only report")
++        try check(!request.isCurrent(generation: 5, requestID: nil, videoPeer: video, audioPeer: nil), "Unowned request matched")
++    }
++}

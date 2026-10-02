@@ -1,0 +1,985 @@
+diff --git a/Overlook/ContentView.swift b/Overlook/ContentView.swift
+--- a/Overlook/ContentView.swift
++++ b/Overlook/ContentView.swift
+@@ -444,6 +444,9 @@
+         .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
+         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
+         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
++        .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
++            if let message { connectionErrorMessage = message }
++        }
+         .onDisappear {
+             inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
+         }
+@@ -744,14 +747,12 @@
+             defer {
+                 kvmDeviceManager.endHeadlessConfigurationTransition(lockOwner)
+                 isChangingControlMode = false
++                if controlModeStore.mode == .manual {
++                    controlModeStore.resumeManualCaptureIfNeeded()
++                }
+             }
+             do {
+-                if kvmDeviceManager.mouseJigglerSupported == true {
+-                    try await kvmDeviceManager.setMouseJigglerEnabled(false)
+-                    guard kvmDeviceManager.mouseJigglerEnabled == false else {
+-                        throw MouseJigglerError.readbackMismatch
+-                    }
+-                }
++                try await kvmDeviceManager.pauseMouseJigglerForHeadless()
+                 guard kvmDeviceManager.glkvmClient === expectedClient,
+                       !sessionCoordinator.isConnecting else { return }
+                 isOCRModeEnabled = false
+diff --git a/Overlook/ControlMode.swift b/Overlook/ControlMode.swift
+--- a/Overlook/ControlMode.swift
++++ b/Overlook/ControlMode.swift
+@@ -28,15 +28,16 @@
+ 
+     @Published private(set) var mode: OverlookControlMode
+     private(set) var generation = 0
+-    private let defaults: UserDefaults
++    private let defaults: UserDefaults?
+     private var inputCaptureHandler: ((Bool) -> Void)?
+     private var waitForRemoteMutations: @MainActor @Sendable () async -> Void = {}
++    private var didResumeManualCapture: @MainActor @Sendable () async -> Void = {}
+     private var manualCaptureTask: Task<Void, Never>?
+ 
+-    init(defaults: UserDefaults = .standard) {
++    init(defaults: UserDefaults? = .standard) {
+         self.defaults = defaults
+         mode = .manual
+-        defaults.set(OverlookControlMode.manual.rawValue, forKey: Self.defaultsKey)
++        defaults?.set(OverlookControlMode.manual.rawValue, forKey: Self.defaultsKey)
+     }
+ 
+     var snapshot: ControlModeSnapshot {
+@@ -45,10 +46,12 @@
+ 
+     func configureInputCapture(
+         _ handler: @escaping (Bool) -> Void,
+-        waitForRemoteMutations: @escaping @MainActor @Sendable () async -> Void = {}
++        waitForRemoteMutations: @escaping @MainActor @Sendable () async -> Void = {},
++        didResumeManualCapture: @escaping @MainActor @Sendable () async -> Void = {}
+     ) {
+         inputCaptureHandler = handler
+         self.waitForRemoteMutations = waitForRemoteMutations
++        self.didResumeManualCapture = didResumeManualCapture
+         handler(mode != .codexHeadless)
+     }
+ 
+@@ -63,17 +66,26 @@
+         }
+         generation += 1
+         mode = newMode
+-        defaults.set(newMode.rawValue, forKey: Self.defaultsKey)
++        defaults?.set(newMode.rawValue, forKey: Self.defaultsKey)
+         if newMode == .manual {
+-            let targetSnapshot = snapshot
+-            let waitForRemoteMutations = waitForRemoteMutations
+-            manualCaptureTask = Task { [weak self] in
+-                await waitForRemoteMutations()
+-                guard !Task.isCancelled, let self, self.snapshot == targetSnapshot else { return }
+-                self.inputCaptureHandler?(true)
+-                self.manualCaptureTask = nil
+-            }
++            resumeManualCaptureIfNeeded()
+         }
+         return true
+     }
++
++    func resumeManualCaptureIfNeeded() {
++        guard mode == .manual else { return }
++        manualCaptureTask?.cancel()
++        let targetSnapshot = snapshot
++        let waitForRemoteMutations = waitForRemoteMutations
++        let didResumeManualCapture = didResumeManualCapture
++        manualCaptureTask = Task { [weak self] in
++            await waitForRemoteMutations()
++            guard !Task.isCancelled, let self, self.snapshot == targetSnapshot else { return }
++            self.inputCaptureHandler?(true)
++            await didResumeManualCapture()
++            guard !Task.isCancelled, self.snapshot == targetSnapshot else { return }
++            self.manualCaptureTask = nil
++        }
++    }
+ }
+diff --git a/Overlook/KVMDeviceManager.swift b/Overlook/KVMDeviceManager.swift
+--- a/Overlook/KVMDeviceManager.swift
++++ b/Overlook/KVMDeviceManager.swift
+@@ -16,6 +16,7 @@
+     @Published private(set) var mouseJigglerEnabled: Bool?
+     @Published private(set) var mouseJigglerSupported: Bool?
+     @Published private(set) var isMouseJigglerUpdating = false
++    @Published private(set) var mouseJigglerErrorMessage: String?
+     @Published private(set) var connectionSessionID: UUID?
+     
+     private var networkMonitor: NWPathMonitor?
+@@ -27,9 +28,19 @@
+     private var connectionGeneration = 0
+     private var configurationGeneration = 0
+     private var mouseJigglerRefreshTask: Task<Void, Never>?
++    private var mouseJigglerRefreshOwner: UUID?
++    private var mouseJigglerResumeIntent: MouseJigglerResumeIntent?
+     private var headlessConfigurationLockState = HeadlessConfigurationLockState()
+     private var mouseJigglerOperationState = OperationOwnershipState()
+     private let systemConfigMutationGate = RemoteMutationGate(maximumPendingMutations: 4)
++    private let persistsConnections: Bool
++
++    private struct MouseJigglerResumeIntent {
++        let id = UUID()
++        let client: GLKVMClient
++        let deviceID: String
++        let connectionGeneration: Int
++    }
+ 
+     private final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
+         func urlSession(
+@@ -88,10 +99,17 @@
+         }
+     }
+     
+-    override init() {
++    override convenience init() {
++        self.init(startsServices: true, persistsConnections: true)
++    }
++
++    init(startsServices: Bool, persistsConnections: Bool) {
++        self.persistsConnections = persistsConnections
+         super.init()
+-        setupNetworkMonitoring()
+-        loadPersistedDevices()
++        if startsServices {
++            setupNetworkMonitoring()
++            loadPersistedDevices()
++        }
+     }
+     
+     private func setupNetworkMonitoring() {
+@@ -782,11 +800,12 @@
+ 
+     @discardableResult
+     func commitConnection(_ prepared: PreparedKVMConnection) -> KVMDevice {
+-        let persisted = persistDevice(prepared.device)
++        let persisted = persistsConnections ? persistDevice(prepared.device) : prepared.device
+         connectionGeneration &+= 1
+         configurationGeneration &+= 1
+-        mouseJigglerRefreshTask?.cancel()
+-        mouseJigglerRefreshTask = nil
++        invalidateMouseJigglerRefresh()
++        mouseJigglerResumeIntent = nil
++        mouseJigglerErrorMessage = nil
+         mouseJigglerOperationState.reset()
+         connectionSessionID = UUID()
+         connectedDevice = persisted
+@@ -805,14 +824,24 @@
+             return
+         }
+ 
++        invalidateMouseJigglerRefresh()
++        let owner = UUID()
++        mouseJigglerRefreshOwner = owner
+         await refreshMouseJigglerState(
+             client: client,
+             deviceID: deviceID,
+-            generation: connectionGeneration
++            generation: connectionGeneration,
++            configurationGeneration: configurationGeneration,
++            owner: owner
+         )
++        if mouseJigglerRefreshOwner == owner { mouseJigglerRefreshOwner = nil }
+     }
+ 
+     func setMouseJigglerEnabled(_ enabled: Bool) async throws {
++        try await setMouseJigglerEnabled(enabled, preservesResumeIntent: false)
++    }
++
++    private func setMouseJigglerEnabled(_ enabled: Bool, preservesResumeIntent: Bool) async throws {
+         guard MouseJigglerPolicy.allowsRequestedState(
+             enabled,
+             isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
+@@ -822,6 +851,9 @@
+         guard let client = glkvmClient, let deviceID = connectedDevice?.id else {
+             throw MouseJigglerError.unavailable
+         }
++        if !preservesResumeIntent { mouseJigglerResumeIntent = nil }
++        mouseJigglerErrorMessage = nil
++        invalidateMouseJigglerRefresh()
+ 
+         let generation = connectionGeneration
+         configurationGeneration &+= 1
+@@ -865,7 +897,21 @@
+                 }
+ 
+                 current.mouseJiggle = enabled
+-                _ = try await client.setSystemConfig(current)
++                do {
++                    _ = try await client.setSystemConfig(current)
++                } catch {
++                    if enabled {
++                        _ = try await self.disableInterruptedHeadlessJiggler(
++                            client: client, deviceID: deviceID, generation: generation, config: current
++                        )
++                    }
++                    throw error
++                }
++                if enabled, try await self.disableInterruptedHeadlessJiggler(
++                    client: client, deviceID: deviceID, generation: generation, config: current
++                ) {
++                    throw CancellationError()
++                }
+                 guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                       self.configurationGeneration == operationGeneration
+                 else {
+@@ -878,7 +924,22 @@
+                     throw MouseJigglerError.settingsLockedForHeadless
+                 }
+ 
+-                return try await client.getSystemConfig()
++                let readback: GLKVMSystemConfig
++                do { readback = try await client.getSystemConfig() }
++                catch {
++                    if enabled {
++                        _ = try await self.disableInterruptedHeadlessJiggler(
++                            client: client, deviceID: deviceID, generation: generation, config: current
++                        )
++                    }
++                    throw error
++                }
++                if enabled, try await self.disableInterruptedHeadlessJiggler(
++                    client: client, deviceID: deviceID, generation: generation, config: readback
++                ) {
++                    throw CancellationError()
++                }
++                return readback
+             }
+ 
+             guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+@@ -908,6 +969,32 @@
+             }
+             throw error
+         }
++    }
++
++    private func disableInterruptedHeadlessJiggler(
++        client: GLKVMClient, deviceID: String, generation: Int, config: GLKVMSystemConfig
++    ) async throws -> Bool {
++        guard headlessConfigurationLockState.isLocked,
++              isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
++        // Sent firmware writes can outlive cancellation. Keep the mutation gate
++        // occupied until the non-cancelled recovery completes.
++        return try await Task { @MainActor in
++            guard self.headlessConfigurationLockState.isLocked,
++                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
++            var disabledConfig = config
++            disabledConfig.mouseJiggle = false
++            _ = try await client.setSystemConfig(disabledConfig)
++            guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return true }
++            let disabled = try await client.getSystemConfig()
++            guard disabled.supportsMouseJiggle, !disabled.mouseJiggle else {
++                throw MouseJigglerError.readbackMismatch
++            }
++            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
++               self.headlessConfigurationLockState.isLocked {
++                self.mouseJigglerEnabled = false
++            }
++            return true
++        }.value
+     }
+ 
+     func applySystemConfig(
+@@ -983,8 +1070,44 @@
+     }
+ 
+     func beginHeadlessConfigurationTransition() -> UUID {
++        if mouseJigglerResumeIntent == nil, mouseJigglerEnabled == true,
++           let client = glkvmClient, let deviceID = connectedDevice?.id {
++            mouseJigglerResumeIntent = MouseJigglerResumeIntent(
++                client: client, deviceID: deviceID, connectionGeneration: connectionGeneration
++            )
++        }
+         configurationGeneration &+= 1
++        invalidateMouseJigglerRefresh()
+         return headlessConfigurationLockState.beginTransition()
++    }
++
++    func pauseMouseJigglerForHeadless() async throws {
++        if mouseJigglerSupported == true {
++            try await setMouseJigglerEnabled(false, preservesResumeIntent: true)
++            guard mouseJigglerEnabled == false else { throw MouseJigglerError.readbackMismatch }
++        }
++    }
++
++    func resumeMouseJigglerAfterHeadless() async throws {
++        guard let intent = mouseJigglerResumeIntent else { return }
++        guard isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration) else {
++            mouseJigglerResumeIntent = nil
++            return
++        }
++        guard !headlessConfigurationLockState.isLocked else { return }
++        do {
++            try await setMouseJigglerEnabled(true, preservesResumeIntent: true)
++            if mouseJigglerResumeIntent?.id == intent.id { mouseJigglerResumeIntent = nil }
++        } catch is CancellationError {
++            throw CancellationError()
++        } catch {
++            if mouseJigglerResumeIntent?.id == intent.id,
++               isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration),
++               !headlessConfigurationLockState.isLocked {
++                mouseJigglerErrorMessage = "The KVM could not restore the mouse jiggler. Check its state before enabling it again."
++            }
++            throw error
++        }
+     }
+ 
+     func endHeadlessConfigurationTransition(_ owner: UUID) {
+@@ -993,36 +1116,70 @@
+ 
+     func setHeadlessModeActive(_ isActive: Bool) {
+         configurationGeneration &+= 1
++        invalidateMouseJigglerRefresh()
+         headlessConfigurationLockState.setHeadlessModeActive(isActive)
+     }
+ 
++    private func invalidateMouseJigglerRefresh() {
++        mouseJigglerRefreshOwner = nil
++        mouseJigglerRefreshTask?.cancel()
++        mouseJigglerRefreshTask = nil
++    }
++
+     private func scheduleMouseJigglerRefresh(client: GLKVMClient, deviceID: String, generation: Int) {
+-        mouseJigglerRefreshTask?.cancel()
++        invalidateMouseJigglerRefresh()
++        let owner = UUID()
++        let configurationGeneration = configurationGeneration
++        mouseJigglerRefreshOwner = owner
+         mouseJigglerRefreshTask = Task { [weak self] in
+             guard let self else { return }
+-            await self.refreshMouseJigglerState(client: client, deviceID: deviceID, generation: generation)
+-            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) {
++            await self.refreshMouseJigglerState(
++                client: client, deviceID: deviceID, generation: generation,
++                configurationGeneration: configurationGeneration, owner: owner
++            )
++            if self.mouseJigglerRefreshOwner == owner {
++                self.mouseJigglerRefreshOwner = nil
+                 self.mouseJigglerRefreshTask = nil
+             }
+         }
+     }
+ 
+-    private func refreshMouseJigglerState(client: GLKVMClient, deviceID: String, generation: Int) async {
+-        do {
+-            let config = try await systemConfigMutationGate.perform { [weak self] in
+-                guard let self,
+-                      self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
+-                else {
+-                    throw CancellationError()
+-                }
+-                return try await client.getSystemConfig()
+-            }
+-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+-            mouseJigglerSupported = config.supportsMouseJiggle
+-            mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
+-        } catch {
+-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+-            mouseJigglerEnabled = nil
++    private func refreshMouseJigglerState(
++        client: GLKVMClient, deviceID: String, generation: Int,
++        configurationGeneration expectedConfigurationGeneration: Int, owner: UUID
++    ) async {
++        func isCurrentRefresh() -> Bool {
++            !Task.isCancelled && mouseJigglerRefreshOwner == owner
++                && configurationGeneration == expectedConfigurationGeneration
++                && isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
++        }
++        for attempt in 0..<3 {
++            guard isCurrentRefresh() else { return }
++            do {
++                let config = try await systemConfigMutationGate.perform {
++                    guard isCurrentRefresh() else { throw CancellationError() }
++                    return try await client.getSystemConfig()
++                }
++                guard isCurrentRefresh() else { return }
++                mouseJigglerSupported = config.supportsMouseJiggle
++                mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
++                return
++            } catch {
++                guard isCurrentRefresh(), !(error is CancellationError) else { return }
++                let isTransportFailure: Bool
++                if case GLKVMClient.ClientError.transportFailed = error { isTransportFailure = true }
++                else if let urlError = error as? URLError {
++                    isTransportFailure = [.timedOut, .networkConnectionLost, .cannotConnectToHost,
++                        .cannotFindHost, .notConnectedToInternet].contains(urlError.code)
++                } else { isTransportFailure = false }
++                if isTransportFailure, attempt < 2 {
++                    do { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 100_000_000) }
++                    catch { return }
++                    continue
++                }
++                mouseJigglerEnabled = nil
++                return
++            }
+         }
+     }
+ 
+@@ -1035,8 +1192,9 @@
+     private func clearConnectedDevice() {
+         connectionGeneration &+= 1
+         configurationGeneration &+= 1
+-        mouseJigglerRefreshTask?.cancel()
+-        mouseJigglerRefreshTask = nil
++        invalidateMouseJigglerRefresh()
++        mouseJigglerResumeIntent = nil
++        mouseJigglerErrorMessage = nil
+         mouseJigglerEnabled = nil
+         mouseJigglerSupported = nil
+         mouseJigglerOperationState.reset()
+diff --git a/Overlook/OverlookApp.swift b/Overlook/OverlookApp.swift
+--- a/Overlook/OverlookApp.swift
++++ b/Overlook/OverlookApp.swift
+@@ -91,6 +91,16 @@
+             },
+             waitForRemoteMutations: { [weak self] in
+                 await self?.localControlServer.waitForMutationsToDrain()
++            },
++            didResumeManualCapture: { [weak self] in
++                guard !Task.isCancelled, let self else { return }
++                do {
++                    try await self.kvmDeviceManager.resumeMouseJigglerAfterHeadless()
++                } catch is CancellationError {
++                    return
++                } catch {
++                    // The manager publishes a bounded message for the UI.
++                }
+             }
+         )
+         localControlServer.setModeProvider { [weak self] in
+diff --git a/scripts/test-agent-control.sh b/scripts/test-agent-control.sh
+--- a/scripts/test-agent-control.sh
++++ b/scripts/test-agent-control.sh
+@@ -23,6 +23,9 @@
+ if [[ "$suite" != mcp ]]; then
+   run_swift ControlMode Overlook/ControlMode.swift tests/ControlModeTests.swift
+   run_swift ReliabilityPolicy Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift tests/ReliabilityPolicyTests.swift
++  run_swift MouseJigglerLifecycle Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
++    Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
++    Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
+   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
+   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
+   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
+diff --git a/tests/MouseJigglerLifecycleTests.swift b/tests/MouseJigglerLifecycleTests.swift
+new file mode 100644
+--- /dev/null
++++ b/tests/MouseJigglerLifecycleTests.swift
+@@ -0,0 +1,511 @@
++import Foundation
++import Combine
++
++@main
++struct MouseJigglerLifecycleTests {
++    @MainActor static func main() async throws {
++        let tests: [(String, @MainActor () async throws -> Void)] = [
++            ("enabled jiggler resumes only after remote drain", testRestoreAfterDrain),
++            ("previously disabled jiggler stays disabled", testPriorOff),
++            ("failed disable recovers in Manual", testFailedDisable),
++            ("manual toggle supersedes pending restoration", testManualSupersession),
++            ("manual toggle supersedes a sent restore", testManualSupersessionAfterPost),
++            ("Headless interrupts restoration safely", testReheadless),
++            ("Headless interrupts delayed readback safely", testReheadlessDuringReadback),
++            ("Headless cancellation repairs sent firmware write", testCancelledRestoreInHeadless),
++            ("control store cancellation repairs sent firmware write", testStoreCancellation),
++            ("failed transition uses shared drain and capture hook", testFailedTransitionHook),
++            ("restore failure is visible and can recover", testRestoreFailure),
++            ("locked restore retains its pending intent", testLockedRestore),
++            ("disconnect invalidates restoration", testDisconnect),
++            ("stale refresh cannot publish old configuration", testStaleRefresh),
++            ("cancelled refresh preserves confirmed state", testCancelledRefresh),
++            ("newest refresh owns success and cleanup", testRefreshOwnership),
++            ("transient refresh retries are bounded", testTransientRefresh),
++            ("authentication rejection is never retried", testAuthenticationFailure),
++            ("unsupported firmware is never retried or enabled", testUnsupported),
++            ("replacement session never inherits restoration", testReplacementSession),
++            ("disconnected state rejects jiggler writes", testDisconnectedState),
++            ("cancelled retry backoff preserves state", testCancelledRetryBackoff),
++        ]
++        var failures: [String] = []
++        for (name, test) in tests {
++            do { try await test(); print("PASS: \(name)") }
++            catch { failures.append("\(name): \(error)") }
++        }
++        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
++        guard failures.isEmpty else { throw TestFailure.message("\(failures.count) lifecycle regressions") }
++        print("MouseJigglerLifecycleTests: \(tests.count) scenarios passed; URLProtocol only, no KVM or persisted state")
++    }
++
++    @MainActor private static func setup(enabled: Bool = true, supported: Bool = true) async throws -> (KVMDeviceManager, JigglerFixture) {
++        let fixture = JigglerFixture(enabled: enabled, supported: supported)
++        let configuration = URLSessionConfiguration.ephemeral
++        configuration.protocolClasses = [JigglerURLProtocol.self]
++        let client = try GLKVMClient(host: fixture.host, authToken: "fixture-only", allowInsecureTLS: false, sessionConfiguration: configuration)
++        let device = KVMDevice(id: fixture.host, name: "Synthetic KVM", host: fixture.host, port: 80, type: .custom, authToken: "", capabilities: [])
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        manager.commitConnection(PreparedKVMConnection(device: device, client: client))
++        try await eventually { manager.mouseJigglerSupported != nil }
++        return (manager, fixture)
++    }
++
++    @MainActor private static func enterHeadless(_ manager: KVMDeviceManager) async throws {
++        let owner = manager.beginHeadlessConfigurationTransition()
++        defer { manager.endHeadlessConfigurationTransition(owner) }
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.setHeadlessModeActive(true)
++    }
++
++    @MainActor private static func testRestoreAfterDrain() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let modeBinding = store.$mode.sink { manager.setHeadlessModeActive($0 == .codexHeadless) }
++        defer { modeBinding.cancel() }
++        let drain = RemoteMutationGate()
++        let blocker = TestBarrier()
++        let mutation = Task { try await drain.perform { await blocker.wait() } }
++        try await eventually { drain.isBusy }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, waitForRemoteMutations: {
++            await drain.waitUntilIdle()
++        }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        store.setMode(.codexHeadless)
++        manager.endHeadlessConfigurationTransition(owner)
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Headless must confirm off")
++        store.setMode(.manual)
++        await spin()
++        try expect(fixture.posts == [false] && captures == [true, false], "Restore and capture must wait for real drain")
++        fixture.holdNextPost()
++        await blocker.release()
++        _ = try await mutation.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(captures == [true, false, true], "Firmware restore delayed Manual capture after drain")
++        fixture.releaseHeldRequests()
++        try await eventually { manager.mouseJigglerEnabled == true }
++        try expect(fixture.posts == [false, true] && manager.mouseJigglerEnabled == true, "Enabled state was not restored")
++    }
++
++    @MainActor private static func testPriorOff() async throws {
++        let (manager, fixture) = try await setup(enabled: false)
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && !fixture.posts.contains(true), "Prior off was enabled")
++    }
++
++    @MainActor private static func testFailedDisable() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextPostAfterApplying()
++        let owner = manager.beginHeadlessConfigurationTransition()
++        do { try await manager.pauseMouseJigglerForHeadless(); throw TestFailure.message("Rejected disable unexpectedly succeeded") }
++        catch is TestFailure { throw TestFailure.message("Rejected disable unexpectedly succeeded") }
++        catch { }
++        manager.endHeadlessConfigurationTransition(owner)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled && manager.mouseJigglerEnabled == true, "Manual failure recovery lost prior enabled state")
++    }
++
++    @MainActor private static func testManualSupersession() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextGet()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manual.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && !fixture.posts.contains(true), "Newer Manual choice was overwritten")
++    }
++
++    @MainActor private static func testReheadless() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try expect(!fixture.enabled, "Interrupted restore left firmware enabled in Headless")
++        try expect(manager.mouseJigglerEnabled != true, "Interrupted restore published enabled in Headless")
++    }
++
++    @MainActor private static func testManualSupersessionAfterPost() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manual.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(!fixture.enabled && fixture.posts == [false, true, false], "Sent restore overrode newer Manual toggle")
++    }
++
++    @MainActor private static func testDisconnect() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextGet()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.disconnectFromDevice()
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts == [false] && manager.mouseJigglerEnabled == nil, "Disconnected session was restored")
++    }
++
++    @MainActor private static func testReheadlessDuringReadback() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdGet(number: fixture.getCount + 2)
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        fixture.releaseHeldRequests()
++        _ = try? await restore.value
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Delayed readback left Headless enabled")
++    }
++
++    @MainActor private static func testCancelledRestoreInHeadless() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.holdNextPost()
++        let restore = Task { try await manager.resumeMouseJigglerAfterHeadless() }
++        try await eventually { fixture.hasHeldRequest }
++        manager.setHeadlessModeActive(true)
++        restore.cancel()
++        _ = try? await restore.value
++        fixture.releaseHeldRequests()
++        try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Cancellation left sent enable active")
++    }
++
++    @MainActor private static func testRestoreFailure() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        manager.setHeadlessModeActive(false)
++        fixture.failNextPostAfterApplying()
++        do { try await manager.resumeMouseJigglerAfterHeadless(); throw TestFailure.message("Rejected restore succeeded") }
++        catch is TestFailure { throw TestFailure.message("Rejected restore succeeded") }
++        catch { }
++        try expect(manager.mouseJigglerErrorMessage != nil, "Restore failure was hidden")
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled && manager.mouseJigglerErrorMessage == nil, "Restore could not recover")
++    }
++
++    @MainActor private static func testStoreCancellation() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let binding = store.$mode.sink { manager.setHeadlessModeActive($0 == .codexHeadless) }
++        defer { binding.cancel() }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        store.setMode(.codexHeadless)
++        manager.endHeadlessConfigurationTransition(owner)
++        fixture.holdNextPost()
++        store.setMode(.manual)
++        try await eventually { fixture.hasHeldRequest }
++        store.setMode(.codexHeadless)
++        try await eventually { !fixture.enabled && !manager.isMouseJigglerUpdating }
++        fixture.releaseHeldRequests()
++        try expect(captures == [true, false, true, false], "Cancelled Manual task resumed local capture")
++        try expect(manager.mouseJigglerEnabled == false, "Store cancellation did not confirm safe firmware state")
++    }
++
++    @MainActor private static func testFailedTransitionHook() async throws {
++        let (manager, fixture) = try await setup()
++        let store = ControlModeStore(defaults: nil)
++        let drain = RemoteMutationGate()
++        let blocker = TestBarrier()
++        let mutation = Task { try await drain.perform { await blocker.wait() } }
++        try await eventually { drain.isBusy }
++        var captures: [Bool] = []
++        store.configureInputCapture({ captures.append($0) }, waitForRemoteMutations: {
++            await drain.waitUntilIdle()
++        }, didResumeManualCapture: {
++            try? await manager.resumeMouseJigglerAfterHeadless()
++        })
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.endHeadlessConfigurationTransition(owner)
++        store.resumeManualCaptureIfNeeded()
++        await spin()
++        try expect(fixture.posts == [false] && captures == [true], "Failed-transition recovery bypassed drain")
++        await blocker.release()
++        _ = try await mutation.value
++        try await eventually { fixture.enabled }
++        try expect(captures == [true, true], "Failure hook delayed Manual capture")
++        try expect(fixture.enabled, "Shared failure hook did not restore previous state")
++    }
++
++    @MainActor private static func testLockedRestore() async throws {
++        let (manager, fixture) = try await setup()
++        try await enterHeadless(manager)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts == [false], "Locked restore sent enable")
++        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Locked Manual toggle succeeded") }
++        catch is TestFailure { throw TestFailure.message("Locked Manual toggle succeeded") }
++        catch { }
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.enabled, "Locked request erased prior true intent")
++    }
++
++    @MainActor private static func testRefreshOwnership() async throws {
++        let (manager, fixture) = try await setup()
++        try await manager.setMouseJigglerEnabled(false)
++        fixture.simulateFirmwareEnabled(true)
++        fixture.holdNextGet()
++        let old = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        fixture.simulateFirmwareEnabled(false)
++        fixture.holdNextGet()
++        let newest = Task { await manager.refreshMouseJigglerState() }
++        await spin()
++        fixture.releaseHeldRequests()
++        await old.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(manager.mouseJigglerEnabled == false, "Old owner published stale success")
++        fixture.releaseHeldRequests()
++        await newest.value
++        try expect(manager.mouseJigglerEnabled == false, "Old cleanup invalidated newer refresh")
++    }
++
++    @MainActor private static func testStaleRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        try await manager.setMouseJigglerEnabled(false)
++        fixture.simulateFirmwareEnabled(true)
++        fixture.holdNextGet()
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        fixture.holdNextPost()
++        let manual = Task { try await manager.setMouseJigglerEnabled(false) }
++        await spin()
++        fixture.releaseHeldRequests()
++        await refresh.value
++        try await eventually { fixture.hasHeldRequest }
++        try expect(manager.mouseJigglerEnabled != true, "Stale refresh published superseded configuration")
++        fixture.releaseHeldRequests()
++        try await manual.value
++        try expect(manager.mouseJigglerEnabled == false, "New state lost")
++    }
++
++    @MainActor private static func testCancelledRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.holdNextGet()
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.hasHeldRequest }
++        refresh.cancel()
++        await refresh.value
++        fixture.releaseHeldRequests()
++        try expect(manager.mouseJigglerEnabled == true, "Cancellation erased confirmed state")
++    }
++
++    @MainActor private static func testTransientRefresh() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 2, status: nil)
++        let before = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - before == 3 && manager.mouseJigglerEnabled == true, "Transient failures were not retried")
++        fixture.failNextGets(count: 4, status: nil)
++        let boundedBefore = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - boundedBefore == 3 && manager.mouseJigglerEnabled == nil, "Retries exceeded three or did not expose unavailable state")
++    }
++
++    @MainActor private static func testAuthenticationFailure() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 3, status: 401)
++        let before = fixture.getCount
++        await manager.refreshMouseJigglerState()
++        try expect(fixture.getCount - before == 1, "Authentication failure was retried")
++    }
++
++    @MainActor private static func testUnsupported() async throws {
++        let (manager, fixture) = try await setup(supported: false)
++        try expect(manager.mouseJigglerSupported == false && manager.mouseJigglerEnabled == nil, "Unsupported firmware was misrepresented")
++        let owner = manager.beginHeadlessConfigurationTransition()
++        try await manager.pauseMouseJigglerForHeadless()
++        manager.setHeadlessModeActive(true)
++        manager.endHeadlessConfigurationTransition(owner)
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(fixture.posts.isEmpty, "Unsupported firmware received a configuration write")
++    }
++
++    @MainActor private static func testReplacementSession() async throws {
++        let (manager, first) = try await setup()
++        try await enterHeadless(manager)
++        let (replacement, second) = try await setup(enabled: false)
++        manager.commitConnection(PreparedKVMConnection(device: replacement.connectedDevice!, client: replacement.glkvmClient!))
++        manager.setHeadlessModeActive(false)
++        try await manager.resumeMouseJigglerAfterHeadless()
++        try expect(first.posts == [false] && second.posts.isEmpty, "Restoration crossed session boundary")
++    }
++
++    @MainActor private static func testDisconnectedState() async throws {
++        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
++        await manager.refreshMouseJigglerState()
++        try await manager.resumeMouseJigglerAfterHeadless()
++        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Disconnected write succeeded") }
++        catch is TestFailure { throw TestFailure.message("Disconnected write succeeded") }
++        catch { }
++        try expect(manager.mouseJigglerEnabled == nil && manager.mouseJigglerSupported == nil, "Disconnected state was available")
++    }
++
++    @MainActor private static func testCancelledRetryBackoff() async throws {
++        let (manager, fixture) = try await setup()
++        fixture.failNextGets(count: 3, status: nil)
++        let before = fixture.getCount
++        let refresh = Task { await manager.refreshMouseJigglerState() }
++        try await eventually { fixture.getCount > before }
++        refresh.cancel()
++        await refresh.value
++        try expect(fixture.getCount - before == 1 && manager.mouseJigglerEnabled == true, "Cancelled backoff retried or erased state")
++    }
++
++    @MainActor private static func eventually(_ condition: () -> Bool) async throws {
++        for _ in 0..<1000 {
++            if condition() { return }
++            try await Task.sleep(nanoseconds: 1_000_000)
++        }
++        throw TestFailure.message("Timed out awaiting in-process fixture")
++    }
++    private static func spin() async { for _ in 0..<20 { await Task.yield() } }
++    private static func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
++        if !condition() { throw TestFailure.message(message) }
++    }
++}
++
++private enum TestFailure: Error { case message(String) }
++private actor TestBarrier {
++    private var released = false
++    private var waiters: [CheckedContinuation<Void, Never>] = []
++    func wait() async {
++        if released { return }
++        await withCheckedContinuation { waiters.append($0) }
++    }
++    func release() { released = true; let current = waiters; waiters = []; current.forEach { $0.resume() } }
++}
++
++private final class JigglerFixture: @unchecked Sendable {
++    let host = "jiggler-\(UUID().uuidString.lowercased()).invalid"
++    private let lock = NSLock()
++    private var currentEnabled: Bool
++    private let supported: Bool
++    private var writes: [Bool] = []
++    private var gets = 0
++    private var held: [() -> Void] = []
++    private var holdGet = false
++    private var holdGetNumber: Int?
++    private var holdPost = false
++    private var rejectPost = false
++    private var remainingFailures = 0
++    private var failureStatus: Int?
++    init(enabled: Bool, supported: Bool) {
++        currentEnabled = enabled; self.supported = supported
++        JigglerURLProtocol.register(self)
++    }
++    var enabled: Bool { lock.withLock { currentEnabled } }
++    var posts: [Bool] { lock.withLock { writes } }
++    var getCount: Int { lock.withLock { gets } }
++    var hasHeldRequest: Bool { lock.withLock { !held.isEmpty } }
++    func holdNextGet() { lock.withLock { holdGet = true } }
++    func holdGet(number: Int) { lock.withLock { holdGetNumber = number } }
++    func simulateFirmwareEnabled(_ enabled: Bool) { lock.withLock { currentEnabled = enabled } }
++    func holdNextPost() { lock.withLock { holdPost = true } }
++    func failNextPostAfterApplying() { lock.withLock { rejectPost = true } }
++    func failNextGets(count: Int, status: Int?) { lock.withLock { remainingFailures = count; failureStatus = status } }
++    func releaseHeldRequests() {
++        let callbacks = lock.withLock { let callbacks = held; held = []; return callbacks }
++        callbacks.forEach { $0() }
++    }
++    func handle(_ request: URLRequest, reply: @escaping (Int?, String?) -> Void) {
++        let body = Self.bodyData(request)
++        let callback: (() -> Void)? = lock.withLock {
++            let isPost = request.httpMethod == "POST"
++            if isPost {
++                guard let body, let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any], let enabled = object["mouse_jiggle"] as? Bool else {
++                    return { reply(400, #"{"ok":false}"#) }
++                }
++                currentEnabled = enabled; writes.append(enabled)
++            } else { gets += 1 }
++            let shouldHold = isPost ? holdPost : (holdGet || holdGetNumber == gets)
++            if isPost { holdPost = false } else { holdGet = false }
++            let failedPost = isPost && rejectPost
++            if isPost { rejectPost = false }
++            let failedGet = !isPost && remainingFailures > 0
++            if failedGet { remainingFailures -= 1 }
++            let status = failedGet ? failureStatus : 200
++            let config = supported ? "\"mouse_jiggle\":\(currentEnabled)" : ""
++            let payload = failedPost ? #"{"ok":false}"# : "{\"ok\":true,\"result\":{\"config\":{\(config)}}}"
++            let callback = { reply(status, status == nil ? nil : payload) }
++            if shouldHold { held.append(callback); return nil }
++            return callback
++        }
++        callback?()
++    }
++
++    private static func bodyData(_ request: URLRequest) -> Data? {
++        if let body = request.httpBody { return body }
++        guard let stream = request.httpBodyStream else { return nil }
++        stream.open()
++        defer { stream.close() }
++        var data = Data()
++        var buffer = [UInt8](repeating: 0, count: 4096)
++        while stream.hasBytesAvailable {
++            let count = stream.read(&buffer, maxLength: buffer.count)
++            guard count > 0 else { break }
++            data.append(contentsOf: buffer.prefix(count))
++        }
++        return data
++    }
++}
++
++private final class JigglerURLProtocol: URLProtocol, @unchecked Sendable {
++    private static let lock = NSLock()
++    private static var fixtures: [String: JigglerFixture] = [:]
++    private let stateLock = NSLock()
++    private var stopped = false
++    static func register(_ fixture: JigglerFixture) { lock.withLock { fixtures[fixture.host] = fixture } }
++    override class func canInit(with request: URLRequest) -> Bool { true }
++    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
++    override func startLoading() {
++        guard let url = request.url, let fixture = Self.lock.withLock({ Self.fixtures[url.host ?? ""] }) else {
++            preconditionFailure("Unexpected URL: fixture cannot contact network")
++        }
++        fixture.handle(request) { [weak self] status, payload in
++            guard let self else { return }
++            self.stateLock.withLock {
++                guard !self.stopped else { return }
++                guard let status else { self.client?.urlProtocol(self, didFailWithError: URLError(.timedOut)); return }
++                let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"])!
++                self.client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
++                self.client?.urlProtocol(self, didLoad: Data((payload ?? "").utf8))
++                self.client?.urlProtocolDidFinishLoading(self)
++            }
++        }
++    }
++    override func stopLoading() { stateLock.withLock { stopped = true } }
++}

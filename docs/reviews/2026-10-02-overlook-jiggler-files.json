@@ -1,0 +1,35 @@
+{
+  "baseSourceDigest": "44a20a59fcb10b7894821d9834eb26d6294768241134d4d79acf65ddfc7ac59e",
+  "files": [
+    {
+      "path": "Overlook/ContentView.swift",
+      "beforeSha256": "0b78e25fc42ed50aee9d5810f2cf31e8d77284b17899a68e334fa487a128c914",
+      "afterSha256": "e06c9342af4763293603010cc5ea8258985dbd4ab2dfe1f4b7fff9f1908f3c15"
+    },
+    {
+      "path": "Overlook/ControlMode.swift",
+      "beforeSha256": "7c2f1d677fde8d7c86ba791a00d6d2dcd4fcfaaec70819ec05dafb50271117b3",
+      "afterSha256": "7a4857f2e62409781287d289e8e105d5f09f336d599ac37eb40912f093969e4c"
+    },
+    {
+      "path": "Overlook/KVMDeviceManager.swift",
+      "beforeSha256": "7c4397a0104476945c382860add32d6ea5b546ab9e022253bee8f1cea7f93626",
+      "afterSha256": "45b02f6b0648153cf5d265253ba0ecc7e4afea08b37f8d264d8280f359761a58"
+    },
+    {
+      "path": "Overlook/OverlookApp.swift",
+      "beforeSha256": "71ba93d9ba003507712a52cd9c38552bd58ef7c7a8ac4842064d3d1c730f742f",
+      "afterSha256": "805413a42694b5c8b68a7cc3602f6ed6ac511dd39346fcfa9a647e0309441e53"
+    },
+    {
+      "path": "scripts/test-agent-control.sh",
+      "beforeSha256": "0bd545b3d2d3f2549fb2d0c6e6e913eec31be42907cb402bf78ebaee43fa056a",
+      "afterSha256": "2c12ea2a6add4d508a08bbfe5d496f3953b129a6629238021278c66f7360fbf5"
+    },
+    {
+      "path": "tests/MouseJigglerLifecycleTests.swift",
+      "beforeSha256": null,
+      "afterSha256": "9f7b751b5b260b2571e3f42d6363b6181496db0202d30d88ad64bad9a2409566"
+    }
+  ]
+}
