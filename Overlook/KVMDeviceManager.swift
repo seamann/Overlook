@@ -18,6 +18,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     @Published private(set) var isMouseJigglerUpdating = false
     @Published private(set) var mouseJigglerErrorMessage: String?
     @Published private(set) var connectionSessionID: UUID?
+    @Published private(set) var credentialStorageWarning: String?
+    @Published private(set) var credentialStorageWarningGeneration: UInt64 = 0
     
     private var networkMonitor: NWPathMonitor?
     private var scanTimer: Timer?
@@ -34,6 +36,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private var mouseJigglerOperationState = OperationOwnershipState()
     private let systemConfigMutationGate = RemoteMutationGate(maximumPendingMutations: 4)
     private let persistsConnections: Bool
+    private let persistence: KVMDevicePersistence
 
     private struct MouseJigglerResumeIntent {
         let id = UUID()
@@ -69,8 +72,6 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         ("192.168.200.1", ScanPortPolicy.requiredPort),
     ]
 
-    private static let savedDevicesKey = "overlook.saved_devices.v1"
-
     private struct PersistedDevice: Codable, Hashable, Sendable {
         let host: String
         let port: Int
@@ -103,8 +104,9 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         self.init(startsServices: true, persistsConnections: true)
     }
 
-    init(startsServices: Bool, persistsConnections: Bool) {
+    init(startsServices: Bool, persistsConnections: Bool, persistence: KVMDevicePersistence = .live) {
         self.persistsConnections = persistsConnections
+        self.persistence = persistence
         super.init()
         if startsServices {
             setupNetworkMonitoring()
@@ -999,6 +1001,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
     func applySystemConfig(
         _ config: GLKVMSystemConfig,
+        editedFields: Set<String>,
         connectionSessionID expectedSessionID: UUID
     ) async throws -> GLKVMSystemConfig {
         guard MouseJigglerPolicy.allowsSettingsApply(
@@ -1040,9 +1043,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             ) else {
                 throw MouseJigglerError.settingsLockedForHeadless
             }
-            var merged = config
-            merged.mouseJiggle = current.mouseJiggle
-            merged.supportsMouseJiggle = current.supportsMouseJiggle
+            let merged = try current.mergingSettingsEdits(from: config, editedFields: editedFields)
             let updated = try await client.setSystemConfig(merged)
             guard self.connectionSessionID == expectedSessionID,
                   self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
@@ -1082,7 +1083,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     func pauseMouseJigglerForHeadless() async throws {
-        if mouseJigglerSupported == true {
+        guard let supported = mouseJigglerSupported else { throw MouseJigglerError.unavailable }
+        if supported {
             try await setMouseJigglerEnabled(false, preservesResumeIntent: true)
             guard mouseJigglerEnabled == false else { throw MouseJigglerError.readbackMismatch }
         }
@@ -1206,18 +1208,22 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     private func persistDevice(_ device: KVMDevice) -> KVMDevice {
-        let tokenStored = device.authToken.isEmpty || KVMTokenStore.save(device.authToken, host: device.host, port: device.port)
+        let existing = readPersistedDevices()
+        let previous = existing.last { $0.host == device.host && $0.port == device.port }
+        let tokenStored = !device.authToken.isEmpty && persistence.saveToken(device.authToken, device.host, device.port)
+        credentialStorageWarning = device.authToken.isEmpty || tokenStored ? nil : "Der Zugangstoken konnte nicht sicher im Schlüsselbund gespeichert werden. Die Verbindung funktioniert für diese Sitzung; bei der nächsten Anmeldung kann der Token erneut erforderlich sein."
+        if credentialStorageWarning != nil { credentialStorageWarningGeneration &+= 1 }
         let record = PersistedDevice(
             host: device.host,
             port: device.port,
             name: device.name,
             type: device.type,
-            authToken: tokenStored ? nil : device.authToken,
+            authToken: tokenStored ? nil : previous?.authToken,
             capabilities: device.capabilities
         )
 
         let current = EndpointRecordPolicy.replacing(
-            readPersistedDevices(),
+            existing,
             with: record
         ) { "\($0.host):\($0.port)" }
         writePersistedDevices(current)
@@ -1309,13 +1315,13 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     private func readPersistedDevices() -> [PersistedDevice] {
-        guard let data = UserDefaults.standard.data(forKey: Self.savedDevicesKey) else { return [] }
+        guard let data = persistence.readRecords() else { return [] }
         return (try? JSONDecoder().decode([PersistedDevice].self, from: data)) ?? []
     }
 
     private func writePersistedDevices(_ devices: [PersistedDevice]) {
         guard let data = try? JSONEncoder().encode(devices) else { return }
-        UserDefaults.standard.set(data, forKey: Self.savedDevicesKey)
+        persistence.writeRecords(data)
     }
     
     private func validateDeviceConnection(_ device: KVMDevice) async throws -> Bool {
@@ -1381,6 +1387,19 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         scanTimer?.invalidate()
         deviceDiscoverySessions.forEach { $0.cancel() }
     }
+}
+
+// Injected in local tests to avoid reading or writing real credentials/defaults.
+struct KVMDevicePersistence {
+    let readRecords: () -> Data?
+    let writeRecords: (Data) -> Void
+    let saveToken: (String, String, Int) -> Bool
+
+    static let live = KVMDevicePersistence(
+        readRecords: { UserDefaults.standard.data(forKey: "overlook.saved_devices.v1") },
+        writeRecords: { UserDefaults.standard.set($0, forKey: "overlook.saved_devices.v1") },
+        saveToken: { KVMTokenStore.save($0, host: $1, port: $2) }
+    )
 }
 
 private enum KVMTokenStore {

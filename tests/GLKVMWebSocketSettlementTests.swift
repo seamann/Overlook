@@ -52,6 +52,7 @@ private struct SettlementControl {
 @MainActor
 private final class SettlementProbe {
     var completed = false
+    var dispatched = false
     var error: Error?
     var observedErrors: [String] = []
 }
@@ -66,6 +67,14 @@ struct GLKVMWebSocketSettlementTests {
         do {
             let health = try JSONSerialization.jsonObject(with: await control.request("/fixture/health")) as? [String: Any]
             try expect(health?["fixture"] as? String == "overlook-ws-settlement", "Only the local settlement fixture is allowed")
+            try await testCancelledRemoteActionBlocksInputAndDrains(control)
+            print("PASS: cancellation after dispatch blocks actual input before bounded queue cleanup")
+            try await testStalledCallerCancellationDoesNotReplay(control)
+            print("PASS: caller cancellation settles an uncertain send and preserves its replacement")
+            try await testAlreadyCancelledSendDoesNotDispatch(control)
+            print("PASS: cancellation before dispatch never reaches the fixture")
+            try await testDisconnectSettlesPendingSend(control)
+            print("PASS: disconnect settles an uncertain send and preserves its replacement")
             try await testShutdownDoesNotReconnect(control)
             print("PASS: shutdown settles and never reconnects after an in-flight local key fails")
             try await testLocalKeyTimeoutBlocksInput(control)
@@ -78,11 +87,156 @@ struct GLKVMWebSocketSettlementTests {
             print("PASS: stale abort preserves replacement task on the same client")
             try await testReconnectAfterOldPingStarted(control)
             print("PASS: reconnect remains usable after the old connection's regular ping started")
-            print("GLKVMWebSocketSettlementTests passed (6 groups)")
+            print("GLKVMWebSocketSettlementTests passed (10 groups)")
         } catch {
             fputs("GLKVMWebSocketSettlementTests FAILED: \(error)\n", stderr)
             exit(1)
         }
+    }
+
+    @MainActor private static func testCancelledRemoteActionBlocksInputAndDrains(_ control: SettlementControl) async throws {
+        try await control.mode("stall-handshake")
+        let previous = try await control.status().count
+        let fixture = CaptureFixture()
+        defer { fixture.finish() }
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        fixture.manager.setGLKVMClient(client)
+        fixture.manager.setTransportMode(.glkvmWebSocket)
+        _ = try await control.waitForConnection(after: previous)
+        let probe = SettlementProbe()
+        let action = Task { @MainActor in
+            do {
+                try await fixture.manager.performRemoteAction(
+                    .scroll(x: 10, y: 10, deltaY: 1), width: 100, height: 100,
+                    authorization: { true }, willDispatch: { probe.dispatched = true }
+                )
+            } catch { probe.error = error }
+            probe.completed = true
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try expect(probe.dispatched, "The real command must pass its dispatch boundary before cancellation")
+        action.cancel()
+        try await waitForCompletion(probe, "A cancelled actual HID action must release its waiting caller within one second")
+        await action.value
+        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
+                   "The real dispatched action must retain its unknown outcome")
+        try expect(fixture.manager.inputBlocked, "Cancellation after dispatch must block input before cleanup")
+        try expect(fixture.manager.lastInputError != nil, "Cancellation after dispatch must leave a visible error")
+        let cleanup = SettlementProbe()
+        let disconnect = Task { @MainActor in
+            await fixture.manager.disconnectInputForSession()
+            cleanup.completed = true
+        }
+        try await waitForCompletion(cleanup, "The uncertain command must not prevent the real HID queue from draining")
+        await disconnect.value
+        try expect(fixture.manager.inputBlocked, "Queue cleanup must never clear an uncertain action's input block")
+    }
+
+    @MainActor private static func testStalledCallerCancellationDoesNotReplay(_ control: SettlementControl) async throws {
+        try await control.mode("stall-handshake")
+        let previous = try await control.status().count
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        let socket = try client.makeWebSocketClient()
+        await socket.connect()
+        let oldConnection = try await control.waitForConnection(after: previous)
+        let probe = SettlementProbe()
+        let send = Task { @MainActor in
+            do { try await socket.send(eventType: "cancelled-stalled-probe") }
+            catch { probe.error = error }
+            probe.completed = true
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        send.cancel()
+        try await waitForCompletion(probe, "Cancellation must settle an actual pending send within one second")
+        await send.value
+        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
+                   "Cancellation after dispatch must never report success or a definitive not-started result")
+        try await verifyReplacement(socket, after: previous + 1, event: "replacement-after-cancel", control: control)
+        let records = try await control.status()
+        try expect(records.first(where: { $0.id == oldConnection.id })?.closed == true,
+                   "Cancellation must close only the affected stalled transport")
+        try expect(!records.contains(where: { $0.events.contains("cancelled-stalled-probe") }),
+                   "A cancelled uncertain send must never replay on a replacement")
+    }
+
+    @MainActor private static func testAlreadyCancelledSendDoesNotDispatch(_ control: SettlementControl) async throws {
+        try await control.mode("normal")
+        let previous = try await control.status().count
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        let socket = try client.makeWebSocketClient()
+        await socket.connect()
+        let connection = try await control.waitForConnection(after: previous)
+        try await waitUntilConnected(socket)
+        let probe = SettlementProbe()
+        // This MainActor task cannot run until the current actor turn yields.
+        let send = Task { @MainActor in
+            do { try await socket.send(eventType: "never-dispatched-cancelled-probe") }
+            catch { probe.error = error }
+            probe.completed = true
+        }
+        send.cancel()
+        try await waitForCompletion(probe, "An already cancelled send must settle without transport dispatch")
+        await send.value
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let records = try await control.status()
+        let connected = await socket.isConnected
+        await socket.disconnect()
+        guard let record = records.first(where: { $0.id == connection.id }) else {
+            throw CaptureTestFailure(description: "Fixture lost the active connection record")
+        }
+        try expect(probe.error is CancellationError, "Cancellation before dispatch must retain its definitive cancellation result")
+        try expect(!record.events.contains("never-dispatched-cancelled-probe"),
+                   "Cancellation before dispatch must emit no command")
+        try expect(connected, "A send cancelled before dispatch must preserve the healthy transport")
+    }
+
+    @MainActor private static func testDisconnectSettlesPendingSend(_ control: SettlementControl) async throws {
+        try await control.mode("stall-handshake")
+        let previous = try await control.status().count
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        let socket = try client.makeWebSocketClient()
+        await socket.connect()
+        _ = try await control.waitForConnection(after: previous)
+        let probe = SettlementProbe()
+        let send = Task { @MainActor in
+            do { try await socket.send(eventType: "disconnected-stalled-probe") }
+            catch { probe.error = error }
+            probe.completed = true
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        await socket.disconnect()
+        try await waitForCompletion(probe, "Disconnect must settle an actual pending send within one second")
+        await send.value
+        try expect(probe.error?.localizedDescription == "WebSocket send was cancelled; remote outcome is unknown.",
+                   "Disconnect after dispatch must retain the uncertain remote outcome")
+        try await verifyReplacement(socket, after: previous + 1, event: "replacement-after-disconnect", control: control)
+        let records = try await control.status()
+        try expect(!records.contains(where: { $0.events.contains("disconnected-stalled-probe") }),
+                   "Disconnect must never replay an uncertain send")
+    }
+
+    @MainActor private static func waitForCompletion(_ probe: SettlementProbe, _ message: String) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 1
+        while !probe.completed, ProcessInfo.processInfo.systemUptime < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        try expect(probe.completed, message)
+    }
+
+    private static func verifyReplacement(_ socket: GLKVMClient.WebSocketClient, after count: Int,
+                                          event: String, control: SettlementControl) async throws {
+        try await control.mode("normal")
+        await socket.connect()
+        let replacement = try await control.waitForConnection(after: count)
+        try await waitUntilConnected(socket)
+        // Cross the retired transport's former send deadline and late callbacks.
+        try await Task.sleep(nanoseconds: 2_200_000_000)
+        try await socket.send(eventType: event)
+        let record = try await waitForEvent(event, id: replacement.id, control: control)
+        let connected = await socket.isConnected
+        await socket.disconnect()
+        try expect(connected, "An old completion must not close a replacement transport")
+        try expect(record.events.filter { $0 == event }.count == 1, "The replacement must transmit its probe exactly once")
     }
 
     @MainActor private static func testShutdownDoesNotReconnect(_ control: SettlementControl) async throws {

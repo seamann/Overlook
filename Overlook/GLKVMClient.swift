@@ -71,6 +71,9 @@ struct GLKVMSystemConfig: Codable, Hashable {
     var fingerbotStrength: Int
     var videoProcessing: String
 
+    private var originalValues: GLKVMJSONObject = [:]
+    private var originalKnownValues: GLKVMJSONObject = [:]
+
     enum CodingKeys: String, CodingKey {
         case shortcuts
         case orientation
@@ -106,8 +109,9 @@ struct GLKVMSystemConfig: Codable, Hashable {
         reverseScrolling = (try? container.decode(String.self, forKey: .reverseScrolling)) ?? "STANDARD"
         keyboardControl = (try? container.decode(Bool.self, forKey: .keyboardControl)) ?? true
         themeMode = (try? container.decode(String.self, forKey: .themeMode)) ?? "auto"
-        if let decodedMouseJiggle = try? container.decode(Bool.self, forKey: .mouseJiggle) {
-            mouseJiggle = decodedMouseJiggle
+        if container.contains(.mouseJiggle) {
+            // Present but malformed cannot be treated as safely unsupported.
+            mouseJiggle = try container.decode(Bool.self, forKey: .mouseJiggle)
             supportsMouseJiggle = true
         } else {
             mouseJiggle = false
@@ -118,30 +122,57 @@ struct GLKVMSystemConfig: Codable, Hashable {
         isAbsoluteMouse = (try? container.decode(Bool.self, forKey: .isAbsoluteMouse)) ?? true
         fingerbotStrength = (try? container.decode(Int.self, forKey: .fingerbotStrength)) ?? 0
         videoProcessing = (try? container.decode(String.self, forKey: .videoProcessing)) ?? ""
+        originalValues = try GLKVMJSONObject(from: decoder)
+        originalKnownValues = knownValues
     }
 
     func encode(to encoder: Encoder) throws {
-        var container = encoder.container(keyedBy: CodingKeys.self)
-        try container.encode(shortcuts, forKey: .shortcuts)
-        try container.encode(orientation, forKey: .orientation)
-        try container.encode(streamQuality, forKey: .streamQuality)
-        try container.encode(videoMode, forKey: .videoMode)
-        try container.encode(showCursor, forKey: .showCursor)
-        try container.encode(mousePolling, forKey: .mousePolling)
-        try container.encode(mouseControl, forKey: .mouseControl)
-        try container.encode(relativeSense, forKey: .relativeSense)
-        try container.encode(scrollRate, forKey: .scrollRate)
-        try container.encode(reverseScrolling, forKey: .reverseScrolling)
-        try container.encode(keyboardControl, forKey: .keyboardControl)
-        try container.encode(themeMode, forKey: .themeMode)
-        if supportsMouseJiggle {
-            try container.encode(mouseJiggle, forKey: .mouseJiggle)
+        try serializedValues.encode(to: encoder)
+    }
+
+    // The API accepts a complete object. Preserve unrecognized values and absence;
+    // typed defaults are only a UI view and must not become unsolicited writes.
+    private var serializedValues: GLKVMJSONObject {
+        originalValues.merging(knownValues.filter { originalKnownValues[$0.key] != $0.value }) { _, edited in edited }
+    }
+
+    func settingsEditKeys(relativeTo baseline: Self) -> Set<String> {
+        Set(knownValues.filter {
+            $0.key != CodingKeys.mouseJiggle.rawValue && baseline.knownValues[$0.key] != $0.value
+        }.map { $0.key })
+    }
+
+    func mergingSettingsEdits(from draft: Self, editedFields: Set<String>) throws -> Self {
+        let edits = draft.knownValues.filter {
+            $0.key != CodingKeys.mouseJiggle.rawValue && editedFields.contains($0.key)
         }
-        try container.encode(keymap, forKey: .keymap)
-        try container.encode(gotMutedPanelTip, forKey: .gotMutedPanelTip)
-        try container.encode(isAbsoluteMouse, forKey: .isAbsoluteMouse)
-        try container.encode(fingerbotStrength, forKey: .fingerbotStrength)
-        try container.encode(videoProcessing, forKey: .videoProcessing)
+        let values = serializedValues.merging(edits) { _, edited in edited }
+        return try JSONDecoder().decode(Self.self, from: JSONEncoder().encode(values))
+    }
+
+    private var knownValues: GLKVMJSONObject {
+        let values: GLKVMJSONObject = [
+            "shortcuts": .array(shortcuts.map { .object(["keys": .array($0.keys.map(JSONValue.string)), "label": .string($0.label)]) }),
+            "orientation": .int(orientation),
+            "stream_quality": .int(streamQuality),
+            "video_mode": .string(videoMode),
+            "show_cursor": .bool(showCursor),
+            "mouse_polling": .int(mousePolling),
+            "mouse_control": .bool(mouseControl),
+            "relative_sense": .int(relativeSense),
+            "scroll_rate": .int(scrollRate),
+            "reverse_scrolling": .string(reverseScrolling),
+            "keyboard_control": .bool(keyboardControl),
+            "theme_mode": .string(themeMode),
+            "keymap": .string(keymap),
+            "got_muted_panel_tip": .bool(gotMutedPanelTip),
+            "is_absolute_mouse": .bool(isAbsoluteMouse),
+            "fingerbot_strength": .int(fingerbotStrength),
+            "video_processing": .string(videoProcessing),
+        ]
+        return supportsMouseJiggle
+            ? values.merging([CodingKeys.mouseJiggle.rawValue: .bool(mouseJiggle)]) { _, edited in edited }
+            : values
     }
 }
 
@@ -465,24 +496,28 @@ final class GLKVMClient {
         request.httpBody = body
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
+        let (data, response): (Data, URLResponse)
+        do {
+            try Task.checkCancellation()
+            (data, response) = try await session.data(for: request)
+            try Task.checkCancellation()
+        } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            throw ClientError.transportFailed
+        }
+        guard let http = response as? HTTPURLResponse else { throw ClientError.decodingFailed }
+        guard (200...299).contains(http.statusCode) else {
+            throw ClientError.httpError(statusCode: http.statusCode, body: nil)
+        }
+
+        let decoder = JSONDecoder()
+        guard let status = try? decoder.decode(GLKVMResponseStatus.self, from: data) else {
             throw ClientError.decodingFailed
         }
-
-        guard (200...299).contains(http.statusCode) else {
-            let bodyString = String(data: data, encoding: .utf8)
-            throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
-        }
-
-        if let wrapped = try? JSONDecoder().decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data) {
-            if let token = wrapped.result.token, !token.isEmpty {
-                return token
-            }
-            if wrapped.ok == false {
-                let bodyString = String(data: data, encoding: .utf8)
-                throw ClientError.httpError(statusCode: http.statusCode, body: bodyString)
-            }
+        guard status.ok else { throw ClientError.requestRejected }
+        if let wrapped = try? decoder.decode(GLKVMResponse<GLKVMAuthLoginResult>.self, from: data),
+           let token = wrapped.result.token, !token.isEmpty {
+            return token
         }
 
         if let token = authTokenFromSetCookieHeaders(in: http, for: url) {
@@ -593,7 +628,7 @@ private func authTokenFromSetCookieHeaders(in response: HTTPURLResponse, for url
 
     return HTTPCookie
         .cookies(withResponseHeaderFields: headerFields, for: url)
-        .first(where: { $0.name == "auth_token" })?
+        .first(where: { $0.name == "auth_token" && !$0.value.isEmpty })?
         .value
 }
 
@@ -1106,6 +1141,7 @@ extension GLKVMClient {
             case encodingFailed
             case decodingFailed
             case sendTimedOut
+            case sendCancelled
 
             var errorDescription: String? {
                 switch self {
@@ -1117,6 +1153,8 @@ extension GLKVMClient {
                     return "WebSocket message decoding failed."
                 case .sendTimedOut:
                     return "WebSocket send timed out."
+                case .sendCancelled:
+                    return "WebSocket send was cancelled; remote outcome is unknown."
                 }
             }
         }
@@ -1138,6 +1176,15 @@ extension GLKVMClient {
             }
         }
 
+        private struct PendingSend {
+            let transport: TransportState
+            let continuation: CheckedContinuation<Void, Error>
+            let deadline: Task<Void, Never>
+        }
+
+        // Actor isolation arbitrates callback, timeout, cancellation and disconnect.
+        // Foundation may never call a stalled handshake's send completion after cancel.
+        private var pendingSends: [UUID: PendingSend] = [:]
         private var transport: TransportState?
         private var receiveTask: Task<Void, Never>?
         private var pingTask: Task<Void, Never>?
@@ -1188,6 +1235,9 @@ extension GLKVMClient {
         }
 
         func disconnect() {
+            if let transport {
+                settlePendingSends(through: transport, error: WebSocketError.sendCancelled)
+            }
             receiveTask?.cancel()
             receiveTask = nil
 
@@ -1256,20 +1306,69 @@ extension GLKVMClient {
             _ message: URLSessionWebSocketTask.Message,
             through capturedTransport: TransportState
         ) async throws {
+            try Task.checkCancellation()
             guard transport === capturedTransport else {
                 throw CancellationError()
             }
-            let deadline = scheduleSendAbort(for: capturedTransport)
-            defer { deadline.cancel() }
+            let operationID = UUID()
+            var didDispatch = false
             do {
-                try await capturedTransport.task.send(message)
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                        guard !Task.isCancelled else {
+                            continuation.resume(throwing: CancellationError())
+                            return
+                        }
+                        let deadline = scheduleSendAbort(for: capturedTransport)
+                        pendingSends[operationID] = PendingSend(
+                            transport: capturedTransport, continuation: continuation, deadline: deadline
+                        )
+                        didDispatch = true
+                        capturedTransport.task.send(message) { [weak self] error in
+                            Task { await self?.finishSend(operationID, error: error) }
+                        }
+                    }
+                } onCancel: { [weak self] in
+                    Task { await self?.cancelSend(operationID) }
+                }
                 try throwIfTransportTimedOut(capturedTransport)
                 try markConnected(capturedTransport)
             } catch {
                 if capturedTransport.timedOut {
                     throw WebSocketError.sendTimedOut
                 }
+                if didDispatch && Task.isCancelled {
+                    throw WebSocketError.sendCancelled
+                }
                 throw error
+            }
+        }
+
+        private func finishSend(_ operationID: UUID, error: Error?) {
+            guard let pending = pendingSends.removeValue(forKey: operationID) else { return }
+            pending.deadline.cancel()
+            if let error {
+                pending.continuation.resume(throwing: error)
+            } else {
+                pending.continuation.resume()
+            }
+        }
+
+        private func cancelSend(_ operationID: UUID) {
+            guard let pending = pendingSends[operationID] else { return }
+            // Once dispatched, cancellation cannot establish remote non-delivery.
+            // Retire only this transport; callers retain the uncertain outcome.
+            if transport === pending.transport {
+                markDisconnected(sendError: WebSocketError.sendCancelled)
+            } else {
+                settlePendingSends(through: pending.transport, error: WebSocketError.sendCancelled)
+            }
+        }
+
+        private func settlePendingSends(through retiredTransport: TransportState, error: Error) {
+            let operationIDs = pendingSends.filter { $0.value.transport === retiredTransport }.map(\.key)
+            for operationID in operationIDs {
+                finishSend(operationID, error: error)
             }
         }
 
@@ -1293,7 +1392,7 @@ extension GLKVMClient {
             if timedOut {
                 capturedTransport.timedOut = true
             }
-            markDisconnected()
+            markDisconnected(sendError: timedOut ? WebSocketError.sendTimedOut : WebSocketError.sendCancelled)
         }
 
         private func throwIfTransportTimedOut(_ completedTransport: TransportState) throws {
@@ -1331,7 +1430,10 @@ extension GLKVMClient {
             try await sendHidMouseButton(button: "middle", state: false)
         }
 
-        private func markDisconnected() {
+        private func markDisconnected(sendError: Error = WebSocketError.sendCancelled) {
+            if let transport {
+                settlePendingSends(through: transport, error: sendError)
+            }
             receiveTask?.cancel()
             receiveTask = nil
             pingTask?.cancel()

@@ -8,6 +8,7 @@ struct KVMDevice {
 
 @main
 struct GLKVMSystemConfigTests {
+    private static let fixtureLoginPassword = "fixture-password"
     static func main() async throws {
         let decoder = JSONDecoder()
         let encoder = JSONEncoder()
@@ -39,7 +40,117 @@ struct GLKVMSystemConfigTests {
         precondition(GLKVMHIDPrintRequestPolicy.contentType == "text/plain; charset=utf-8")
 
         try await testResponseContract()
+        var failedContracts = 0
+        do { try testLosslessConfigContract() } catch { failedContracts += 1 }
+        do { try await testLoginContract() } catch { failedContracts += 1 }
+        do { try testConfigEditContract() } catch { failedContracts += 1 }
+        guard failedContracts == 0 else { throw ContractFailure.regressions(failedContracts) }
         print("GLKVMSystemConfigTests passed")
+    }
+
+    private static func testLosslessConfigContract() throws {
+        let cases = [
+            "{}",
+            #"{"mouse_jiggle":true,"future":{"text":"Grüße 🖱️","flags":[true,null,17,2.5]},"show_cursor":"firmware-value","shortcuts":[{"keys":["Ctrl"],"label":"Test","new_option":true}]}"#,
+            #"{"orientation":0,"show_cursor":false,"keymap":"de","future":null}"#,
+        ]
+        var failures: [String] = []
+        for (index, payload) in cases.enumerated() {
+            let data = Data(payload.utf8)
+            let original = try JSONDecoder().decode(GLKVMJSONObject.self, from: data)
+            let config = try JSONDecoder().decode(GLKVMSystemConfig.self, from: data)
+            let roundtrip = try JSONDecoder().decode(GLKVMJSONObject.self, from: JSONEncoder().encode(config))
+            if original != roundtrip { failures.append("lossless roundtrip \(index)") }
+        }
+        for payload in [#"{"mouse_jiggle":"true"}"#, #"{"mouse_jiggle":null}"#, #"{"mouse_jiggle":1}"#] {
+            do {
+                _ = try JSONDecoder().decode(GLKVMSystemConfig.self, from: Data(payload.utf8))
+                failures.append("invalid present jiggler accepted")
+            } catch {}
+        }
+        var edited = try JSONDecoder().decode(GLKVMSystemConfig.self, from: Data("{}".utf8))
+        edited.keymap = "de"
+        let changed = try JSONDecoder().decode(GLKVMJSONObject.self, from: JSONEncoder().encode(edited))
+        if changed != ["keymap": .string("de")] { failures.append("edit inserted untouched default fields") }
+        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
+        guard failures.isEmpty else { throw ContractFailure.regressions(failures.count) }
+        print("Lossless config contract: \(cases.count + 4) scenarios passed")
+    }
+
+    private static func testConfigEditContract() throws {
+        let decoder = JSONDecoder()
+        let baseline = try decoder.decode(GLKVMSystemConfig.self, from: Data("{}".utf8))
+        var draft = baseline
+        draft.shortcuts = [GLKVMSystemConfigShortcut(keys: ["Ctrl", "Enter"], label: "Grüße 🖱️")]
+        draft.orientation = 90
+        draft.streamQuality = 3
+        draft.videoMode = "stream"
+        draft.showCursor = false
+        draft.mousePolling = 20
+        draft.mouseControl = false
+        draft.relativeSense = 20
+        draft.scrollRate = 10
+        draft.reverseScrolling = "REVERSED"
+        draft.keyboardControl = false
+        draft.themeMode = "dark"
+        draft.keymap = "de"
+        draft.gotMutedPanelTip = true
+        draft.isAbsoluteMouse = false
+        draft.fingerbotStrength = 4
+        draft.videoProcessing = "low_latency_first"
+        let expected = try decoder.decode(GLKVMJSONObject.self, from: Data(#"{"shortcuts":[{"keys":["Ctrl","Enter"],"label":"Grüße 🖱️"}],"orientation":90,"stream_quality":3,"video_mode":"stream","show_cursor":false,"mouse_polling":20,"mouse_control":false,"relative_sense":20,"scroll_rate":10,"reverse_scrolling":"REVERSED","keyboard_control":false,"theme_mode":"dark","keymap":"de","got_muted_panel_tip":true,"is_absolute_mouse":false,"fingerbot_strength":4,"video_processing":"low_latency_first"}"#.utf8))
+        guard draft.settingsEditKeys(relativeTo: baseline) == Set(expected.keys) else { throw ContractFailure.regressions(1) }
+        let actual = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(draft))
+        guard actual == expected else { throw ContractFailure.regressions(1) }
+        let unchanged = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(baseline))
+        guard unchanged.isEmpty else { throw ContractFailure.regressions(1) }
+
+        let fresh = try decoder.decode(GLKVMSystemConfig.self, from: Data(#"{"keymap":"fr","mouse_jiggle":true,"stream_quality":3,"future":null}"#.utf8))
+        let unchangedMerge = try fresh.mergingSettingsEdits(from: baseline, editedFields: baseline.settingsEditKeys(relativeTo: baseline))
+        let unchangedPayload = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(unchangedMerge))
+        let freshPayload = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(fresh))
+        guard unchangedPayload == freshPayload else { throw ContractFailure.regressions(1) }
+        var jigglerOnly = fresh
+        jigglerOnly.mouseJiggle = false
+        let protected = try fresh.mergingSettingsEdits(from: jigglerOnly, editedFields: ["mouse_jiggle"])
+        guard protected.mouseJiggle else { throw ContractFailure.regressions(1) }
+
+        let large: GLKVMJSONObject = ["unknown_entries": .array((0..<10_000).map { .object(["value": .int($0)]) })]
+        let largeData = try JSONEncoder().encode(large)
+        let largeConfig = try decoder.decode(GLKVMSystemConfig.self, from: largeData)
+        let largeRoundtrip = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(largeConfig))
+        guard largeRoundtrip == large else { throw ContractFailure.regressions(1) }
+        print("Config edit contract: all 17 settings, unchanged/protected merge and 10k unknown entries passed")
+    }
+
+    private static func testLoginContract() async throws {
+        let cases: [(String, String?)] = [
+            ("login-token", nil), ("login-cookie", nil),
+            ("login-reject-token", "requestRejected"),
+            ("login-reject-cookie", "requestRejected"),
+            ("login-reject-empty", "requestRejected"),
+            ("login-http-error", "httpError(403)"),
+            ("login-malformed", "decodingFailed"),
+            ("login-invalid-ok-cookie", "decodingFailed"),
+            ("login-empty-cookie", "decodingFailed"),
+            ("login-transport-error", "transportFailed"),
+        ]
+        var failures: [String] = []
+        for (scenario, expected) in cases {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [GLKVMResponseFixtureProtocol.self]
+            configuration.httpCookieStorage = nil
+            let client = try GLKVMClient(host: "\(scenario).invalid", allowInsecureTLS: false, sessionConfiguration: configuration)
+            do {
+                let token = try await client.authLogin(password: fixtureLoginPassword)
+                if expected != nil || token != "fixture-token" { failures.append("\(scenario): unexpected login success") }
+            } catch {
+                if String(describing: error) != expected { failures.append("\(scenario): wrong error category") }
+            }
+        }
+        failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
+        guard failures.isEmpty else { throw ContractFailure.regressions(failures.count) }
+        print("Login contract: \(cases.count) scenarios passed; synthetic credentials only")
     }
 
     private static func jsonObject(from data: Data) throws -> [String: Any] {
@@ -112,7 +223,7 @@ private final class GLKVMResponseFixtureProtocol: URLProtocol {
     override func startLoading() {
         guard let url = request.url else { preconditionFailure("Fixture needs a URL") }
         let scenario = url.host?.split(separator: ".").first.map(String.init) ?? ""
-        if scenario == "transport-error" {
+        if scenario == "transport-error" || scenario == "login-transport-error" {
             let error = URLError(.timedOut, userInfo: [
                 NSLocalizedDescriptionKey: "synthetic-secret transport detail",
                 NSURLErrorFailingURLErrorKey: URL(string: "https://synthetic-secret.invalid/private")!,
@@ -121,9 +232,11 @@ private final class GLKVMResponseFixtureProtocol: URLProtocol {
             return
         }
         let payload = Self.payload(for: scenario)
+        var headers = ["Content-Type": "application/json"]
+        if scenario.contains("cookie") { headers["Set-Cookie"] = scenario == "login-empty-cookie" ? "auth_token=; Path=/" : "auth_token=fixture-token; Path=/" }
         let response = HTTPURLResponse(
-            url: url, statusCode: scenario == "http-error" ? 403 : 200,
-            httpVersion: "HTTP/1.1", headerFields: ["Content-Type": "application/json"]
+            url: url, statusCode: scenario.contains("http-error") ? 403 : 200,
+            httpVersion: "HTTP/1.1", headerFields: headers
         )!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Data(payload.utf8))
@@ -134,6 +247,14 @@ private final class GLKVMResponseFixtureProtocol: URLProtocol {
 
     private static func payload(for scenario: String) -> String {
         switch scenario {
+        case "login-token": return #"{"ok":true,"result":{"token":"fixture-token"}}"#
+        case "login-invalid-ok-cookie": return #"{"ok":"true"}"#
+        case "login-empty-cookie": return #"{"ok":true}"#
+        case "login-cookie": return #"{"ok":true}"#
+        case "login-reject-token": return #"{"ok":false,"result":{"token":"fixture-token"}}"#
+        case "login-reject-cookie", "login-reject-empty": return #"{"ok":false}"#
+        case "login-http-error": return #"{"ok":false,"result":{"token":"fixture-token"}}"#
+        case "login-malformed": return "invalid response"
         case "accepted": return #"{"ok":true,"result":{}}"#
         case "rejected": return #"{"ok":false,"result":{}}"#
         case "no-result": return #"{"ok":false}"#
@@ -148,3 +269,5 @@ private final class GLKVMResponseFixtureProtocol: URLProtocol {
         }
     }
 }
+
+private enum ContractFailure: Error { case regressions(Int) }

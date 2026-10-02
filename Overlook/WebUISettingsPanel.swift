@@ -14,6 +14,8 @@ struct WebUISettingsPanel: View {
     @AppStorage("overlook.audio.outputDeviceUID") private var audioOutputDeviceUID: String = ""
 
     @State private var config: GLKVMSystemConfig?
+    @State private var editedConfigFields: Set<String> = []
+    @State private var configDraftGeneration = 0
     @State private var configConnectionSessionID: UUID?
     @State private var keymaps: GLKVMHidKeymapsState?
     @State private var streamerState: GLKVMStreamerState?
@@ -721,6 +723,7 @@ struct WebUISettingsPanel: View {
             applyStreamerTask?.cancel()
             applyStreamerTask = nil
             config = nil
+            editedConfigFields = []
             configConnectionSessionID = nil
             isLoading = false
             isApplying = false
@@ -732,6 +735,7 @@ struct WebUISettingsPanel: View {
             applyTask?.cancel()
             applyStreamerTask?.cancel()
             config = nil
+            editedConfigFields = []
             configConnectionSessionID = nil
             isLoading = false
             isApplying = false
@@ -883,6 +887,7 @@ struct WebUISettingsPanel: View {
         else {
             await MainActor.run {
                 config = nil
+                editedConfigFields = []
                 configConnectionSessionID = nil
                 keymaps = nil
                 streamerState = nil
@@ -911,6 +916,8 @@ struct WebUISettingsPanel: View {
                     return
                 }
                 self.config = config
+                editedConfigFields = []
+                configDraftGeneration &+= 1
                 configConnectionSessionID = connectionSessionID
                 inputManager.setGLKVMAbsoluteMouseMode(config.isAbsoluteMouse)
                 webRTCManager.setPreferLowLatencyPlayout(config.videoProcessing == "low_latency_first")
@@ -1203,13 +1210,18 @@ struct WebUISettingsPanel: View {
     }
 
     private func updateConfig(_ mutate: (inout GLKVMSystemConfig) -> Void) {
-        guard var config else { return }
-        mutate(&config)
-        self.config = config
-        scheduleApply(config)
+        guard let previous = config else { return }
+        var updated = previous
+        mutate(&updated)
+        self.config = updated
+        editedConfigFields = editedConfigFields.union(updated.settingsEditKeys(relativeTo: previous))
+        scheduleApply(updated)
     }
 
     private func scheduleApply(_ config: GLKVMSystemConfig) {
+        let editedFields = editedConfigFields
+        configDraftGeneration &+= 1
+        let generation = configDraftGeneration
         applyTask?.cancel()
         applyTask = Task {
             do {
@@ -1218,11 +1230,11 @@ struct WebUISettingsPanel: View {
                 return
             }
             guard !Task.isCancelled, isPresented else { return }
-            await apply(config)
+            await apply(config, editedFields: editedFields, generation: generation)
         }
     }
 
-    private func apply(_ config: GLKVMSystemConfig) async {
+    private func apply(_ config: GLKVMSystemConfig, editedFields: Set<String>, generation: Int) async {
         guard let connectionSessionID = configConnectionSessionID,
               kvmDeviceManager.connectionSessionID == connectionSessionID
         else { return }
@@ -1230,23 +1242,23 @@ struct WebUISettingsPanel: View {
         do {
             let updated = try await kvmDeviceManager.applySystemConfig(
                 config,
+                editedFields: editedFields,
                 connectionSessionID: connectionSessionID
             )
             await MainActor.run {
-                guard isPresented,
-                      kvmDeviceManager.connectionSessionID == connectionSessionID
-                else {
-                    isApplying = false
-                    return
-                }
+                guard !Task.isCancelled, generation == configDraftGeneration,
+                      isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID
+                else { return }
                 self.config = updated
+                editedConfigFields = []
                 inputManager.setGLKVMAbsoluteMouseMode(updated.isAbsoluteMouse)
                 isApplying = false
             }
         } catch {
             await MainActor.run {
+                guard generation == configDraftGeneration else { return }
                 isApplying = false
-                if isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
+                if !Task.isCancelled, isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
                     recordError("Failed to apply settings: \(error)")
                 }
             }

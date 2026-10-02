@@ -13,10 +13,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+swiftc_bin="${OVERLOOK_SWIFTC:-swiftc}"
+swift_flags=(-swift-version 5 -target "${OVERLOOK_SWIFT_TARGET:-$(uname -m)-apple-macos14.0}")
+if [[ -n "${OVERLOOK_SWIFT_SDK:-}" ]]; then
+  swift_flags+=(-sdk "$OVERLOOK_SWIFT_SDK")
+fi
+
 run_swift() {
   local name="$1"
   shift
-  swiftc -parse-as-library "$@" -o "$test_dir/$name"
+  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "$@" -o "$test_dir/$name"
   "$test_dir/$name"
 }
 
@@ -27,6 +33,9 @@ if [[ "$suite" != mcp ]]; then
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
     Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
+  run_swift CredentialConfig Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
+    Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
+    Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     Overlook/KVMDevice.swift Overlook/SessionConnectionCoordinator.swift tests/SessionConnectionCoordinatorTests.swift
@@ -36,7 +45,7 @@ if [[ "$suite" != mcp ]]; then
   run_swift LocalInputCapture "${capture_sources[@]}" tests/LocalInputCaptureTests.swift
   run_swift InputManagerCapture "${capture_sources[@]}" tests/InputManagerCaptureTests.swift
   run_swift InputManagerGLKVM "${capture_sources[@]}" tests/InputManagerGLKVMTests.swift
-  swiftc -parse-as-library "${capture_sources[@]}" tests/InputManagerHIDQueueTests.swift -o "$test_dir/HIDQueue"
+  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "${capture_sources[@]}" tests/InputManagerHIDQueueTests.swift -o "$test_dir/HIDQueue"
   node tests/hid-capture-fixture.mjs --self-test
   node tests/hid-capture-fixture.mjs "$test_dir/hid-port" &
   fixture_pid=$!
@@ -45,7 +54,7 @@ if [[ "$suite" != mcp ]]; then
   kill "$fixture_pid" 2>/dev/null || true
   wait "$fixture_pid" || true
   fixture_pid=''
-  swiftc -parse-as-library "${capture_sources[@]}" tests/GLKVMWebSocketSettlementTests.swift -o "$test_dir/WebSocketSettlement"
+  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library "${capture_sources[@]}" tests/GLKVMWebSocketSettlementTests.swift -o "$test_dir/WebSocketSettlement"
   node --check tests/ws-settlement-fixture.mjs
   node tests/ws-settlement-fixture.mjs "$test_dir/settlement-port" &
   fixture_pid=$!
@@ -66,7 +75,7 @@ if [[ "$suite" != mcp ]]; then
     Overlook/RemoteActionState.swift Overlook/RemoteSnapshot.swift Overlook/LocalControlServer.swift \
     tests/LocalControlServerStubs.swift tests/LocalControlServerTests.swift
 
-  swiftc -parse-as-library Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
+  "$swiftc_bin" "${swift_flags[@]}" -parse-as-library Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     tests/GLKVMWebSocketTests.swift -o "$test_dir/WebSocketReadiness"
   node tests/ws-readiness-fixture.mjs "$test_dir/port" &
   fixture_pid=$!

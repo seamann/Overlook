@@ -447,6 +447,9 @@ struct ContentView: View {
         .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
             if let message { connectionErrorMessage = message }
         }
+        .onChange(of: kvmDeviceManager.credentialStorageWarningGeneration, initial: true) { _, _ in
+            if let message = kvmDeviceManager.credentialStorageWarning { connectionErrorMessage = message }
+        }
         .onDisappear {
             inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
         }
@@ -541,7 +544,8 @@ struct ContentView: View {
             )
         }
         .alert(
-            "Connection Failed",
+            connectionErrorMessage == kvmDeviceManager.credentialStorageWarning
+                ? "Credentials Not Saved" : "Connection Failed",
             isPresented: Binding(
                 get: { connectionErrorMessage != nil },
                 set: { if !$0 { connectionErrorMessage = nil } }
@@ -635,7 +639,7 @@ struct ContentView: View {
                 guard sessionCoordinator.isCurrent(attempt.id) else { return }
                 selectedDevice = device
                 showingConnections = false
-                connectionErrorMessage = nil
+                connectionErrorMessage = kvmDeviceManager.credentialStorageWarning
             } catch is CancellationError {
                 return
             } catch {

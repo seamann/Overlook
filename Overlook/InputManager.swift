@@ -1343,9 +1343,13 @@ class InputManager: ObservableObject {
                 completion?(.success(()))
             } catch {
                 if let self {
-                    if let webSocketError = error as? GLKVMClient.WebSocketClient.WebSocketError,
-                       case .sendTimedOut = webSocketError {
-                        self.latchUnconfirmedInput()
+                    if let webSocketError = error as? GLKVMClient.WebSocketClient.WebSocketError {
+                        switch webSocketError {
+                        case .sendTimedOut, .sendCancelled:
+                            self.latchUnconfirmedInput()
+                        default:
+                            break
+                        }
                     }
                     let errorDescription = error.localizedDescription
                     if let feedback = HIDCommandFeedbackPolicy.failureUpdate(
