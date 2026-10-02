@@ -1,5 +1,7 @@
 # Overlook: Umsetzung der Review-Maßnahmen
 
+Dieser Bericht bewahrt den M109-Checkpoint vor dem anschließend beauftragten Versionswechsel. Der aktuelle Stand ist im [WebRTC-154-/MCP-2.2-Rolloutbericht](2026-10-02-overlook-m154-mcp22-rollout.md) dokumentiert: M154 ist seit 10:36 UTC installiert und verbunden; SDK 2.2 ist installiert, konfiguriert und separat live geprüft. Die alte MCP-Verbindung dieses Chats benötigt noch einen Codex-Neustart. Die folgenden Angaben zu M109 und dem noch nicht installierten M154 beschreiben den früheren Checkpoint.
+
 Stand: 2. Oktober 2026. Die beauftragten Reparaturen und das kleine MCP-Update sind im isolierten Arbeitsbaum `codex/overlook-review-2026-10-02` umgesetzt. Der signierte M109-Reparaturbuild wurde nach Freigabe unter `/Applications/Overlook.app` installiert. Fenster schließen/wiederzeigen und die lokale API sind an der vollständigen App geprüft. Die Abnahme von Video, Eingaben, Jiggler-Wachhalten und Audio am echten KVM steht noch aus. Der laufende MCP-Adapter verwendet weiterhin 2.0; seine 2.2-Quellen sind vorbereitet.
 
 ## Ergebnis und Architektur

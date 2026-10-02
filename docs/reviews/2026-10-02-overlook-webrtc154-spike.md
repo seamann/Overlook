@@ -1,5 +1,7 @@
 # Overlook: isolierter WebRTC-154-Versuch
 
+Dieser Bericht bewahrt den Vorbereitungsstand des separaten Kandidaten. Nach Wolfgangs ausdrücklicher Update-Beauftragung wurde er um 10:36 UTC installiert und mit dem bisherigen KVM verbunden. Der [aktuelle Rolloutbericht](/Users/doebber/.codex/worktrees/overlook-review-2026-10-02/docs/reviews/2026-10-02-overlook-m154-mcp22-rollout.md) enthält Installations-, MCP- und Live-Nachweise. Die folgenden Aussagen zum noch nicht installierten Kandidaten beschreiben den früheren Vorbereitungsstand.
+
 Stand: 2. Oktober 2026. Ergebnis: Die tatsächlich verwendeten nativen Swift-
 und Objective-C-Pfade kompilieren, linken und bestehen ihre lokalen Tests mit
 M154. Auch der vollständige reguläre Xcode-Release-Build besteht inzwischen
