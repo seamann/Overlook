@@ -36,6 +36,7 @@ if [[ "$suite" != mcp ]]; then
   run_swift CredentialConfig Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
     Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
+  run_swift StatsGeneration Overlook/FrameDeliveryState.swift tests/StatsGenerationTests.swift
   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     Overlook/KVMDevice.swift Overlook/SessionConnectionCoordinator.swift tests/SessionConnectionCoordinatorTests.swift
@@ -68,6 +69,9 @@ if [[ "$suite" != mcp ]]; then
     printf 'Set OVERLOOK_WEBRTC_FRAMEWORK_DIR to the resolved macOS framework parent.\n' >&2
     exit 1
   fi
+  run_swift FrameDelivery -F "$framework_parent" -framework WebRTC \
+    -Xlinker -rpath -Xlinker "$framework_parent" \
+    Overlook/FrameDeliveryState.swift Overlook/RemoteSnapshot.swift tests/FrameDeliveryTests.swift
   run_swift RemoteSnapshot -F "$framework_parent" -framework WebRTC \
     -Xlinker -rpath -Xlinker "$framework_parent" \
     Overlook/RemoteSnapshot.swift tests/RemoteSnapshotTests.swift

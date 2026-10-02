@@ -116,6 +116,7 @@ class WebRTCManager: NSObject, ObservableObject {
 
     private var lastInboundVideoBytesReceived: Int64?
     private var lastInboundVideoBytesTimestamp: TimeInterval?
+    private var streamStatsRequestID: UUID?
 
     private var lastInboundAudioBytesReceived: Int64?
     private var lastInboundAudioBytesTimestamp: TimeInterval?
@@ -179,6 +180,7 @@ class WebRTCManager: NSObject, ObservableObject {
     }
 
     private func invalidateSnapshotSource(endpointURL: URL? = nil) {
+        videoRenderer?.invalidate()
         if let videoRenderer { videoTrack?.remove(videoRenderer) }
         if let videoView { videoTrack?.remove(videoView) }
         videoRenderer = nil
@@ -186,6 +188,9 @@ class WebRTCManager: NSObject, ObservableObject {
         snapshotProvider.resetSource(endpointURL: endpointURL)
         currentFrame = nil
         lastFrameCaptureTime = 0
+        fpsWindowStartTime = 0
+        fpsFrameCount = 0
+        lastFpsPublishTime = 0
     }
     
     override init() {
@@ -965,7 +970,9 @@ class WebRTCManager: NSObject, ObservableObject {
 
     private func measureStreamStats() async {
         guard let peerConnection else {
+            streamStatsRequestID = nil
             await MainActor.run {
+                guard self.peerConnection == nil else { return }
                 inboundVideoKbps = nil
                 inboundVideoPlayoutDelayMs = nil
                 inboundVideoJitterMs = nil
@@ -981,6 +988,18 @@ class WebRTCManager: NSObject, ObservableObject {
             return
         }
 
+        let measuredAudioPeer = audioPeerConnection
+        let request = StreamStatsRequest(
+            generation: connectionGeneration, videoPeer: peerConnection, audioPeer: measuredAudioPeer
+        )
+        streamStatsRequestID = request.requestID
+        func requestIsCurrent() -> Bool {
+            request.isCurrent(
+                generation: connectionGeneration, requestID: streamStatsRequestID,
+                videoPeer: self.peerConnection, audioPeer: self.audioPeerConnection
+            )
+        }
+
         if preferLowLatencyPlayout {
             let now = Date().timeIntervalSince1970
             if lastPlayoutHintApplyTime == nil || (now - (lastPlayoutHintApplyTime ?? 0)) > 2.0 {
@@ -993,6 +1012,7 @@ class WebRTCManager: NSObject, ObservableObject {
         let lastTs = lastInboundVideoBytesTimestamp
 
         let report = await peerConnection.statistics()
+        guard requestIsCurrent() else { return }
         func numberValue(_ any: Any?) -> NSNumber? {
             any as? NSNumber
         }
@@ -1054,6 +1074,7 @@ class WebRTCManager: NSObject, ObservableObject {
 
         guard let bytesReceived else {
             await MainActor.run {
+                guard requestIsCurrent() else { return }
                 self.lastInboundVideoBytesReceived = nil
                 self.lastInboundVideoBytesTimestamp = nil
                 self.inboundVideoKbps = nil
@@ -1118,6 +1139,7 @@ class WebRTCManager: NSObject, ObservableObject {
         }
 
         await MainActor.run {
+            guard requestIsCurrent() else { return }
             self.lastInboundVideoBytesReceived = bytesReceived
             self.lastInboundVideoBytesTimestamp = now
             self.lastJitterBufferDelaySeconds = jitterBufferDelaySeconds
@@ -1130,8 +1152,10 @@ class WebRTCManager: NSObject, ObservableObject {
             self.iceCurrentRoundTripTimeMs = rttMs
         }
 
-        guard let audioPeerConnection else {
+        guard requestIsCurrent() else { return }
+        guard let audioPeerConnection = measuredAudioPeer else {
             await MainActor.run {
+                guard requestIsCurrent() else { return }
                 self.lastInboundAudioBytesReceived = nil
                 self.lastInboundAudioBytesTimestamp = nil
                 self.lastAudioJitterBufferDelaySeconds = nil
@@ -1149,6 +1173,7 @@ class WebRTCManager: NSObject, ObservableObject {
         let lastAudioTs = lastInboundAudioBytesTimestamp
 
         let audioReport = await audioPeerConnection.statistics()
+        guard requestIsCurrent() else { return }
         func audioNumberValue(_ any: Any?) -> NSNumber? {
             any as? NSNumber
         }
@@ -1201,6 +1226,7 @@ class WebRTCManager: NSObject, ObservableObject {
 
         guard let audioBytesReceived else {
             await MainActor.run {
+                guard requestIsCurrent() else { return }
                 self.lastInboundAudioBytesReceived = nil
                 self.lastInboundAudioBytesTimestamp = nil
                 self.lastAudioJitterBufferDelaySeconds = nil
@@ -1257,6 +1283,7 @@ class WebRTCManager: NSObject, ObservableObject {
         }
 
         await MainActor.run {
+            guard requestIsCurrent() else { return }
             self.lastInboundAudioBytesReceived = audioBytesReceived
             self.lastInboundAudioBytesTimestamp = audioNow
             self.lastAudioJitterBufferDelaySeconds = audioJitterBufferDelaySeconds
@@ -1301,6 +1328,7 @@ class WebRTCManager: NSObject, ObservableObject {
     private func tearDown(cancelReconnect: Bool) {
         invalidateSnapshotSource()
         connectionGeneration += 1
+        streamStatsRequestID = nil
         signalingListenerTask?.cancel()
         signalingListenerTask = nil
         if cancelReconnect {
@@ -1545,10 +1573,8 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
         let sourceID = snapshotSourceID
         let renderer = SnapshotVideoRenderer(
             sourceID: sourceID,
-            onFrame: { [weak self] frame, receivedAt in
-                Task { @MainActor in
-                    self?.acceptVideoFrame(frame, receivedAt: receivedAt, sourceID: sourceID)
-                }
+            onFrame: { [weak self] batch in
+                self?.acceptVideoFrame(batch, sourceID: sourceID)
             },
             onSize: { [weak self] size in
                 Task { @MainActor in
@@ -1600,17 +1626,21 @@ extension WebRTCManager: @preconcurrency RTCDataChannelDelegate {
 
 // MARK: - Source-bound video observation
 extension WebRTCManager {
-    fileprivate func acceptVideoFrame(_ frame: SnapshotFrame?, receivedAt now: TimeInterval, sourceID: String) {
+    fileprivate func acceptVideoFrame(_ batch: FrameDeliveryBatch<SnapshotFrame>, sourceID: String) {
         guard sourceID == snapshotSourceID else { return }
+        let frame = batch.payload
+        let now = batch.receivedAt
 
+        fpsFrameCount += batch.frameCount
+        // Delegate threads can arrive out of timestamp order after a drain.
+        // Their FPS count remains valid, but old frames cannot regress health.
+        if let lastReceivedAt = getLastVideoFrameTime(), now < lastReceivedAt { return }
         setLastVideoFrameTime(now)
 
         if fpsWindowStartTime == 0 {
-            fpsWindowStartTime = now
-            lastFpsPublishTime = now
+            fpsWindowStartTime = batch.firstReceivedAt
+            lastFpsPublishTime = batch.firstReceivedAt
         }
-
-        fpsFrameCount += 1
 
         if now - lastFpsPublishTime >= 0.5 {
             let dt = now - fpsWindowStartTime
@@ -1641,35 +1671,6 @@ extension WebRTCManager {
         currentFrame = frame.pixelBuffer
     }
 
-}
-
-/// Each renderer keeps the identity of the track to which it was attached.
-/// A late callback can never acquire the identity of a newer connection.
-private final class SnapshotVideoRenderer: NSObject, RTCVideoRenderer, @unchecked Sendable {
-    private let sourceID: String
-    private let onFrame: @Sendable (SnapshotFrame?, TimeInterval) -> Void
-    private let onSize: @Sendable (CGSize) -> Void
-
-    init(
-        sourceID: String,
-        onFrame: @escaping @Sendable (SnapshotFrame?, TimeInterval) -> Void,
-        onSize: @escaping @Sendable (CGSize) -> Void
-    ) {
-        self.sourceID = sourceID
-        self.onFrame = onFrame
-        self.onSize = onSize
-    }
-
-    func renderFrame(_ frame: RTCVideoFrame?) {
-        guard let frame else { return }
-        let receivedAt = ProcessInfo.processInfo.systemUptime
-        let captured = SnapshotNativeFrame.capture(frame, sourceID: sourceID, receivedAt: receivedAt)
-        onFrame(captured, receivedAt)
-    }
-
-    func setSize(_ size: CGSize) {
-        onSize(size)
-    }
 }
 
 // MARK: - Supporting Types
