@@ -1,0 +1,6 @@
+diff --git a/.codex/config.toml b/.codex/config.toml
+--- a/.codex/config.toml
++++ b/.codex/config.toml
+@@ -50 +50 @@
+-args = ["/Users/doebber/Documents/Wago/work/Overlook-agent/mcp/overlook-control/dist/index.js"]
++args = ["/Users/doebber/.local/share/overlook-control/releases/sdk-2.2.0-75a375a/dist/index.js"]
