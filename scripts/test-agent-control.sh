@@ -23,6 +23,9 @@ run_swift() {
 if [[ "$suite" != mcp ]]; then
   run_swift ControlMode Overlook/ControlMode.swift tests/ControlModeTests.swift
   run_swift ReliabilityPolicy Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift tests/ReliabilityPolicyTests.swift
+  run_swift MouseJigglerLifecycle Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
+    Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
+    Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \

@@ -91,6 +91,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             },
             waitForRemoteMutations: { [weak self] in
                 await self?.localControlServer.waitForMutationsToDrain()
+            },
+            didResumeManualCapture: { [weak self] in
+                guard !Task.isCancelled, let self else { return }
+                do {
+                    try await self.kvmDeviceManager.resumeMouseJigglerAfterHeadless()
+                } catch is CancellationError {
+                    return
+                } catch {
+                    // The manager publishes a bounded message for the UI.
+                }
             }
         )
         localControlServer.setModeProvider { [weak self] in

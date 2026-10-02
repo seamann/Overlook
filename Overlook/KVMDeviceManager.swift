@@ -16,6 +16,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     @Published private(set) var mouseJigglerEnabled: Bool?
     @Published private(set) var mouseJigglerSupported: Bool?
     @Published private(set) var isMouseJigglerUpdating = false
+    @Published private(set) var mouseJigglerErrorMessage: String?
     @Published private(set) var connectionSessionID: UUID?
     
     private var networkMonitor: NWPathMonitor?
@@ -27,9 +28,19 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private var connectionGeneration = 0
     private var configurationGeneration = 0
     private var mouseJigglerRefreshTask: Task<Void, Never>?
+    private var mouseJigglerRefreshOwner: UUID?
+    private var mouseJigglerResumeIntent: MouseJigglerResumeIntent?
     private var headlessConfigurationLockState = HeadlessConfigurationLockState()
     private var mouseJigglerOperationState = OperationOwnershipState()
     private let systemConfigMutationGate = RemoteMutationGate(maximumPendingMutations: 4)
+    private let persistsConnections: Bool
+
+    private struct MouseJigglerResumeIntent {
+        let id = UUID()
+        let client: GLKVMClient
+        let deviceID: String
+        let connectionGeneration: Int
+    }
 
     private final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
         func urlSession(
@@ -88,10 +99,17 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
     }
     
-    override init() {
+    override convenience init() {
+        self.init(startsServices: true, persistsConnections: true)
+    }
+
+    init(startsServices: Bool, persistsConnections: Bool) {
+        self.persistsConnections = persistsConnections
         super.init()
-        setupNetworkMonitoring()
-        loadPersistedDevices()
+        if startsServices {
+            setupNetworkMonitoring()
+            loadPersistedDevices()
+        }
     }
     
     private func setupNetworkMonitoring() {
@@ -782,11 +800,12 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
     @discardableResult
     func commitConnection(_ prepared: PreparedKVMConnection) -> KVMDevice {
-        let persisted = persistDevice(prepared.device)
+        let persisted = persistsConnections ? persistDevice(prepared.device) : prepared.device
         connectionGeneration &+= 1
         configurationGeneration &+= 1
-        mouseJigglerRefreshTask?.cancel()
-        mouseJigglerRefreshTask = nil
+        invalidateMouseJigglerRefresh()
+        mouseJigglerResumeIntent = nil
+        mouseJigglerErrorMessage = nil
         mouseJigglerOperationState.reset()
         connectionSessionID = UUID()
         connectedDevice = persisted
@@ -805,14 +824,24 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             return
         }
 
+        invalidateMouseJigglerRefresh()
+        let owner = UUID()
+        mouseJigglerRefreshOwner = owner
         await refreshMouseJigglerState(
             client: client,
             deviceID: deviceID,
-            generation: connectionGeneration
+            generation: connectionGeneration,
+            configurationGeneration: configurationGeneration,
+            owner: owner
         )
+        if mouseJigglerRefreshOwner == owner { mouseJigglerRefreshOwner = nil }
     }
 
     func setMouseJigglerEnabled(_ enabled: Bool) async throws {
+        try await setMouseJigglerEnabled(enabled, preservesResumeIntent: false)
+    }
+
+    private func setMouseJigglerEnabled(_ enabled: Bool, preservesResumeIntent: Bool) async throws {
         guard MouseJigglerPolicy.allowsRequestedState(
             enabled,
             isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
@@ -822,6 +851,9 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         guard let client = glkvmClient, let deviceID = connectedDevice?.id else {
             throw MouseJigglerError.unavailable
         }
+        if !preservesResumeIntent { mouseJigglerResumeIntent = nil }
+        mouseJigglerErrorMessage = nil
+        invalidateMouseJigglerRefresh()
 
         let generation = connectionGeneration
         configurationGeneration &+= 1
@@ -865,7 +897,21 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                 }
 
                 current.mouseJiggle = enabled
-                _ = try await client.setSystemConfig(current)
+                do {
+                    _ = try await client.setSystemConfig(current)
+                } catch {
+                    if enabled {
+                        _ = try await self.disableInterruptedHeadlessJiggler(
+                            client: client, deviceID: deviceID, generation: generation, config: current
+                        )
+                    }
+                    throw error
+                }
+                if enabled, try await self.disableInterruptedHeadlessJiggler(
+                    client: client, deviceID: deviceID, generation: generation, config: current
+                ) {
+                    throw CancellationError()
+                }
                 guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
                       self.configurationGeneration == operationGeneration
                 else {
@@ -878,7 +924,22 @@ final class KVMDeviceManager: NSObject, ObservableObject {
                     throw MouseJigglerError.settingsLockedForHeadless
                 }
 
-                return try await client.getSystemConfig()
+                let readback: GLKVMSystemConfig
+                do { readback = try await client.getSystemConfig() }
+                catch {
+                    if enabled {
+                        _ = try await self.disableInterruptedHeadlessJiggler(
+                            client: client, deviceID: deviceID, generation: generation, config: current
+                        )
+                    }
+                    throw error
+                }
+                if enabled, try await self.disableInterruptedHeadlessJiggler(
+                    client: client, deviceID: deviceID, generation: generation, config: readback
+                ) {
+                    throw CancellationError()
+                }
+                return readback
             }
 
             guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
@@ -908,6 +969,32 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             }
             throw error
         }
+    }
+
+    private func disableInterruptedHeadlessJiggler(
+        client: GLKVMClient, deviceID: String, generation: Int, config: GLKVMSystemConfig
+    ) async throws -> Bool {
+        guard headlessConfigurationLockState.isLocked,
+              isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
+        // Sent firmware writes can outlive cancellation. Keep the mutation gate
+        // occupied until the non-cancelled recovery completes.
+        return try await Task { @MainActor in
+            guard self.headlessConfigurationLockState.isLocked,
+                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return false }
+            var disabledConfig = config
+            disabledConfig.mouseJiggle = false
+            _ = try await client.setSystemConfig(disabledConfig)
+            guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return true }
+            let disabled = try await client.getSystemConfig()
+            guard disabled.supportsMouseJiggle, !disabled.mouseJiggle else {
+                throw MouseJigglerError.readbackMismatch
+            }
+            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+               self.headlessConfigurationLockState.isLocked {
+                self.mouseJigglerEnabled = false
+            }
+            return true
+        }.value
     }
 
     func applySystemConfig(
@@ -983,8 +1070,44 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     func beginHeadlessConfigurationTransition() -> UUID {
+        if mouseJigglerResumeIntent == nil, mouseJigglerEnabled == true,
+           let client = glkvmClient, let deviceID = connectedDevice?.id {
+            mouseJigglerResumeIntent = MouseJigglerResumeIntent(
+                client: client, deviceID: deviceID, connectionGeneration: connectionGeneration
+            )
+        }
         configurationGeneration &+= 1
+        invalidateMouseJigglerRefresh()
         return headlessConfigurationLockState.beginTransition()
+    }
+
+    func pauseMouseJigglerForHeadless() async throws {
+        if mouseJigglerSupported == true {
+            try await setMouseJigglerEnabled(false, preservesResumeIntent: true)
+            guard mouseJigglerEnabled == false else { throw MouseJigglerError.readbackMismatch }
+        }
+    }
+
+    func resumeMouseJigglerAfterHeadless() async throws {
+        guard let intent = mouseJigglerResumeIntent else { return }
+        guard isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration) else {
+            mouseJigglerResumeIntent = nil
+            return
+        }
+        guard !headlessConfigurationLockState.isLocked else { return }
+        do {
+            try await setMouseJigglerEnabled(true, preservesResumeIntent: true)
+            if mouseJigglerResumeIntent?.id == intent.id { mouseJigglerResumeIntent = nil }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if mouseJigglerResumeIntent?.id == intent.id,
+               isCurrentConnection(client: intent.client, deviceID: intent.deviceID, generation: intent.connectionGeneration),
+               !headlessConfigurationLockState.isLocked {
+                mouseJigglerErrorMessage = "The KVM could not restore the mouse jiggler. Check its state before enabling it again."
+            }
+            throw error
+        }
     }
 
     func endHeadlessConfigurationTransition(_ owner: UUID) {
@@ -993,36 +1116,70 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
     func setHeadlessModeActive(_ isActive: Bool) {
         configurationGeneration &+= 1
+        invalidateMouseJigglerRefresh()
         headlessConfigurationLockState.setHeadlessModeActive(isActive)
     }
 
-    private func scheduleMouseJigglerRefresh(client: GLKVMClient, deviceID: String, generation: Int) {
+    private func invalidateMouseJigglerRefresh() {
+        mouseJigglerRefreshOwner = nil
         mouseJigglerRefreshTask?.cancel()
+        mouseJigglerRefreshTask = nil
+    }
+
+    private func scheduleMouseJigglerRefresh(client: GLKVMClient, deviceID: String, generation: Int) {
+        invalidateMouseJigglerRefresh()
+        let owner = UUID()
+        let configurationGeneration = configurationGeneration
+        mouseJigglerRefreshOwner = owner
         mouseJigglerRefreshTask = Task { [weak self] in
             guard let self else { return }
-            await self.refreshMouseJigglerState(client: client, deviceID: deviceID, generation: generation)
-            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) {
+            await self.refreshMouseJigglerState(
+                client: client, deviceID: deviceID, generation: generation,
+                configurationGeneration: configurationGeneration, owner: owner
+            )
+            if self.mouseJigglerRefreshOwner == owner {
+                self.mouseJigglerRefreshOwner = nil
                 self.mouseJigglerRefreshTask = nil
             }
         }
     }
 
-    private func refreshMouseJigglerState(client: GLKVMClient, deviceID: String, generation: Int) async {
-        do {
-            let config = try await systemConfigMutationGate.perform { [weak self] in
-                guard let self,
-                      self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
-                else {
-                    throw CancellationError()
+    private func refreshMouseJigglerState(
+        client: GLKVMClient, deviceID: String, generation: Int,
+        configurationGeneration expectedConfigurationGeneration: Int, owner: UUID
+    ) async {
+        func isCurrentRefresh() -> Bool {
+            !Task.isCancelled && mouseJigglerRefreshOwner == owner
+                && configurationGeneration == expectedConfigurationGeneration
+                && isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
+        }
+        for attempt in 0..<3 {
+            guard isCurrentRefresh() else { return }
+            do {
+                let config = try await systemConfigMutationGate.perform {
+                    guard isCurrentRefresh() else { throw CancellationError() }
+                    return try await client.getSystemConfig()
                 }
-                return try await client.getSystemConfig()
+                guard isCurrentRefresh() else { return }
+                mouseJigglerSupported = config.supportsMouseJiggle
+                mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
+                return
+            } catch {
+                guard isCurrentRefresh(), !(error is CancellationError) else { return }
+                let isTransportFailure: Bool
+                if case GLKVMClient.ClientError.transportFailed = error { isTransportFailure = true }
+                else if let urlError = error as? URLError {
+                    isTransportFailure = [.timedOut, .networkConnectionLost, .cannotConnectToHost,
+                        .cannotFindHost, .notConnectedToInternet].contains(urlError.code)
+                } else { isTransportFailure = false }
+                if isTransportFailure, attempt < 2 {
+                    do { try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 100_000_000) }
+                    catch { return }
+                    continue
+                }
+                mouseJigglerEnabled = nil
+                return
             }
-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
-            mouseJigglerSupported = config.supportsMouseJiggle
-            mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
-        } catch {
-            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
-            mouseJigglerEnabled = nil
         }
     }
 
@@ -1035,8 +1192,9 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     private func clearConnectedDevice() {
         connectionGeneration &+= 1
         configurationGeneration &+= 1
-        mouseJigglerRefreshTask?.cancel()
-        mouseJigglerRefreshTask = nil
+        invalidateMouseJigglerRefresh()
+        mouseJigglerResumeIntent = nil
+        mouseJigglerErrorMessage = nil
         mouseJigglerEnabled = nil
         mouseJigglerSupported = nil
         mouseJigglerOperationState.reset()

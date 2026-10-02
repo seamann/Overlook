@@ -444,6 +444,9 @@ struct ContentView: View {
         .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
+            if let message { connectionErrorMessage = message }
+        }
         .onDisappear {
             inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
         }
@@ -744,14 +747,12 @@ struct ContentView: View {
             defer {
                 kvmDeviceManager.endHeadlessConfigurationTransition(lockOwner)
                 isChangingControlMode = false
+                if controlModeStore.mode == .manual {
+                    controlModeStore.resumeManualCaptureIfNeeded()
+                }
             }
             do {
-                if kvmDeviceManager.mouseJigglerSupported == true {
-                    try await kvmDeviceManager.setMouseJigglerEnabled(false)
-                    guard kvmDeviceManager.mouseJigglerEnabled == false else {
-                        throw MouseJigglerError.readbackMismatch
-                    }
-                }
+                try await kvmDeviceManager.pauseMouseJigglerForHeadless()
                 guard kvmDeviceManager.glkvmClient === expectedClient,
                       !sessionCoordinator.isConnecting else { return }
                 isOCRModeEnabled = false
