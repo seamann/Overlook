@@ -2,7 +2,8 @@
 
 Stand: 2. Oktober 2026. Ergebnis: Die tatsächlich verwendeten nativen Swift-
 und Objective-C-Pfade kompilieren, linken und bestehen ihre lokalen Tests mit
-M154. Eine Freigabe für den laufenden KVM-Betrieb ist damit noch nicht erfolgt.
+M154. Auch der vollständige reguläre Xcode-Release-Build besteht inzwischen
+mit gültiger App- und Framework-Signatur. Die Geräteabnahme steht noch aus.
 Der normale Reparaturstand und `/Applications/Overlook.app` verwenden M109.
 Der M109-Reparaturbuild wurde inzwischen signiert und nach Freigabe installiert;
 M154 ist weiterhin ausschließlich dieser getrennte Versuch.
@@ -31,8 +32,9 @@ am Projekt ist bewusst auf zwei Dateien begrenzt:
 - `project.pbxproj`: `kind = exactVersion`, `version = 154.0.0` statt Bereich ab 109.0.1.
 - `Package.resolved`: 154.0.0 mit live verifizierter Git-Revision
   `0c0ad84dac6c1941c16a414dfcfba94691866e4c`. Der alte `originHash` wurde
-  entfernt, da er die alte Package-Anforderung beschreibt; der normale
-  SwiftPM-/Xcode-Resolver kann ihn nach der Lizenzbestätigung neu erzeugen.
+  entfernt, da er die alte Package-Anforderung beschreibt. Der normale
+  Xcode-Resolver hat den exakten neuen Pin aufgelöst, ohne diese Datei beim
+  erfolgreichen Release-Build erneut zu ändern.
 
 [WebRTC 154.0.0](https://github.com/stasel/WebRTC/releases/tag/154.0.0),
 [Package.swift des Tags](https://github.com/stasel/WebRTC/blob/154.0.0/Package.swift)
@@ -91,14 +93,30 @@ Logs, Testprogramme, Snapshot-Nachweis und Paketchecks liegen unter
 `/Users/doebber/.codex/artifacts/overlook-review-2026-10-02/webrtc154-spike`.
 `webrtc154-exact-pin.patch` enthält ausschließlich die zwei Paketänderungen.
 
-## Noch erforderliche Abnahme
+## Vollständiger signierter Release-Build
 
 Der frühere reguläre M154-Buildversuch endete mit Exit 69 an der damals
-fehlenden Apple-Lizenz. Lizenz und First-Launch sind inzwischen regulär
-abgeschlossen; der vollständige signierte M109-Build besteht. Ein neuer
-vollständiger signierter M154-Build wurde nach dem finalen Sync noch nicht
-ausgeführt. Die bisherigen nativen M154-Proben ersetzen diesen Build und die
-Abnahme an Janus beziehungsweise der echten KVM-Hardware nicht.
+fehlenden Apple-Lizenz. Nach regulärer Lizenzbestätigung und First-Launch
+besteht jetzt auch der vollständige M154-Release-Build mit Xcode 27.0
+(27A266a), SDK `macosx27.0` und macOS-14-Target. App und WebRTC.framework
+sind mit derselben Apple-Development-Identität wie die installierte App
+signiert, Team `PZWNQ5R725`. `codesign --verify --deep --strict` besteht.
+
+Der Build aus Commit `bc9bec046c623209c3db7cb4ce69ae5b518f7ebb` hat Build-ID
+`bc9bec046c62-ca99916fd08f4b4e-devsigned`, Quellfingerabdruck
+`ca99916fd08f4b4e820e25cf2baf80df41dd19248ac789778c7443233b518aa2`
+und Executable-SHA-256
+`7266bf8902f2697fae85e7c6b1b0a14de178a999965917bd2eca4ad83fb6f085`.
+Der Fingerabdruck vor und nach dem Build ist gleich; `Package.resolved`
+und der isolierte Checkout bestätigen exakt WebRTC 154.0.0 bei
+`0c0ad84dac6c1941c16a414dfcfba94691866e4c`.
+
+[Buildprotokoll](/Users/doebber/.codex/artifacts/overlook-review-2026-10-02/release-m154-final/build.log)
+und [Buildmanifest](/Users/doebber/.codex/artifacts/overlook-review-2026-10-02/release-m154-final/build-manifest.txt)
+liegen beim getrennten Artefakt. Die App wurde weder gestartet noch installiert.
+Der Build belegt keine Janus-Verbindung oder Audio-I/O am Gerät.
+
+## Noch erforderliche Abnahme
 
 Der finale installierte M109-Quellstand mit Digest
 `cec381b605626fa030589e7207cd0eb3730cb12aee88b1112fa848640dad3445`
@@ -106,26 +124,24 @@ ist übernommen, einschließlich der späteren Korrektur der kalten
 Fensteranbindung. Unter den 113 gemeinsamen Dateien unterscheiden sich nur
 die beiden Paketpins; drei eigene Probe-/Script-/Berichtsdateien bleiben
 zusätzlich erhalten. Die zuvor mit beiden Frameworks ausgeführten 39 nativen
-Fälle bleiben als lokale Kompatibilitätsnachweise dokumentiert. Für den
-nachfolgenden Sync wird keine erneute M154-Build- oder Hardware-Abnahme
-behauptet. In dieser Reihenfolge weiterprüfen:
+Fälle bleiben als lokale Kompatibilitätsnachweise dokumentiert; der anschließende
+reguläre Release-Build enthält auch den finalen Fensterfix. Die vollständige
+Swift-Regression des gemeinsamen M109-Reparaturstandes ist mit Xcode 27
+bestanden. In dieser Reihenfolge weiterprüfen:
 
-1. Regulär mit Xcode bauen und den exakt aufgelösten 154.0.0-Stand im
-   `Package.resolved` kontrollieren. Normale Unit-, Integrations- und MCP-Tests
-   erneut ausführen.
-2. Einen getrennten Test-Build gegen echte GLKVM-Hardware öffnen. Janus-Login,
+1. Den getrennten M154-Test-Build gegen echte GLKVM-Hardware öffnen. Janus-Login,
    SDP-Offer/Answer, ICE und ersten Frame kontrollieren; die Produktions-App
    erst nach bestandener Abnahme ersetzen.
-3. Video bei üblichen Auflösungen, Vollbild und längerer Nutzung prüfen.
+2. Video bei üblichen Auflösungen, Vollbild und längerer Nutzung prüfen.
    Native Snapshots, Crop, Rotation und Fehler bei unterbrochenem Stream
    über den tatsächlichen Agent-Control-Pfad bestätigen.
-4. Audio-Ausgabe mit Standardgerät und gewähltem Gerät prüfen. Mikrofon erst
+3. Audio-Ausgabe mit Standardgerät und gewähltem Gerät prüfen. Mikrofon erst
    bei bewusstem Einschalten testen; anschließend Ausschalten, Device-Wechsel
    und keine fortgesetzte Aufnahme kontrollieren.
-5. Disconnect, Reconnect, kurze Netzwerkunterbrechung und Wechsel des KVM-
+4. Disconnect, Reconnect, kurze Netzwerkunterbrechung und Wechsel des KVM-
    Endpunkts testen. Statistik und Snapshot dürfen keine Daten der vorherigen
    Verbindung zeigen.
-6. Verhalten und Ressourcenverbrauch mit dem gesicherten M109-Build
+5. Verhalten und Ressourcenverbrauch mit dem gesicherten M109-Build
    vergleichen. Bei einer Abweichung den M109-Build weiterverwenden.
 
 Der Versuch ist für diese nächste Abnahme vorbereitet. M154 bleibt bis dahin
