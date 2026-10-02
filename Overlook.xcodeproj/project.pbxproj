@@ -38,6 +38,7 @@
 		01000026 /* SessionConnectionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000028 /* SessionConnectionCoordinator.swift */; };
 		01000027 /* LocalInputCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000029 /* LocalInputCapture.swift */; };
 		01000028 /* FrameDeliveryState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002A /* FrameDeliveryState.swift */; };
+		01000029 /* MainWindowLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002B /* MainWindowLifecycle.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -76,6 +77,7 @@
 		02000028 /* SessionConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionConnectionCoordinator.swift; sourceTree = "<group>"; };
 		02000029 /* LocalInputCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInputCapture.swift; sourceTree = "<group>"; };
 		0200002A /* FrameDeliveryState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FrameDeliveryState.swift; sourceTree = "<group>"; };
+		0200002B /* MainWindowLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowLifecycle.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -110,6 +112,7 @@
 				02000026 /* RemoteActionState.swift */,
 				02000029 /* LocalInputCapture.swift */,
 				0200002A /* FrameDeliveryState.swift */,
+				0200002B /* MainWindowLifecycle.swift */,
 				02000028 /* SessionConnectionCoordinator.swift */,
 				02000027 /* KVMDevice.swift */,
 				02000019 /* ContentControlBar.swift */,
@@ -232,6 +235,7 @@
 				01000024 /* RemoteActionState.swift in Sources */,
 				01000027 /* LocalInputCapture.swift in Sources */,
 				01000028 /* FrameDeliveryState.swift in Sources */,
+				01000029 /* MainWindowLifecycle.swift in Sources */,
 				01000026 /* SessionConnectionCoordinator.swift in Sources */,
 				01000025 /* KVMDevice.swift in Sources */,
 				0100001A /* ContentControlBar.swift in Sources */,

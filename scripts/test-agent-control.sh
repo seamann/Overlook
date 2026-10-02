@@ -37,6 +37,7 @@ if [[ "$suite" != mcp ]]; then
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
     Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
   run_swift StatsGeneration Overlook/FrameDeliveryState.swift tests/StatsGenerationTests.swift
+  run_swift MainWindowLifecycle Overlook/MainWindowLifecycle.swift tests/MainWindowLifecycleTests.swift
   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     Overlook/KVMDevice.swift Overlook/SessionConnectionCoordinator.swift tests/SessionConnectionCoordinatorTests.swift

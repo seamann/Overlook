@@ -901,11 +901,18 @@ struct ContentView: View {
 private struct WindowReferenceSetter: NSViewRepresentable {
     @Binding var window: NSWindow?
 
-    func makeNSView(context: Context) -> NSView {
-        NSView(frame: .zero)
+    func makeNSView(context: Context) -> MainWindowAttachmentView {
+        let view = MainWindowAttachmentView(frame: .zero)
+        let binding = $window
+        view.onWindowAttached = { attachedWindow in
+            DispatchQueue.main.async {
+                if binding.wrappedValue !== attachedWindow { binding.wrappedValue = attachedWindow }
+            }
+        }
+        return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
+    func updateNSView(_ nsView: MainWindowAttachmentView, context: Context) {
         guard let w = nsView.window else { return }
         if window !== w {
             DispatchQueue.main.async {
@@ -922,22 +929,16 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> NSView {
-        NSView(frame: .zero)
+    func makeNSView(context: Context) -> MainWindowAttachmentView {
+        let view = MainWindowAttachmentView(frame: .zero)
+        let coordinator = context.coordinator
+        view.onWindowAttached = { coordinator.attach(to: $0) }
+        return view
     }
 
-    func updateNSView(_ nsView: NSView, context: Context) {
+    func updateNSView(_ nsView: MainWindowAttachmentView, context: Context) {
         guard let window = nsView.window else { return }
-
-        if context.coordinator.didConfigureWindow == false {
-            context.coordinator.didConfigureWindow = true
-            let coordinator = context.coordinator
-            DispatchQueue.main.async {
-                window.titlebarAppearsTransparent = false
-                window.styleMask.remove(.fullSizeContentView)
-                coordinator.attach(to: window)
-            }
-        }
+        context.coordinator.attach(to: window)
 
         guard let videoSize, videoSize.width > 0, videoSize.height > 0 else {
             if context.coordinator.lastAspect != nil {
@@ -983,7 +984,6 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
     final class Coordinator: NSObject {
         var lastAspect: NSSize?
         var didInitialResizeForAspect: Bool = false
-        var didConfigureWindow: Bool = false
 
         weak var window: NSWindow?
         weak var forwardedDelegate: NSWindowDelegate?
@@ -994,21 +994,26 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
         private var storedWindowedTitleVisibility: NSWindow.TitleVisibility?
         private var storedWindowedToolbarIsVisible: Bool?
 
-        func attach(to window: NSWindow) {
+        @MainActor func attach(to window: NSWindow) {
             if self.window === window {
                 return
             }
 
+            if let previous = self.window, previous.delegate === self {
+                previous.delegate = forwardedDelegate
+            }
+
             self.window = window
+            window.titlebarAppearsTransparent = false
+            window.styleMask.remove(.fullSizeContentView)
+            MainWindowLifecycle.register(window)
             forwardedDelegate = window.delegate
             window.delegate = self
 
-            if storedWindowedTitlebarAppearsTransparent == nil {
-                storedWindowedTitlebarAppearsTransparent = window.titlebarAppearsTransparent
-                storedWindowedStyleMaskHadFullSizeContentView = window.styleMask.contains(.fullSizeContentView)
-                storedWindowedTitleVisibility = window.titleVisibility
-                storedWindowedToolbarIsVisible = window.toolbar?.isVisible
-            }
+            storedWindowedTitlebarAppearsTransparent = window.titlebarAppearsTransparent
+            storedWindowedStyleMaskHadFullSizeContentView = window.styleMask.contains(.fullSizeContentView)
+            storedWindowedTitleVisibility = window.titleVisibility
+            storedWindowedToolbarIsVisible = window.toolbar?.isVisible
         }
 
         private func applyFullscreenChrome(window: NSWindow) {
@@ -1065,6 +1070,10 @@ private struct WindowAspectRatioSetter: NSViewRepresentable {
 }
 
 extension WindowAspectRatioSetter.Coordinator: NSWindowDelegate {
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        MainWindowLifecycle.shouldClose(sender, forwardingTo: forwardedDelegate)
+    }
+
     override func responds(to aSelector: Selector!) -> Bool {
         if super.responds(to: aSelector) {
             return true
