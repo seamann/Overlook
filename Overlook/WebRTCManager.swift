@@ -96,6 +96,8 @@ class WebRTCManager: NSObject, ObservableObject {
     private var peerConnection: RTCPeerConnection?
     private var audioPeerConnection: RTCPeerConnection?
     private var videoTrack: RTCVideoTrack?
+    private var videoRenderer: SnapshotVideoRenderer?
+    private let snapshotProvider = RemoteSnapshotProvider()
     private var localAudioTrack: RTCAudioTrack?
     private var localAudioSender: RTCRtpSender?
     private var dataChannel: RTCDataChannel?
@@ -157,6 +159,34 @@ class WebRTCManager: NSObject, ObservableObject {
 
     private var isFrameCaptureEnabled: Bool = false
     private var lastFrameCaptureTime: CFTimeInterval = 0
+
+    /// Identifies the current video source; reconnects invalidate earlier snapshots.
+    var snapshotSourceID: String { snapshotProvider.sourceID }
+    var snapshotEndpointID: String? { snapshotProvider.endpointID }
+
+    var snapshotReady: Bool {
+        isConnected && !isConnecting && !isStreamStalled && snapshotProvider.isReady
+    }
+
+    func captureRemoteSnapshot(region: SnapshotRegion? = nil) async throws -> RemoteSnapshot {
+        guard snapshotReady else { throw RemoteSnapshotError.notReady }
+        let sourceID = snapshotSourceID
+        let snapshot = try await snapshotProvider.capture(region: region)
+        try Task.checkCancellation()
+        guard sourceID == snapshotSourceID else { throw RemoteSnapshotError.sourceChanged }
+        guard snapshotReady else { throw RemoteSnapshotError.notReady }
+        return snapshot
+    }
+
+    private func invalidateSnapshotSource(endpointURL: URL? = nil) {
+        if let videoRenderer { videoTrack?.remove(videoRenderer) }
+        if let videoView { videoTrack?.remove(videoView) }
+        videoRenderer = nil
+        videoTrack = nil
+        snapshotProvider.resetSource(endpointURL: endpointURL)
+        currentFrame = nil
+        lastFrameCaptureTime = 0
+    }
     
     override init() {
         super.init()
@@ -311,7 +341,10 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     func connect(to device: KVMDevice) async throws {
-        connectionGeneration += 1
+        // Close the old transport before binding a new endpoint to its source.
+        tearDown(cancelReconnect: false)
+        invalidateSnapshotSource(endpointURL: URL(string: device.originURL))
+        let generation = connectionGeneration
         lastConnectedDevice = device
         setupWebRTC()
 
@@ -364,6 +397,7 @@ class WebRTCManager: NSObject, ObservableObject {
 
             if micEnabled {
                 let granted = await ensureMicrophoneAccess()
+                try requireCurrentConnection(generation)
                 if granted {
                     setupLocalMicrophoneTrackIfNeeded(factory: factory, peerConnection: audioPeerConnection ?? peerConnection)
                 }
@@ -374,11 +408,13 @@ class WebRTCManager: NSObject, ObservableObject {
             
             // Connect to signaling server
             try await connectToSignalingServer(device: device)
+            try requireCurrentConnection(generation)
             
             // Start connection quality monitoring
             startLatencyMonitoring()
             startStreamHealthMonitoring()
         } catch {
+            guard generation == connectionGeneration else { throw CancellationError() }
             let reason = "Connect failed: \(String(describing: error))"
             tearDown(cancelReconnect: false)
             lastDisconnectReason = reason
@@ -386,10 +422,18 @@ class WebRTCManager: NSObject, ObservableObject {
         }
     }
 
+    private func requireCurrentConnection(_ generation: Int) throws {
+        try Task.checkCancellation()
+        guard generation == connectionGeneration else { throw CancellationError() }
+    }
+
     func reconnect(to device: KVMDevice) async {
         tearDown(cancelReconnect: false)
         do {
             try await connect(to: device)
+        } catch is CancellationError {
+            // A newer connect owns state; do not overwrite its outcome.
+            return
         } catch {
             isConnecting = false
             lastDisconnectReason = "Reconnect failed: \(String(describing: error))"
@@ -402,16 +446,21 @@ class WebRTCManager: NSObject, ObservableObject {
         reconnectTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.reconnectTask = nil }
+            var expectedGeneration = self.connectionGeneration
             let delays: [UInt64] = [delayNanoseconds, 1_000_000_000, 2_000_000_000, 4_000_000_000]
             for delay in delays {
                 try? await Task.sleep(nanoseconds: delay)
-                guard !Task.isCancelled else { return }
-                self.tearDown(cancelReconnect: false)
+                guard !Task.isCancelled, expectedGeneration == self.connectionGeneration else { return }
                 self.lastDisconnectReason = reason
                 do {
                     try await self.connect(to: device)
                     return
+                } catch is CancellationError {
+                    return
                 } catch {
+                    // connect tears down once on entry and once on its own failure.
+                    guard self.connectionGeneration == expectedGeneration + 2 else { return }
+                    expectedGeneration = self.connectionGeneration
                     self.lastDisconnectReason = "\(reason) · retry failed: \(error.localizedDescription)"
                 }
             }
@@ -493,8 +542,10 @@ class WebRTCManager: NSObject, ObservableObject {
             "janus": "create",
             "transaction": createTransaction,
         ])
+        try requireCurrentConnection(generation)
 
         let createResponse = try await waitForJanusTransaction(createTransaction)
+        try requireCurrentConnection(generation)
         guard let data = createResponse["data"] as? [String: Any],
               let sessionId = data["id"] as? Int else {
             throw WebRTCError.signalingConnectionLost
@@ -509,8 +560,10 @@ class WebRTCManager: NSObject, ObservableObject {
             "transaction": attachTransaction,
             "session_id": sessionId,
         ])
+        try requireCurrentConnection(generation)
 
         let attachResponse = try await waitForJanusTransaction(attachTransaction)
+        try requireCurrentConnection(generation)
         guard let attachData = attachResponse["data"] as? [String: Any],
               let handleId = attachData["id"] as? Int else {
             throw WebRTCError.signalingConnectionLost
@@ -535,6 +588,7 @@ class WebRTCManager: NSObject, ObservableObject {
             "session_id": sessionId,
             "handle_id": handleId,
         ])
+        try requireCurrentConnection(generation)
 
         if (audioEnabled || micEnabled), let audioPeerConnection {
             let audioAttachTransaction = makeJanusTransaction()
@@ -545,8 +599,10 @@ class WebRTCManager: NSObject, ObservableObject {
                 "transaction": audioAttachTransaction,
                 "session_id": sessionId,
             ])
+            try requireCurrentConnection(generation)
 
             let audioAttachResponse = try await waitForJanusTransaction(audioAttachTransaction)
+            try requireCurrentConnection(generation)
             guard let audioAttachData = audioAttachResponse["data"] as? [String: Any],
                   let audioHandleId = audioAttachData["id"] as? Int else {
                 throw WebRTCError.signalingConnectionLost
@@ -570,6 +626,7 @@ class WebRTCManager: NSObject, ObservableObject {
                 "session_id": sessionId,
                 "handle_id": audioHandleId,
             ])
+            try requireCurrentConnection(generation)
 
             _ = audioPeerConnection
         }
@@ -771,6 +828,7 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     private func handleOfferSDP(_ sdpString: String, senderHandleId: Int?) async {
+        let generation = connectionGeneration
         guard let videoHandleId = janusHandleId else { return }
 
         let peerConnection: RTCPeerConnection?
@@ -792,21 +850,27 @@ class WebRTCManager: NSObject, ObservableObject {
         
         do {
             try await peerConnection.setRemoteDescription(sessionDescription)
+            try requireCurrentConnection(generation)
         } catch {
-            print("Failed to set remote description: \(error)")
+            if generation == connectionGeneration, !(error is CancellationError) {
+                print("Failed to set remote description")
+            }
+            return
         }
         
         // Create and send answer
-        await createAndSendAnswer(peerConnection: peerConnection, handleId: handleId)
+        await createAndSendAnswer(peerConnection: peerConnection, handleId: handleId, generation: generation)
     }
 
-    private func createAndSendAnswer(peerConnection: RTCPeerConnection, handleId: Int) async {
+    private func createAndSendAnswer(peerConnection: RTCPeerConnection, handleId: Int, generation: Int) async {
 
         do {
             let sessionDescription = try await peerConnection.answer(
                 for: RTCMediaConstraints(mandatoryConstraints: nil, optionalConstraints: nil)
             )
+            try requireCurrentConnection(generation)
             try await peerConnection.setLocalDescription(sessionDescription)
+            try requireCurrentConnection(generation)
         } catch {
             print("Failed to create/send answer: \(error)")
             return
@@ -1235,6 +1299,7 @@ class WebRTCManager: NSObject, ObservableObject {
     }
 
     private func tearDown(cancelReconnect: Bool) {
+        invalidateSnapshotSource()
         connectionGeneration += 1
         signalingListenerTask?.cancel()
         signalingListenerTask = nil
@@ -1379,6 +1444,7 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
             }
 
             isConnected = (stateChanged == .connected || stateChanged == .completed)
+            snapshotProvider.setReady(isConnected && videoTrack != nil, sourceID: snapshotSourceID)
             if isConnected {
                 isConnecting = false
                 hasEverConnectedToStream = true
@@ -1405,6 +1471,7 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
     
     func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCIceGatheringState) {
         Task { @MainActor in
+            guard peerConnection === self.peerConnection || peerConnection === self.audioPeerConnection else { return }
             print("ICE gathering state changed: \(stateChanged)")
 
             if stateChanged == .complete {
@@ -1427,6 +1494,7 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
     
     func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
         Task { @MainActor in
+            guard peerConnection === self.peerConnection || peerConnection === self.audioPeerConnection else { return }
             do {
                 if peerConnection === self.audioPeerConnection {
                     if let handleId = self.janusAudioHandleId {
@@ -1455,14 +1523,43 @@ extension WebRTCManager: @preconcurrency RTCPeerConnectionDelegate {
         }
     }
 
-    func peerConnection(_ peerConnection: RTCPeerConnection, didAdd rtpReceiver: RTCRtpReceiver, streams: [RTCMediaStream]) {
-        applyPlayoutDelayHintIfPossible()
+    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didAdd rtpReceiver: RTCRtpReceiver, streams: [RTCMediaStream]) {
         guard let track = rtpReceiver.track as? RTCVideoTrack else { return }
+        Task { @MainActor [weak self] in
+            guard let self, peerConnection === self.peerConnection else { return }
+            self.bindVideoTrack(track)
+        }
+    }
+
+    private func bindVideoTrack(_ track: RTCVideoTrack) {
+        applyPlayoutDelayHintIfPossible()
+        guard track !== videoTrack else { return }
+        if videoTrack != nil {
+            // Renegotiation can replace a track without replacing its peer.
+            invalidateSnapshotSource(endpointURL: lastConnectedDevice.flatMap { URL(string: $0.originURL) })
+        }
         videoTrack = track
         if let videoView {
             track.add(videoView)
         }
-        track.add(self)
+        let sourceID = snapshotSourceID
+        let renderer = SnapshotVideoRenderer(
+            sourceID: sourceID,
+            onFrame: { [weak self] frame, receivedAt in
+                Task { @MainActor in
+                    self?.acceptVideoFrame(frame, receivedAt: receivedAt, sourceID: sourceID)
+                }
+            },
+            onSize: { [weak self] size in
+                Task { @MainActor in
+                    guard let self, self.snapshotSourceID == sourceID else { return }
+                    if size.width > 0, size.height > 0 { self.videoSize = size }
+                }
+            }
+        )
+        videoRenderer = renderer
+        track.add(renderer)
+        snapshotProvider.setReady(isConnected, sourceID: sourceID)
     }
 }
 
@@ -1501,12 +1598,10 @@ extension WebRTCManager: @preconcurrency RTCDataChannelDelegate {
     }
  }
 
-// MARK: - RTCVideoRenderer
-extension WebRTCManager: @preconcurrency RTCVideoRenderer {
-    func renderFrame(_ frame: RTCVideoFrame?) {
-        guard let frame else { return }
-
-        let now = CACurrentMediaTime()
+// MARK: - Source-bound video observation
+extension WebRTCManager {
+    fileprivate func acceptVideoFrame(_ frame: SnapshotFrame?, receivedAt now: TimeInterval, sourceID: String) {
+        guard sourceID == snapshotSourceID else { return }
 
         setLastVideoFrameTime(now)
 
@@ -1521,16 +1616,21 @@ extension WebRTCManager: @preconcurrency RTCVideoRenderer {
             let dt = now - fpsWindowStartTime
             if dt > 0 {
                 let fps = Double(fpsFrameCount) / dt
-                Task { @MainActor in
-                    inboundFps = fps
-                }
+                inboundFps = fps
             }
             fpsWindowStartTime = now
             fpsFrameCount = 0
             lastFpsPublishTime = now
         }
 
-        guard isFrameCaptureEnabled else { return }
+        if let frame {
+            snapshotProvider.receive(frame)
+        } else {
+            snapshotProvider.receiveUnsupportedFrame(sourceID: sourceID, receivedAt: now)
+        }
+
+        // Interactive OCR remains independent from one-shot agent snapshots.
+        guard isFrameCaptureEnabled, let frame else { return }
 
         let minInterval: CFTimeInterval = 1.0 / 12.0
         if now - lastFrameCaptureTime < minInterval {
@@ -1538,20 +1638,37 @@ extension WebRTCManager: @preconcurrency RTCVideoRenderer {
         }
         lastFrameCaptureTime = now
 
-        if let cvBuffer = frame.buffer as? RTCCVPixelBuffer {
-            let pb = cvBuffer.pixelBuffer
-            Task { @MainActor in
-                currentFrame = pb
-            }
-        }
+        currentFrame = frame.pixelBuffer
     }
-    
+
+}
+
+/// Each renderer keeps the identity of the track to which it was attached.
+/// A late callback can never acquire the identity of a newer connection.
+private final class SnapshotVideoRenderer: NSObject, RTCVideoRenderer, @unchecked Sendable {
+    private let sourceID: String
+    private let onFrame: @Sendable (SnapshotFrame?, TimeInterval) -> Void
+    private let onSize: @Sendable (CGSize) -> Void
+
+    init(
+        sourceID: String,
+        onFrame: @escaping @Sendable (SnapshotFrame?, TimeInterval) -> Void,
+        onSize: @escaping @Sendable (CGSize) -> Void
+    ) {
+        self.sourceID = sourceID
+        self.onFrame = onFrame
+        self.onSize = onSize
+    }
+
+    func renderFrame(_ frame: RTCVideoFrame?) {
+        guard let frame else { return }
+        let receivedAt = ProcessInfo.processInfo.systemUptime
+        let captured = SnapshotNativeFrame.capture(frame, sourceID: sourceID, receivedAt: receivedAt)
+        onFrame(captured, receivedAt)
+    }
+
     func setSize(_ size: CGSize) {
-        Task { @MainActor in
-            if size.width > 0, size.height > 0 {
-                videoSize = size
-            }
-        }
+        onSize(size)
     }
 }
 
@@ -1583,8 +1700,16 @@ final class WebRTCManager: NSObject, ObservableObject {
     @Published var currentFrame: CVPixelBuffer?
     @Published var audioEnabled = false
     @Published var micEnabled = false
+    private(set) var snapshotSourceID = UUID().uuidString
+    var snapshotEndpointID: String? { nil }
+    var snapshotReady: Bool { false }
+
+    func captureRemoteSnapshot(region: SnapshotRegion? = nil) async throws -> RemoteSnapshot {
+        throw RemoteSnapshotError.notReady
+    }
     
     func connect(to device: KVMDevice) async throws {
+        snapshotSourceID = UUID().uuidString
         isConnected = false
     }
 
@@ -1596,6 +1721,7 @@ final class WebRTCManager: NSObject, ObservableObject {
     }
     
     func disconnect() {
+        snapshotSourceID = UUID().uuidString
         isConnected = false
         isConnecting = false
         hasEverConnectedToStream = false

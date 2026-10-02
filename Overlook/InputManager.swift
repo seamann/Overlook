@@ -15,64 +15,115 @@ class InputManager: ObservableObject {
     private var glkvmWebSocketClient: GLKVMClient.WebSocketClient?
     private var keyEventMonitor: Any?
     private var mouseEventMonitor: Any?
+    private(set) var localClipboardTransferTask: Task<Void, Never>?
     private var isCapturing = false
     private var mouseModeRefreshTask: Task<Void, Never>?
     private var hidCommandTail: Task<Void, Never>?
     private var hidReconnectTask: Task<Void, Never>?
     private var acceptsHIDCommands = true
+    private let localInputCapture: LocalInputCaptureContext
+    private let clipboardText: @MainActor () -> String?
+    private var localInputFocusObservers: [NSObjectProtocol] = []
+    private var keyboardCaptureGeneration = 0
+    private var mouseCaptureGeneration = 0
+    private var activePrintOperations = 0
+    private var activePrintDrainWaiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var transportID = UUID().uuidString
+    @Published private(set) var inputBlocked = false
 
-    private struct PendingAbsoluteMouseMove {
+    private struct PendingAbsoluteMouseMove: Equatable, Sendable {
         let toX: Int
         let toY: Int
     }
 
-    private struct PendingRelativeMouseMove {
+    private struct PendingRelativeMouseMove: Equatable, Sendable {
         var deltaX: Int
         var deltaY: Int
     }
 
-    private var pendingAbsoluteMouseMove: PendingAbsoluteMouseMove?
-    private var pendingRelativeMouseMove: PendingRelativeMouseMove?
-    private var mouseMoveSenderTask: Task<Void, Never>?
-    private static let mouseMoveSendIntervalNs: UInt64 = 8_333_333
+    private enum PendingMouseMoveCommand: Equatable, Sendable {
+        case absolute(PendingAbsoluteMouseMove)
+        case relative(PendingRelativeMouseMove)
+
+        func merged(with newer: PendingMouseMoveCommand) -> PendingMouseMoveCommand {
+            switch (self, newer) {
+            case (.relative(let oldMove), .relative(let newMove)):
+                return .relative(
+                    PendingRelativeMouseMove(
+                        deltaX: oldMove.deltaX + newMove.deltaX,
+                        deltaY: oldMove.deltaY + newMove.deltaY
+                    )
+                )
+            default:
+                return newer
+            }
+        }
+    }
+
+    private struct PendingMouseMoveCommandSnapshot: Sendable {
+        let move: PendingMouseMoveCommand
+        let mode: TransportMode
+        let ws: GLKVMClient.WebSocketClient?
+    }
+
+    private var mouseMoveBuffer = LatestMouseMoveCommandBuffer<PendingMouseMoveCommand>()
+    private var mouseMoveGeneration = 0
 
     private var pendingCommandKeyCode: UInt16?
     private var activeCommandKeyCode: UInt16?
     private var commandKeySentToRemote: Bool = false
     private var suppressedKeyUps: Set<UInt16> = []
     
-    @Published var isKeyboardCaptureEnabled = false
-    @Published var isMouseCaptureEnabled = false
+    @Published private(set) var isKeyboardCaptureEnabled = false
+    @Published private(set) var isMouseCaptureEnabled = false
     @Published private(set) var isLocalInputCaptureAllowed = true
     @Published private(set) var activityStatus = "Ready"
     @Published private(set) var lastInputError: String?
     @Published private(set) var hidStatus = "Disconnected"
 
-    enum TransportMode: String, CaseIterable {
+    enum TransportMode: String, CaseIterable, Sendable {
         case webRTC
         case glkvmWebSocket
     }
 
     @Published var transportMode: TransportMode = .glkvmWebSocket
     @Published private(set) var isGLKVMAbsoluteMouseMode = true
+
+    init(
+        inputFocusEnvironment: @escaping @MainActor () -> LocalInputFocusEnvironment = {
+            LocalInputFocusEnvironment.live()
+        },
+        clipboardText: @escaping @MainActor () -> String? = {
+            NSPasteboard.general.string(forType: .string)
+        }
+    ) {
+        localInputCapture = LocalInputCaptureContext(focusEnvironment: inputFocusEnvironment)
+        self.clipboardText = clipboardText
+        observeLocalInputFocusChanges()
+        installKeyboardMonitorIfNeeded()
+        refreshLocalInputFocus()
+    }
     
     func setup(with webRTCManager: WebRTCManager) {
         self.webRTCManager = webRTCManager
     }
 
     func setGLKVMClient(_ client: GLKVMClient?) {
+        guard glkvmClient !== client else { return }
         mouseModeRefreshTask?.cancel()
         mouseModeRefreshTask = nil
+        disconnectGLKVMWebSocket()
         glkvmClient = client
         isGLKVMAbsoluteMouseMode = true
-        pendingAbsoluteMouseMove = nil
-        pendingRelativeMouseMove = nil
+        stopMouseMoveSender()
         if client == nil {
-            disconnectGLKVMWebSocket()
             return
         }
+        let oldInputDrain = hidCommandTail
         Task { [weak self] in
-            await self?.reconnectGLKVMWebSocketIfNeeded()
+            await oldInputDrain?.value
+            guard let self, self.glkvmClient === client else { return }
+            await self.reconnectGLKVMWebSocketIfNeeded()
         }
         mouseModeRefreshTask = Task { [weak self, weak client] in
             guard let client else { return }
@@ -91,11 +142,11 @@ class InputManager: ObservableObject {
     func setGLKVMAbsoluteMouseMode(_ isAbsolute: Bool) {
         guard isGLKVMAbsoluteMouseMode != isAbsolute else { return }
         isGLKVMAbsoluteMouseMode = isAbsolute
-        pendingAbsoluteMouseMove = nil
-        pendingRelativeMouseMove = nil
+        stopMouseMoveSender()
     }
 
     func handleVideoMouseMove(pointInView: CGPoint, deltaInView: CGSize = .zero, viewSize: CGSize, videoSize: CGSize?) {
+        refreshLocalInputFocus()
         guard isMouseCaptureEnabled else { return }
         let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
         let moveEvent = MouseMoveEvent(position: normalized, delta: deltaInView, timestamp: CACurrentMediaTime())
@@ -113,10 +164,7 @@ class InputManager: ObservableObject {
     private func enqueueAbsoluteMouseMoveEvent(_ event: MouseMoveEvent) {
         guard isNormalized(event.position) else { return }
         let (toX, toY) = glkvmAbsolutePoint(fromNormalized: event.position)
-        pendingAbsoluteMouseMove = PendingAbsoluteMouseMove(toX: toX, toY: toY)
-        if mouseMoveSenderTask == nil {
-            startMouseMoveSender()
-        }
+        enqueueMouseMoveCommand(.absolute(PendingAbsoluteMouseMove(toX: toX, toY: toY)))
     }
 
     private func enqueueRelativeMouseMoveEvent(_ event: MouseMoveEvent) {
@@ -124,85 +172,103 @@ class InputManager: ObservableObject {
         let deltaY = Int(event.delta.height.rounded())
         guard deltaX != 0 || deltaY != 0 else { return }
 
-        if var pending = pendingRelativeMouseMove {
-            pending.deltaX += deltaX
-            pending.deltaY += deltaY
-            pendingRelativeMouseMove = pending
-        } else {
-            pendingRelativeMouseMove = PendingRelativeMouseMove(deltaX: deltaX, deltaY: deltaY)
-        }
+        enqueueMouseMoveCommand(.relative(PendingRelativeMouseMove(deltaX: deltaX, deltaY: deltaY)))
+    }
 
-        if mouseMoveSenderTask == nil {
-            startMouseMoveSender()
+    private func enqueueMouseMoveCommand(_ command: PendingMouseMoveCommand) {
+        let shouldSchedule = mouseMoveBuffer.enqueue(command) { oldCommand, newCommand in
+            oldCommand.merged(with: newCommand)
+        }
+        if shouldSchedule {
+            scheduleMouseMoveCommandIfNeeded()
         }
     }
 
-    private func startMouseMoveSender() {
-        guard mouseMoveSenderTask == nil else { return }
+    private func scheduleMouseMoveCommandIfNeeded() {
+        guard mouseMoveBuffer.hasScheduledMove else { return }
+        let generation = mouseMoveGeneration
+        let manager = self
 
-        let sendIntervalNs = Self.mouseMoveSendIntervalNs
-
-        mouseMoveSenderTask = Task.detached(priority: .userInitiated) { [weak self] in
-            while !Task.isCancelled {
-                guard let self else { return }
-
-                let snapshot: (
-                    absoluteMove: PendingAbsoluteMouseMove?,
-                    relativeMove: PendingRelativeMouseMove?,
-                    isAbsoluteMouseMode: Bool,
-                    mode: TransportMode,
-                    ws: GLKVMClient.WebSocketClient?
-                ) = await MainActor.run {
-                    let absoluteMove = self.pendingAbsoluteMouseMove
-                    let relativeMove = self.pendingRelativeMouseMove
-                    self.pendingAbsoluteMouseMove = nil
-                    self.pendingRelativeMouseMove = nil
-                    return (
-                        absoluteMove,
-                        relativeMove,
-                        self.isGLKVMAbsoluteMouseMode,
-                        self.transportMode,
-                        self.glkvmWebSocketClient
-                    )
-                }
-
-                let hasMove = snapshot.isAbsoluteMouseMode ? snapshot.absoluteMove != nil : snapshot.relativeMove != nil
-                guard hasMove else {
-                    await MainActor.run {
-                        self.mouseMoveSenderTask = nil
-                    }
-                    return
-                }
-
-                if snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws {
-                    if snapshot.isAbsoluteMouseMode, let move = snapshot.absoluteMove {
-                        await MainActor.run {
-                            self.enqueueHIDCommand(label: "Mouse move") {
-                                try await ws.sendHidMouseMove(toX: move.toX, toY: move.toY)
-                            }
-                        }
-                    } else if let move = snapshot.relativeMove {
-                        await MainActor.run {
-                            self.enqueueHIDCommand(label: "Relative mouse move") {
-                                try await Self.sendRelativeMouseMove(move, through: ws)
-                            }
-                        }
-                    }
-                }
-
-                try? await Task.sleep(nanoseconds: sendIntervalNs)
+        enqueueHIDCommand(label: "Mouse move", completion: { [weak self] _ in
+            self?.finishMouseMoveCommand(generation: generation)
+        }, successFeedback: .errorsOnly, freezesPendingMouseMove: false) {
+            let snapshot = await MainActor.run {
+                manager.takeScheduledMouseMoveCommand(generation: generation)
             }
+            guard let snapshot, snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws else { return }
+
+            try await Self.sendMouseMoveCommand(snapshot.move, through: ws)
         }
+    }
+
+    private func takeScheduledMouseMoveCommand(generation: Int) -> PendingMouseMoveCommandSnapshot? {
+        refreshLocalInputFocus()
+        guard isMouseCaptureEnabled,
+              generation == mouseMoveGeneration,
+              let move = mouseMoveBuffer.takeScheduledMove()
+        else {
+            return nil
+        }
+
+        return PendingMouseMoveCommandSnapshot(
+            move: move,
+            mode: transportMode,
+            ws: glkvmWebSocketClient
+        )
+    }
+
+    private func finishMouseMoveCommand(generation: Int) {
+        guard generation == mouseMoveGeneration else { return }
+
+        if mouseMoveBuffer.finishCommand() {
+            scheduleMouseMoveCommandIfNeeded()
+        }
+    }
+
+    private func freezeMouseMovesForOrderedHIDCommand() {
+        guard mouseMoveBuffer.hasScheduledMove else { return }
+        mouseMoveBuffer.freezeScheduledMove()
+
+        guard let pendingMove = mouseMoveBuffer.takePendingMoveAfterFrozenCommand() else { return }
+        enqueueCapturedMouseMoveCommand(pendingMove, generation: mouseMoveGeneration)
+    }
+
+    private func enqueueCapturedMouseMoveCommand(_ command: PendingMouseMoveCommand, generation: Int) {
+        let manager = self
+        enqueueHIDCommand(
+            label: "Mouse move",
+            successFeedback: .errorsOnly,
+            freezesPendingMouseMove: false
+        ) {
+            let snapshot = await MainActor.run {
+                manager.mouseMoveSnapshot(for: command, generation: generation)
+            }
+            guard let snapshot, snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws else { return }
+
+            try await Self.sendMouseMoveCommand(snapshot.move, through: ws)
+        }
+    }
+
+    private func mouseMoveSnapshot(
+        for command: PendingMouseMoveCommand,
+        generation: Int
+    ) -> PendingMouseMoveCommandSnapshot? {
+        refreshLocalInputFocus()
+        guard isMouseCaptureEnabled, generation == mouseMoveGeneration else { return nil }
+        return PendingMouseMoveCommandSnapshot(
+            move: command,
+            mode: transportMode,
+            ws: glkvmWebSocketClient
+        )
     }
 
     private func stopMouseMoveSender() {
-        pendingAbsoluteMouseMove = nil
-        pendingRelativeMouseMove = nil
-        mouseMoveSenderTask?.cancel()
-        mouseMoveSenderTask = nil
+        mouseMoveGeneration &+= 1
+        mouseMoveBuffer.invalidate()
     }
 
     func handleVideoMouseButton(button: MouseButton, isDown: Bool, pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?) {
+        refreshLocalInputFocus()
         guard isMouseCaptureEnabled else { return }
         let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
         let buttonEvent = MouseButtonEvent(button: button, isDown: isDown, position: normalized, timestamp: CACurrentMediaTime())
@@ -210,12 +276,15 @@ class InputManager: ObservableObject {
     }
 
     func handleVideoMouseScroll(deltaX: CGFloat, deltaY: CGFloat) {
+        refreshLocalInputFocus()
         guard isMouseCaptureEnabled else { return }
         let scrollEvent = MouseScrollEvent(deltaX: deltaX, deltaY: deltaY, timestamp: CACurrentMediaTime())
         sendMouseScrollEvent(scrollEvent)
     }
 
     func setTransportMode(_ mode: TransportMode) {
+        guard transportMode != mode else { return }
+        transportID = UUID().uuidString
         transportMode = mode
         switch mode {
         case .webRTC:
@@ -229,88 +298,171 @@ class InputManager: ObservableObject {
     }
 
     func disconnectGLKVMWebSocket() {
+        transportID = UUID().uuidString
         stopMouseMoveSender()
         let ws = glkvmWebSocketClient
         glkvmWebSocketClient = nil
         hidStatus = "Disconnected"
         hidReconnectTask?.cancel()
         hidReconnectTask = nil
-        enqueueHIDCommand(label: "Release inputs") {
+        let priorCommands = hidCommandTail
+        let releaseTask = enqueueHIDCommand(label: "Release inputs") {
             try await ws?.releaseAllHIDInputs()
         }
-        Task { [weak self] in
-            await self?.hidCommandTail?.value
+        let pendingCommands = releaseTask ?? priorCommands
+        Task {
+            let transportAbort = await ws?.scheduleCurrentTransportAbort(after: 2_000_000_000)
+            await pendingCommands?.value
+            transportAbort?.cancel()
             await ws?.disconnect()
         }
     }
+
+    func disconnectInputForSession() async {
+        setSessionAvailable(false)
+        transportID = UUID().uuidString
+        stopMouseMoveSender()
+        mouseModeRefreshTask?.cancel()
+        mouseModeRefreshTask = nil
+        hidReconnectTask?.cancel()
+        hidReconnectTask = nil
+
+        let ws = glkvmWebSocketClient
+        glkvmWebSocketClient = nil
+        glkvmClient = nil
+        isGLKVMAbsoluteMouseMode = true
+        hidStatus = "Disconnected"
+
+        await waitForActivePrintOperationsToDrain()
+        let priorCommands = hidCommandTail
+        let releaseTask = enqueueHIDCommand(label: "Release inputs", completion: { [weak self] result in
+            if case .failure = result {
+                self?.latchUnconfirmedInput()
+            }
+        }) {
+            try await ws?.releaseAllHIDInputs()
+        }
+        let transportAbort = await ws?.scheduleCurrentTransportAbort(after: 2_000_000_000)
+        await (releaseTask ?? priorCommands)?.value
+        transportAbort?.cancel()
+        await ws?.disconnect()
+    }
+
+    func inputReadiness() async -> (text: Bool, mouse: Bool) {
+        let capturedTransport = transportID
+        let mouse = await glkvmWebSocketClient?.isConnected ?? false
+        guard capturedTransport == transportID else { return (false, false) }
+        return (glkvmClient != nil && !inputBlocked, mouse && !inputBlocked)
+    }
+
+    var controlEndpointID: String? {
+        guard let url = glkvmClient?.baseURL else { return nil }
+        return SnapshotEndpointIdentity.from(url)
+    }
     
     func startKeyboardCapture() {
-        guard isLocalInputCaptureAllowed else {
-            stopKeyboardCapture()
-            return
-        }
-        guard keyEventMonitor == nil else {
-            isCapturing = true
-            isKeyboardCaptureEnabled = true
-            return
-        }
-        
-        isCapturing = true
-        isKeyboardCaptureEnabled = true
-        
+        localInputCapture.keyboardRequested = true
+        installKeyboardMonitorIfNeeded()
+        refreshLocalInputFocus()
+    }
+
+    private func installKeyboardMonitorIfNeeded() {
+        guard keyEventMonitor == nil else { return }
         keyEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in
-            self?.handleKeyEvent(event)
-            guard let self, self.isKeyboardCaptureEnabled else { return event }
+            guard let self else { return event }
+            self.refreshLocalInputFocus()
+            guard self.localInputCapture.keyboardEventIsEligible(event) else { return event }
+            self.handleKeyEvent(event)
             return nil
         }
     }
     
     func stopKeyboardCapture() {
-        isKeyboardCaptureEnabled = false
-        
+        localInputCapture.keyboardRequested = false
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil
         }
-        
-        if !isMouseCaptureEnabled {
-            isCapturing = false
-        }
+        refreshLocalInputFocus()
     }
     
     func startMouseCapture() {
-        guard isLocalInputCaptureAllowed else {
-            stopMouseCapture()
-            return
-        }
-        isCapturing = true
-        isMouseCaptureEnabled = true
+        localInputCapture.mouseRequested = true
+        refreshLocalInputFocus()
     }
 
     func setLocalInputCaptureAllowed(_ allowed: Bool) {
-        isLocalInputCaptureAllowed = allowed
-        if allowed {
-            startFullInputCapture()
-        } else {
-            if let ws = glkvmWebSocketClient {
-                enqueueHIDCommand(label: "Local input released") {
-                    try await ws.releaseAllHIDInputs()
-                }
-            }
-            stopFullInputCapture()
+        guard isLocalInputCaptureAllowed != allowed else {
+            refreshLocalInputFocus()
+            return
         }
+        isLocalInputCaptureAllowed = allowed
+        localInputCapture.modeReady = allowed
+        refreshLocalInputFocus()
     }
     
     func stopMouseCapture() {
-        isMouseCaptureEnabled = false
-        
+        localInputCapture.mouseRequested = false
         if let monitor = mouseEventMonitor {
             NSEvent.removeMonitor(monitor)
             mouseEventMonitor = nil
         }
-        
-        if !isKeyboardCaptureEnabled {
-            isCapturing = false
+        refreshLocalInputFocus()
+    }
+
+    func setSessionAvailable(_ available: Bool) {
+        localInputCapture.sessionAvailable = available
+        refreshLocalInputFocus()
+    }
+
+    func setConnectionTransitioning(_ transitioning: Bool) {
+        localInputCapture.connectionTransitioning = transitioning
+        refreshLocalInputFocus()
+    }
+
+    func setLocalUIBlocked(_ blocked: Bool, owner: UUID) {
+        localInputCapture.setLocalUIBlocked(blocked, owner: owner)
+        refreshLocalInputFocus()
+    }
+
+    func registerRemoteInputSurface(_ surface: NSView) {
+        localInputCapture.registerRemoteInputSurface(surface)
+        refreshLocalInputFocus()
+    }
+
+    func unregisterRemoteInputSurface(_ surface: NSView) {
+        localInputCapture.unregisterRemoteInputSurface(surface)
+        refreshLocalInputFocus()
+    }
+
+    func refreshLocalInputFocus() {
+        localInputCapture.inputBlocked = inputBlocked
+        let previous = LocalInputCaptureDecision(
+            keyboardEnabled: isKeyboardCaptureEnabled,
+            mouseEnabled: isMouseCaptureEnabled
+        )
+        let next = localInputCapture.decision()
+        guard previous != next else { return }
+
+        if previous.keyboardEnabled && !next.keyboardEnabled {
+            keyboardCaptureGeneration &+= 1
+            clearPendingCommandKey()
+            suppressedKeyUps.removeAll()
+        }
+        if previous.mouseEnabled && !next.mouseEnabled {
+            mouseCaptureGeneration &+= 1
+            stopMouseMoveSender()
+        }
+
+        isKeyboardCaptureEnabled = next.keyboardEnabled
+        isMouseCaptureEnabled = next.mouseEnabled
+        isCapturing = next.keyboardEnabled || next.mouseEnabled
+
+        if LocalInputCapturePolicy.revoked(from: previous, to: next),
+           let ws = glkvmWebSocketClient {
+            enqueueHIDCommand(label: "Local input released") {
+                try await ws.releaseAllHIDInputs()
+            }
         }
     }
     
@@ -352,7 +504,7 @@ class InputManager: ObservableObject {
                     pendingCommandKeyCode = nil
                     commandKeySentToRemote = true
 
-                    enqueueHIDCommand(label: "Key combination") {
+                    enqueueLocalKeyboardHIDCommand(label: "Key combination") {
                         try await ws.sendHidKey(key: metaKey, state: true)
                         try await ws.sendHidKey(key: keyName, state: true)
                     }
@@ -430,7 +582,7 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient,
            let code = activeCommandKeyCode,
            let metaKey = glkvmKeyForMacKeyCode(code) {
-            enqueueHIDCommand(label: "Modifier released") {
+            enqueueLocalKeyboardHIDCommand(label: "Modifier released") {
                 try await ws.sendHidKey(key: metaKey, state: false)
             }
         }
@@ -462,20 +614,43 @@ class InputManager: ObservableObject {
     }
 
     private func pasteClipboardToRemote() {
-        guard let text = NSPasteboard.general.string(forType: .string) else { return }
+        guard let text = clipboardText() else { return }
         guard !text.isEmpty else { return }
+        let authorization = makeLocalKeyboardAuthorization()
 
-        Task { [weak self] in
+        localClipboardTransferTask = Task { [weak self] in
+            guard let self else { return }
             do {
-                try await self?.sendTextToRemote(text)
+                try await self.sendTextToRemote(text, authorization: authorization)
+            } catch RemoteTextInputError.authorizationExpired {
+                // Focus or mode changed before the asynchronous paste could dispatch.
             } catch {
-                self?.lastInputError = error.localizedDescription
-                self?.activityStatus = "Clipboard transfer failed"
+                self.lastInputError = error.localizedDescription
+                self.activityStatus = "Clipboard transfer failed"
             }
         }
     }
 
-    func sendTextToRemote(_ text: String) async throws {
+    func makeLocalKeyboardAuthorization() -> @MainActor @Sendable () -> Bool {
+        let captureGeneration = keyboardCaptureGeneration
+        return { [weak self] in
+            guard let self else { return false }
+            self.refreshLocalInputFocus()
+            return self.isKeyboardCaptureEnabled
+                && self.keyboardCaptureGeneration == captureGeneration
+        }
+    }
+
+    func sendTextToRemote(
+        _ text: String,
+        authorization: @escaping @MainActor @Sendable () -> Bool = { true },
+        willDispatch: @escaping @MainActor @Sendable () throws -> Void = {}
+    ) async throws {
+        try Task.checkCancellation()
+        guard !inputBlocked else { throw RemoteActionError.inputBlocked }
+        guard authorization() else {
+            throw RemoteTextInputError.authorizationExpired
+        }
         guard let client = glkvmClient else {
             throw RemoteTextInputError.notConnected
         }
@@ -485,37 +660,194 @@ class InputManager: ObservableObject {
         }
 
         let keymap: String? = try? await client.getSystemConfig().keymap
-        try await client.hidPrint(text: text, keymap: keymap)
+        try Task.checkCancellation()
+        guard authorization(), glkvmClient === client, !inputBlocked else {
+            throw RemoteTextInputError.authorizationExpired
+        }
+        try willDispatch()
+        beginPrintOperation()
+        defer { finishPrintOperation() }
+        do {
+            try await client.hidPrint(text: text, keymap: keymap)
+            try Task.checkCancellation()
+        } catch {
+            latchUnconfirmedInput()
+            throw error
+        }
         activityStatus = "Text sent (\(text.count) characters)"
         lastInputError = nil
     }
 
-    func sendCodexClick(signedX: Int, signedY: Int) async throws {
-        guard transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient else {
+    private func beginPrintOperation() {
+        activePrintOperations += 1
+    }
+
+    private func finishPrintOperation() {
+        precondition(activePrintOperations > 0)
+        activePrintOperations -= 1
+        guard activePrintOperations == 0 else { return }
+        let waiters = activePrintDrainWaiters
+        activePrintDrainWaiters = []
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitForActivePrintOperationsToDrain() async {
+        guard activePrintOperations > 0 else { return }
+        await withCheckedContinuation { continuation in
+            activePrintDrainWaiters = activePrintDrainWaiters + [continuation]
+        }
+    }
+
+    func sendCodexShortcut(
+        keys: [String],
+        authorization: @escaping @MainActor @Sendable () -> Bool = { true },
+        willDispatch: @escaping @MainActor @Sendable () throws -> Void = {}
+    ) async throws {
+        try Task.checkCancellation()
+        guard !inputBlocked else { throw RemoteActionError.inputBlocked }
+        guard authorization() else {
+            throw RemoteTextInputError.authorizationExpired
+        }
+        guard RemoteShortcutPolicy.accepts(keys) else {
+            throw RemoteTextInputError.invalidShortcut
+        }
+        guard let client = glkvmClient else {
             throw RemoteTextInputError.notConnected
         }
+
+        try willDispatch()
+        do {
+            try await client.sendHidShortcut(keys: keys)
+            try Task.checkCancellation()
+        } catch {
+            latchUnconfirmedInput()
+            throw error
+        }
+        activityStatus = "Shortcut sent (\(keys.joined(separator: "+")))"
+        lastInputError = nil
+    }
+
+    func sendCodexClick(
+        signedX: Int,
+        signedY: Int,
+        authorization: @escaping @MainActor @Sendable () -> Bool = { true },
+        willDispatch: @escaping @MainActor @Sendable () throws -> Void = {}
+    ) async throws {
         let x = Self.clampInt(signedX, min: -32_767, max: 32_767)
         let y = Self.clampInt(signedY, min: -32_767, max: 32_767)
-        try await withCheckedThrowingContinuation { continuation in
-            enqueueHIDCommand(label: "Codex click", completion: { result in
-                continuation.resume(with: result)
-            }) {
-                try await ws.sendHidMouseMove(toX: x, toY: y)
-                try await ws.sendHidMouseButton(button: "left", state: true)
-                do {
-                    try await Task.sleep(nanoseconds: 50_000_000)
-                    try await ws.sendHidMouseButton(button: "left", state: false)
-                } catch {
-                    try? await ws.sendHidMouseButton(button: "left", state: false)
-                    throw error
-                }
+        try await sendRemoteMouseGesture(
+            label: "Codex click", authorization: authorization, willDispatch: willDispatch
+        ) { ws in
+            try await ws.sendHidMouseMove(toX: x, toY: y)
+            try Task.checkCancellation()
+            guard await authorization() else { throw RemoteTextInputError.authorizationExpired }
+            try await RemoteGestureCleanup.perform(
+                press: { try await ws.sendHidMouseButton(button: "left", state: true) },
+                body: { try await Task.sleep(nanoseconds: 50_000_000) },
+                release: { try await ws.sendHidMouseButton(button: "left", state: false) }
+            )
+        }
+    }
+
+    func performRemoteAction(
+        _ action: RemoteActionCommand, width: Int, height: Int,
+        authorization: @escaping @MainActor @Sendable () -> Bool,
+        willDispatch: @escaping @MainActor @Sendable () throws -> Void
+    ) async throws {
+        try action.validate(width: width, height: height)
+        switch action {
+        case .text(let text):
+            try await sendTextToRemote(text, authorization: authorization, willDispatch: willDispatch)
+        case .shortcut(let keys):
+            try await sendCodexShortcut(keys: keys, authorization: authorization, willDispatch: willDispatch)
+        case .click(let x, let y):
+            try await sendCodexClick(signedX: RemoteActionCommand.signedHID(pixel: x, extent: width),
+                                    signedY: RemoteActionCommand.signedHID(pixel: y, extent: height),
+                                    authorization: authorization, willDispatch: willDispatch)
+        case .scroll(let x, let y, let delta):
+            try await sendRemoteMouseGesture(label: "Codex scroll", authorization: authorization, willDispatch: willDispatch) { ws in
+                try await ws.sendHidMouseMove(toX: RemoteActionCommand.signedHID(pixel: x, extent: width),
+                                            toY: RemoteActionCommand.signedHID(pixel: y, extent: height))
+                try Task.checkCancellation()
+                guard await authorization() else { throw RemoteTextInputError.authorizationExpired }
+                try await ws.sendHidMouseWheel(deltaX: 0, deltaY: delta)
+            }
+        case .drag(let x, let y, let toX, let toY, let duration):
+            try await sendRemoteMouseGesture(label: "Codex drag", authorization: authorization, willDispatch: willDispatch) { ws in
+                try await ws.sendHidMouseMove(toX: RemoteActionCommand.signedHID(pixel: x, extent: width),
+                                            toY: RemoteActionCommand.signedHID(pixel: y, extent: height))
+                try Task.checkCancellation()
+                guard await authorization() else { throw RemoteTextInputError.authorizationExpired }
+                let steps = max(2, min(40, duration / 50))
+                try await RemoteGestureCleanup.perform(
+                    press: { try await ws.sendHidMouseButton(button: "left", state: true) },
+                    body: {
+                        for step in 1...steps {
+                            try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000 / steps))
+                            guard await authorization() else { throw RemoteTextInputError.authorizationExpired }
+                            let px = x + (toX - x) * step / steps
+                            let py = y + (toY - y) * step / steps
+                            try await ws.sendHidMouseMove(toX: RemoteActionCommand.signedHID(pixel: px, extent: width),
+                                                        toY: RemoteActionCommand.signedHID(pixel: py, extent: height))
+                        }
+                    },
+                    release: { try await ws.sendHidMouseButton(button: "left", state: false) }
+                )
             }
         }
     }
 
-    enum RemoteTextInputError: LocalizedError {
+    private func sendRemoteMouseGesture(
+        label: String,
+        authorization: @escaping @MainActor @Sendable () -> Bool,
+        willDispatch: @escaping @MainActor @Sendable () throws -> Void,
+        operation: @escaping @Sendable (GLKVMClient.WebSocketClient) async throws -> Void
+    ) async throws {
+        try Task.checkCancellation()
+        guard !inputBlocked else { throw RemoteActionError.inputBlocked }
+        guard authorization() else { throw RemoteTextInputError.authorizationExpired }
+        guard transportMode == .glkvmWebSocket, isGLKVMAbsoluteMouseMode, let ws = glkvmWebSocketClient else {
+            throw RemoteTextInputError.notConnected
+        }
+        let expectedTransport = transportID
+        let cancellationHandle = HIDCommandCancellationHandle()
+        let commandContinuation = CancellableCommandContinuation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                commandContinuation.install(continuation)
+                let task = enqueueHIDCommand(label: label, completion: { result in
+                    commandContinuation.resume(with: result)
+                }) { [weak self] in
+                    try Task.checkCancellation()
+                    try await MainActor.run {
+                        guard let self, !self.inputBlocked, self.transportID == expectedTransport, authorization() else {
+                            throw RemoteTextInputError.authorizationExpired
+                        }
+                        try willDispatch()
+                    }
+                    do {
+                        try await operation(ws)
+                    } catch {
+                        if error as? RemoteActionError == .cleanupFailed {
+                            await MainActor.run { self?.latchUnconfirmedInput() }
+                        }
+                        throw error
+                    }
+                }
+                cancellationHandle.install(task)
+            }
+        } onCancel: {
+            cancellationHandle.cancel()
+            // The inner task owns completion: cancellation must not release the
+            // common mutation gate until bounded button-up cleanup has finished.
+        }
+    }
+
+    enum RemoteTextInputError: LocalizedError, Equatable {
         case notConnected
         case emptyText
+        case authorizationExpired
+        case invalidShortcut
 
         var errorDescription: String? {
             switch self {
@@ -523,8 +855,43 @@ class InputManager: ObservableObject {
                 return "GLKVM input is not connected."
             case .emptyText:
                 return "Enter text before sending."
+            case .authorizationExpired:
+                return "Headless authorization expired before remote input."
+            case .invalidShortcut:
+                return "Shortcut contains unsupported or too many keys."
             }
         }
+    }
+
+    private func latchUnconfirmedInput() {
+        inputBlocked = true
+        refreshLocalInputFocus()
+        activityStatus = "Input blocked: previous remote outcome is unknown"
+    }
+
+    /// Only the explicit Manual UI recovery calls this. It never changes the
+    /// control mode or upgrades an earlier unknown action to success.
+    func recoverInputAfterManualReview(
+        authorization: @escaping @MainActor @Sendable () -> Bool
+    ) async throws {
+        guard inputBlocked, isLocalInputCaptureAllowed, authorization() else { throw RemoteActionError.unauthorized }
+        let capturedTransport = transportID
+        let pending = hidCommandTail
+        try await RemoteGestureCleanup.perform(press: {}, body: {}, release: { await pending?.value })
+        guard authorization(), isLocalInputCaptureAllowed, capturedTransport == transportID else {
+            throw RemoteActionError.sessionChanged
+        }
+        guard let ws = glkvmWebSocketClient else { throw RemoteActionError.inputUnavailable }
+        try await RemoteGestureCleanup.perform(press: {}, body: {}, release: { try await ws.releaseAllHIDInputs() })
+        guard authorization(), isLocalInputCaptureAllowed, capturedTransport == transportID else {
+            throw RemoteActionError.sessionChanged
+        }
+        try Task.checkCancellation()
+        inputBlocked = false
+        transportID = UUID().uuidString
+        activityStatus = "Manual review acknowledged; input release transmitted"
+        lastInputError = nil
+        refreshLocalInputFocus()
     }
     
     private func handleMouseEvent(_ event: NSEvent) {
@@ -593,7 +960,7 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket,
            let key = glkvmKeyForMacKeyCode(event.keyCode),
            let ws = glkvmWebSocketClient {
-            enqueueHIDCommand(label: event.isKeyDown ? "Key down" : "Key up") {
+            enqueueLocalKeyboardHIDCommand(label: event.isKeyDown ? "Key down" : "Key up") {
                 let isShiftKey = key == "ShiftLeft" || key == "ShiftRight"
                 let carriesSyntheticShift = !isShiftKey && event.modifiers.contains(.shift)
                 if event.isKeyDown && carriesSyntheticShift {
@@ -626,7 +993,7 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient {
             let shouldMove = isGLKVMAbsoluteMouseMode && isNormalized(event.position)
             let absolutePoint = shouldMove ? glkvmAbsolutePoint(fromNormalized: event.position) : nil
-            enqueueHIDCommand(label: event.isDown ? "Mouse down" : "Mouse up") {
+            enqueueLocalMouseHIDCommand(label: event.isDown ? "Mouse down" : "Mouse up") {
                 if let absolutePoint {
                     try await ws.sendHidMouseMove(toX: absolutePoint.0, toY: absolutePoint.1)
                 }
@@ -650,23 +1017,13 @@ class InputManager: ObservableObject {
     }
     
     private func sendMouseMoveEvent(_ event: MouseMoveEvent) {
-        if transportMode == .glkvmWebSocket, isGLKVMAbsoluteMouseMode, isNormalized(event.position), let ws = glkvmWebSocketClient {
-            let (toX, toY) = glkvmAbsolutePoint(fromNormalized: event.position)
-            enqueueHIDCommand(label: "Mouse move") {
-                try await ws.sendHidMouseMove(toX: toX, toY: toY)
-            }
+        if transportMode == .glkvmWebSocket, isGLKVMAbsoluteMouseMode {
+            enqueueAbsoluteMouseMoveEvent(event)
             return
         }
 
-        if transportMode == .glkvmWebSocket, !isGLKVMAbsoluteMouseMode, let ws = glkvmWebSocketClient {
-            let move = PendingRelativeMouseMove(
-                deltaX: Int(event.delta.width.rounded()),
-                deltaY: Int(event.delta.height.rounded())
-            )
-            guard move.deltaX != 0 || move.deltaY != 0 else { return }
-            enqueueHIDCommand(label: "Relative mouse move") {
-                try await Self.sendRelativeMouseMove(move, through: ws)
-            }
+        if transportMode == .glkvmWebSocket, !isGLKVMAbsoluteMouseMode {
+            enqueueRelativeMouseMoveEvent(event)
             return
         }
 
@@ -686,7 +1043,7 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient {
             let dx = Self.clampInt(Int(event.deltaX.rounded()), min: -127, max: 127)
             let dy = Self.clampInt(Int(event.deltaY.rounded()), min: -127, max: 127)
-            enqueueHIDCommand(label: "Mouse wheel") {
+            enqueueLocalMouseHIDCommand(label: "Mouse wheel", successFeedback: .errorsOnly) {
                 try await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy)
             }
             return
@@ -750,6 +1107,25 @@ class InputManager: ObservableObject {
             sendKeyEvent(keyUpEvent)
         }
     }
+
+    private func observeLocalInputFocusChanges() {
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            NSApplication.didBecomeActiveNotification,
+            NSApplication.didResignActiveNotification,
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didResignKeyNotification,
+            NSWindow.willBeginSheetNotification,
+            NSWindow.didEndSheetNotification
+        ]
+        localInputFocusObservers = names.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshLocalInputFocus()
+                }
+            }
+        }
+    }
     
     private func keyCodeForCharacter(_ character: Character) -> UInt16 {
         // Basic mapping for common characters
@@ -799,6 +1175,11 @@ class InputManager: ObservableObject {
     }
     
     deinit {
+        for observer in localInputFocusObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        localInputFocusObservers.removeAll()
+
         if let monitor = keyEventMonitor {
             NSEvent.removeMonitor(monitor)
             keyEventMonitor = nil
@@ -811,6 +1192,8 @@ class InputManager: ObservableObject {
 
         mouseModeRefreshTask?.cancel()
         mouseModeRefreshTask = nil
+        mouseMoveGeneration &+= 1
+        mouseMoveBuffer.invalidate()
     }
 
     func shutdown() async {
@@ -821,75 +1204,183 @@ class InputManager: ObservableObject {
         mouseModeRefreshTask = nil
         hidReconnectTask?.cancel()
         hidReconnectTask = nil
+        let ws = glkvmWebSocketClient
+        glkvmWebSocketClient = nil
+        let transportAbort = await ws?.scheduleCurrentTransportAbort(after: 2_000_000_000)
         let pendingCommands = hidCommandTail
         await pendingCommands?.value
         hidCommandTail = nil
 
-        let ws = glkvmWebSocketClient
-        glkvmWebSocketClient = nil
         try? await ws?.releaseAllHIDInputs()
+        transportAbort?.cancel()
         await ws?.disconnect()
         activityStatus = "Input stopped"
     }
 
     private func reconnectGLKVMWebSocketIfNeeded() async {
+        guard acceptsHIDCommands else { return }
         if transportMode != .glkvmWebSocket {
             return
         }
         guard let client = glkvmClient else {
             return
         }
-
+        let expectedTransport = transportID
         let connected = await glkvmWebSocketClient?.isConnected ?? false
         let connecting = await glkvmWebSocketClient?.isConnecting ?? false
+        guard acceptsHIDCommands,
+              !Task.isCancelled,
+              glkvmClient === client,
+              transportID == expectedTransport,
+              transportMode == .glkvmWebSocket else { return }
         if !connected && !connecting {
             await glkvmWebSocketClient?.disconnect()
+            guard acceptsHIDCommands,
+                  !Task.isCancelled,
+                  glkvmClient === client,
+                  transportID == expectedTransport else { return }
             let ws = try? client.makeWebSocketClient(stream: false)
             glkvmWebSocketClient = ws
+            transportID = UUID().uuidString
+            let installedTransport = transportID
             await ws?.connect()
+            guard acceptsHIDCommands,
+                  !Task.isCancelled,
+                  glkvmClient === client,
+                  transportID == installedTransport else {
+                if glkvmWebSocketClient === ws {
+                    glkvmWebSocketClient = nil
+                }
+                await ws?.disconnect()
+                return
+            }
+            // Reconnection does not prove that an earlier HTTP print has stopped
+            // or that an unconfirmed release reached the remote application.
             activityStatus = ws == nil ? "HID connection failed" : "HID connecting"
             hidStatus = ws == nil ? "Failed" : "Connecting"
         }
     }
 
+    private func enqueueLocalKeyboardHIDCommand(
+        label: String,
+        successFeedback: HIDCommandSuccessFeedbackMode = .publishChanges,
+        operation: @escaping @Sendable () async throws -> Void
+    ) {
+        let generation = keyboardCaptureGeneration
+        enqueueHIDCommand(
+            label: label,
+            successFeedback: successFeedback,
+            executionAllowed: { [weak self] in
+                guard let self else { return false }
+                self.refreshLocalInputFocus()
+                return self.isKeyboardCaptureEnabled && self.keyboardCaptureGeneration == generation
+            },
+            operation: operation
+        )
+    }
+
+    private func enqueueLocalMouseHIDCommand(
+        label: String,
+        successFeedback: HIDCommandSuccessFeedbackMode = .publishChanges,
+        operation: @escaping @Sendable () async throws -> Void
+    ) {
+        let generation = mouseCaptureGeneration
+        enqueueHIDCommand(
+            label: label,
+            successFeedback: successFeedback,
+            executionAllowed: { [weak self] in
+                guard let self else { return false }
+                self.refreshLocalInputFocus()
+                return self.isMouseCaptureEnabled && self.mouseCaptureGeneration == generation
+            },
+            operation: operation
+        )
+    }
+
+    @discardableResult
     private func enqueueHIDCommand(
         label: String,
         completion: (@MainActor @Sendable (Result<Void, Error>) -> Void)? = nil,
+        successFeedback: HIDCommandSuccessFeedbackMode = .publishChanges,
+        freezesPendingMouseMove: Bool = true,
+        executionAllowed: @escaping @MainActor @Sendable () -> Bool = { true },
         operation: @escaping @Sendable () async throws -> Void
-    ) {
+    ) -> Task<Void, Never>? {
         guard acceptsHIDCommands else {
             completion?(.failure(CancellationError()))
-            return
+            return nil
+        }
+        if freezesPendingMouseMove {
+            freezeMouseMovesForOrderedHIDCommand()
         }
         let predecessor = hidCommandTail
-        hidCommandTail = Task { [weak self] in
+        let task = Task { [weak self] in
             await predecessor?.value
             guard !Task.isCancelled else {
                 completion?(.failure(CancellationError()))
                 return
             }
+            guard executionAllowed() else {
+                completion?(.success(()))
+                return
+            }
             do {
                 try await operation()
-                self?.activityStatus = label
-                self?.lastInputError = nil
+                if let self,
+                   let feedback = HIDCommandFeedbackPolicy.successUpdate(
+                       currentStatus: self.activityStatus,
+                       currentError: self.lastInputError,
+                       nextStatus: label,
+                       mode: successFeedback
+                   ) {
+                    if self.activityStatus != feedback.status {
+                        self.activityStatus = feedback.status
+                    }
+                    if feedback.clearsError {
+                        self.lastInputError = nil
+                    }
+                }
                 completion?(.success(()))
             } catch {
-                self?.lastInputError = error.localizedDescription
-                self?.activityStatus = "Input interrupted; reconnecting"
-                self?.scheduleHIDReconnect()
+                if let self {
+                    if let webSocketError = error as? GLKVMClient.WebSocketClient.WebSocketError,
+                       case .sendTimedOut = webSocketError {
+                        self.latchUnconfirmedInput()
+                    }
+                    let errorDescription = error.localizedDescription
+                    if let feedback = HIDCommandFeedbackPolicy.failureUpdate(
+                        currentStatus: self.activityStatus,
+                        currentError: self.lastInputError,
+                        nextError: errorDescription
+                    ) {
+                        if self.lastInputError != errorDescription {
+                            self.lastInputError = errorDescription
+                        }
+                        if self.activityStatus != feedback.status {
+                            self.activityStatus = feedback.status
+                        }
+                    }
+                    if error as? RemoteTextInputError != .authorizationExpired {
+                        self.scheduleHIDReconnect()
+                    }
+                }
                 completion?(.failure(error))
             }
         }
+        hidCommandTail = task
+        return task
     }
 
     private func scheduleHIDReconnect() {
-        guard hidReconnectTask == nil else { return }
+        guard acceptsHIDCommands, hidReconnectTask == nil else { return }
         hidReconnectTask = Task { [weak self] in
             for delay in [250_000_000, 500_000_000, 1_000_000_000, 2_000_000_000] as [UInt64] {
                 guard !Task.isCancelled, let self else { return }
                 try? await Task.sleep(nanoseconds: delay)
                 await self.reconnectGLKVMWebSocketIfNeeded()
-                if await self.glkvmWebSocketClient?.isConnected == true {
+                let connected = await self.glkvmWebSocketClient?.isConnected == true
+                guard self.acceptsHIDCommands, !Task.isCancelled else { return }
+                if connected {
                     self.hidStatus = "Connected"
                     self.hidReconnectTask = nil
                     return
@@ -1096,10 +1587,46 @@ class InputManager: ObservableObject {
         }
     }
 
+    private static func sendMouseMoveCommand(
+        _ command: PendingMouseMoveCommand,
+        through ws: GLKVMClient.WebSocketClient
+    ) async throws {
+        switch command {
+        case .absolute(let move):
+            try await ws.sendHidMouseMove(toX: move.toX, toY: move.toY)
+        case .relative(let move):
+            try await sendRelativeMouseMove(move, through: ws)
+        }
+    }
+
     private static func clampInt(_ value: Int, min: Int, max: Int) -> Int {
         if value < min { return min }
         if value > max { return max }
         return value
+    }
+}
+
+private final class HIDCommandCancellationHandle: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+    private var isCancelled = false
+
+    func install(_ task: Task<Void, Never>?) {
+        guard let task else { return }
+        lock.lock()
+        let shouldCancel = isCancelled
+        if !shouldCancel { self.task = task }
+        lock.unlock()
+        if shouldCancel { task.cancel() }
+    }
+
+    func cancel() {
+        lock.lock()
+        isCancelled = true
+        let currentTask = task
+        task = nil
+        lock.unlock()
+        currentTask?.cancel()
     }
 }
 
@@ -1130,7 +1657,7 @@ struct MouseScrollEvent {
     let timestamp: CFTimeInterval
 }
 
-enum MouseButton: Int, Codable {
+enum MouseButton: Int, Codable, Hashable {
     case left = 0
     case right = 1
     case middle = 2
@@ -1139,7 +1666,7 @@ enum MouseButton: Int, Codable {
 // MARK: - Input Capture Extensions
 extension InputManager {
     func toggleKeyboardCapture() {
-        if isKeyboardCaptureEnabled {
+        if localInputCapture.keyboardRequested {
             stopKeyboardCapture()
         } else {
             startKeyboardCapture()
@@ -1147,7 +1674,7 @@ extension InputManager {
     }
     
     func toggleMouseCapture() {
-        if isMouseCaptureEnabled {
+        if localInputCapture.mouseRequested {
             stopMouseCapture()
         } else {
             startMouseCapture()
@@ -1155,17 +1682,24 @@ extension InputManager {
     }
     
     func startFullInputCapture() {
-        guard isLocalInputCaptureAllowed else {
-            stopFullInputCapture()
-            return
-        }
-        startKeyboardCapture()
-        startMouseCapture()
+        localInputCapture.keyboardRequested = true
+        localInputCapture.mouseRequested = true
+        installKeyboardMonitorIfNeeded()
+        refreshLocalInputFocus()
     }
     
     func stopFullInputCapture() {
-        stopKeyboardCapture()
-        stopMouseCapture()
+        localInputCapture.keyboardRequested = false
+        localInputCapture.mouseRequested = false
+        if let monitor = keyEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyEventMonitor = nil
+        }
+        if let monitor = mouseEventMonitor {
+            NSEvent.removeMonitor(monitor)
+            mouseEventMonitor = nil
+        }
+        refreshLocalInputFocus()
     }
 }
 

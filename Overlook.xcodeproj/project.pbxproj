@@ -32,6 +32,11 @@
 		01000020 /* ControlMode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000022 /* ControlMode.swift */; };
 		01000021 /* ReliabilityPolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000023 /* ReliabilityPolicies.swift */; };
 		01000022 /* LocalControlServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000024 /* LocalControlServer.swift */; };
+		01000023 /* RemoteSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000025 /* RemoteSnapshot.swift */; };
+		01000024 /* RemoteActionState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000026 /* RemoteActionState.swift */; };
+		01000025 /* KVMDevice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000027 /* KVMDevice.swift */; };
+		01000026 /* SessionConnectionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000028 /* SessionConnectionCoordinator.swift */; };
+		01000027 /* LocalInputCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 02000029 /* LocalInputCapture.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -63,7 +68,12 @@
 		02000022 /* ControlMode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlMode.swift; sourceTree = "<group>"; };
 		02000023 /* ReliabilityPolicies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReliabilityPolicies.swift; sourceTree = "<group>"; };
 		02000024 /* LocalControlServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalControlServer.swift; sourceTree = "<group>"; };
+		02000025 /* RemoteSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteSnapshot.swift; sourceTree = "<group>"; };
+		02000026 /* RemoteActionState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteActionState.swift; sourceTree = "<group>"; };
 		03000001 /* Overlook.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Overlook.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		02000027 /* KVMDevice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KVMDevice.swift; sourceTree = "<group>"; };
+		02000028 /* SessionConnectionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionConnectionCoordinator.swift; sourceTree = "<group>"; };
+		02000029 /* LocalInputCapture.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalInputCapture.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -94,6 +104,11 @@
 				02000022 /* ControlMode.swift */,
 				02000023 /* ReliabilityPolicies.swift */,
 				02000024 /* LocalControlServer.swift */,
+				02000025 /* RemoteSnapshot.swift */,
+				02000026 /* RemoteActionState.swift */,
+				02000029 /* LocalInputCapture.swift */,
+				02000028 /* SessionConnectionCoordinator.swift */,
+				02000027 /* KVMDevice.swift */,
 				02000019 /* ContentControlBar.swift */,
 				0200001A /* VideoSurfaceView.swift */,
 				0200001B /* StatusBarView.swift */,
@@ -210,6 +225,11 @@
 				01000020 /* ControlMode.swift in Sources */,
 				01000021 /* ReliabilityPolicies.swift in Sources */,
 				01000022 /* LocalControlServer.swift in Sources */,
+				01000023 /* RemoteSnapshot.swift in Sources */,
+				01000024 /* RemoteActionState.swift in Sources */,
+				01000027 /* LocalInputCapture.swift in Sources */,
+				01000026 /* SessionConnectionCoordinator.swift in Sources */,
+				01000025 /* KVMDevice.swift in Sources */,
 				0100001A /* ContentControlBar.swift in Sources */,
 				0100001B /* VideoSurfaceView.swift in Sources */,
 				0100001C /* StatusBarView.swift in Sources */,

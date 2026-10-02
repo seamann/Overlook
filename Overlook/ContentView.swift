@@ -7,9 +7,10 @@ struct ContentView: View {
     @EnvironmentObject var inputManager: InputManager
     @EnvironmentObject var ocrManager: OCRManager
     @EnvironmentObject var kvmDeviceManager: KVMDeviceManager
+    @EnvironmentObject var controlModeStore: ControlModeStore
+    @EnvironmentObject var sessionCoordinator: SessionConnectionCoordinator
     
     @State private var selectedDevice: KVMDevice?
-    @State private var isConnected = false
     @State private var isOCRModeEnabled = false
     @State private var isShowingOCRResult = false
     @State private var showingSettings = false
@@ -24,32 +25,34 @@ struct ContentView: View {
 
     @State private var showingPasswordPrompt = false
     @State private var pendingPasswordDevice: KVMDevice?
+    @State private var pendingPasswordAttemptID: UInt64?
+    @State private var pendingManualEndpoint: (host: String, port: Int)?
     @State private var pendingPassword = ""
     @State private var connectionErrorMessage: String?
-    @State private var isEstablishingConnection = false
-
-    @State private var suppressDeviceAutoConnect = false
+    @State private var isChangingControlMode = false
+    @State private var isRecoveringInput = false
 
     @State private var showingConnections = false
     @State private var didAutoOpenConnections = false
 
-    @State private var pausedCaptureKeyboardWasEnabled: Bool?
-    @State private var pausedCaptureMouseWasEnabled: Bool?
-    @State private var isInputCapturePausedForUI: Bool = false
+    @State private var inputCaptureOwner = UUID()
 
     @State private var windowRef: NSWindow?
 
     @State private var isFullscreen: Bool = false
     @State private var showFullscreenControls: Bool = false
+    @State private var isHoveringFullscreenTopStrip: Bool = false
     @State private var fullscreenHoverTask: Task<Void, Never>?
     @State private var activeWindowMode: OverlookControlMode = .manual
     @State private var didApplyControlMode = false
 
     @AppStorage("overlook.appAppearance") private var appAppearance: String = "system"
-    @AppStorage("overlook.controlMode") private var controlModeRawValue: String = OverlookControlMode.manual.rawValue
+
+    private var isConnected: Bool { kvmDeviceManager.connectedDevice != nil }
+    private var isEstablishingConnection: Bool { sessionCoordinator.isConnecting }
 
     private var controlMode: OverlookControlMode {
-        OverlookControlMode(rawValue: controlModeRawValue) ?? .manual
+        controlModeStore.mode
     }
 
     private var preferredColorScheme: ColorScheme? {
@@ -104,6 +107,83 @@ struct ContentView: View {
         return "Overlook - \(deviceLabel) / \(connectionState) / \(resolution) / \(kbps) / \(fps)"
     }
 
+    private var canToggleMouseJiggler: Bool {
+        MouseJigglerPolicy.canToggle(
+            mode: controlMode,
+            isConnected: isConnected,
+            isAvailable: kvmDeviceManager.mouseJigglerEnabled != nil,
+            isUpdating: kvmDeviceManager.isMouseJigglerUpdating,
+            isTransitioning: isChangingControlMode
+        ) && !showingSettings && !showingConnections
+    }
+
+    private var mouseJigglerHelp: String {
+        if kvmDeviceManager.isMouseJigglerUpdating {
+            return "Updating mouse jiggler"
+        }
+        guard let isEnabled = kvmDeviceManager.mouseJigglerEnabled else {
+            return "Mouse jiggler state unavailable"
+        }
+        return isEnabled ? "Disable mouse jiggler" : "Keep the remote display awake"
+    }
+
+    private var mouseJigglerButton: some View {
+        Button(action: toggleMouseJiggler) {
+            Group {
+                if kvmDeviceManager.isMouseJigglerUpdating {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.left.and.right")
+                        .foregroundStyle(kvmDeviceManager.mouseJigglerEnabled == true ? Color.green : Color.primary)
+                }
+            }
+            .frame(width: 16, height: 16)
+        }
+        .disabled(!canToggleMouseJiggler)
+        .help(mouseJigglerHelp)
+        .accessibilityLabel("Mouse Jiggler")
+        .accessibilityValue(
+            kvmDeviceManager.mouseJigglerEnabled.map { $0 ? "On" : "Off" } ?? "Unavailable"
+        )
+    }
+
+    private var inputRecoveryBanner: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Eingabe angehalten: Remote-Zustand prüfen", systemImage: "exclamationmark.triangle")
+                .font(.headline)
+            Text("Bereits übertragener Text wird nicht zurückgenommen.")
+                .font(.caption)
+            if controlMode == .manual {
+                Button(isRecoveringInput ? "Freigabe wird geprüft …" : "Eingabe nach Prüfung freigeben") {
+                    let expectedMode = controlModeStore.snapshot
+                    isRecoveringInput = true
+                    Task { @MainActor in
+                        defer { isRecoveringInput = false }
+                        do {
+                            try await inputManager.recoverInputAfterManualReview {
+                                controlModeStore.snapshot == expectedMode && expectedMode.mode == .manual
+                            }
+                            transferStatus = nil
+                        } catch {
+                            transferStatus = "Freigabe nicht bestätigt. Eingabe bleibt gesperrt."
+                        }
+                    }
+                }
+                .disabled(isRecoveringInput || !inputManager.isLocalInputCaptureAllowed)
+                .help("Nach eigener Prüfung des Remote-Zustands die Eingabesperre aufheben. Die App bleibt in Manual.")
+            } else {
+                Text("Für die eigene Prüfung zuerst in Manual wechseln.")
+                    .font(.caption)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: 440, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
     private func applyAppAppearance() {
         switch appAppearance {
         case "light":
@@ -114,8 +194,45 @@ struct ContentView: View {
             NSApp.appearance = nil
         }
     }
+
+    private func setFullscreenTopStripHover(_ isHovering: Bool) {
+        guard isFullscreen, !showingSettings, !showingConnections else {
+            guard isHoveringFullscreenTopStrip || showFullscreenControls || fullscreenHoverTask != nil else {
+                return
+            }
+            fullscreenHoverTask?.cancel()
+            fullscreenHoverTask = nil
+            isHoveringFullscreenTopStrip = false
+            if showFullscreenControls {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    showFullscreenControls = false
+                }
+            }
+            return
+        }
+
+        guard isHoveringFullscreenTopStrip != isHovering else { return }
+        isHoveringFullscreenTopStrip = isHovering
+        fullscreenHoverTask?.cancel()
+        fullscreenHoverTask = nil
+
+        if isHovering {
+            fullscreenHoverTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 350_000_000)
+                if isFullscreen && isHoveringFullscreenTopStrip && !showingSettings && !showingConnections {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        showFullscreenControls = true
+                    }
+                }
+            }
+        } else {
+            withAnimation(.easeInOut(duration: 0.15)) {
+                showFullscreenControls = false
+            }
+        }
+    }
     
-    var body: some View {
+    private var videoContent: some View {
         ZStack(alignment: .trailing) {
             if isFullscreen {
                 VideoSurfaceView(
@@ -124,9 +241,7 @@ struct ContentView: View {
                     isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
                         guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
-                        }
+                        connectToDevice(device)
                     },
                     hidesLocalCursor: shouldHideLocalCursor
                 )
@@ -139,9 +254,7 @@ struct ContentView: View {
                     isShowingOCRResult: $isShowingOCRResult,
                     onReconnect: {
                         guard let device = kvmDeviceManager.connectedDevice else { return }
-                        Task { @MainActor in
-                            await webRTCManager.reconnect(to: device)
-                        }
+                        connectToDevice(device)
                     },
                     hidesLocalCursor: shouldHideLocalCursor
                 )
@@ -159,30 +272,12 @@ struct ContentView: View {
                     .allowsHitTesting(false)
             }
 
+            if inputManager.inputBlocked {
+                inputRecoveryBanner
+            }
+
             if isFullscreen && !showingSettings && !showingConnections {
                 VStack(spacing: 0) {
-                    Color.clear
-                        .frame(height: 28)
-                        .frame(maxWidth: .infinity)
-                        .contentShape(Rectangle())
-                        .onHover { hovering in
-                            fullscreenHoverTask?.cancel()
-                            if hovering {
-                                fullscreenHoverTask = Task { @MainActor in
-                                    try? await Task.sleep(nanoseconds: 350_000_000)
-                                    if isFullscreen {
-                                        withAnimation(.easeInOut(duration: 0.15)) {
-                                            showFullscreenControls = true
-                                        }
-                                    }
-                                }
-                            } else {
-                                withAnimation(.easeInOut(duration: 0.15)) {
-                                    showFullscreenControls = false
-                                }
-                            }
-                        }
-
                     if showFullscreenControls {
                         HStack(spacing: 10) {
                             Button(action: { showingConnections.toggle() }) {
@@ -202,10 +297,12 @@ struct ContentView: View {
                             .disabled(!isConnected)
                             .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
 
+                            mouseJigglerButton
+
                             Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                                 Image(systemName: "gearshape")
                             }
-                            .disabled(!isConnected)
+                            .disabled(!isConnected || controlMode != .manual)
                             .help("Settings")
                         }
                         .padding(.horizontal, 12)
@@ -221,6 +318,7 @@ struct ContentView: View {
                     Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(showFullscreenControls)
             }
 
             if showingSettings || showingConnections {
@@ -280,6 +378,11 @@ struct ContentView: View {
                     onForgetSelectedDevice: {
                         guard let device = selectedDevice else { return }
                         guard device.id.hasPrefix("saved-") else { return }
+                        if sessionCoordinator.isConnecting || kvmDeviceManager.connectedDevice.map({
+                            $0.host == device.host && $0.port == device.port
+                        }) == true {
+                            sessionCoordinator.disconnect()
+                        }
                         kvmDeviceManager.forgetDevice(device)
                         selectedDevice = nil
                     }
@@ -295,15 +398,31 @@ struct ContentView: View {
             .animation(.easeInOut(duration: 0.2), value: showingConnections)
             .allowsHitTesting(showingConnections)
         }
+    }
+
+    private var windowContent: some View {
+        videoContent
         .background(WindowAspectRatioSetter(videoSize: webRTCManager.videoSize))
         .background(WindowTitleSetter(title: windowTitle))
         .background(WindowReferenceSetter(window: $windowRef))
         .preferredColorScheme(preferredColorScheme)
+        .onContinuousHover(coordinateSpace: .local) { phase in
+            switch phase {
+            case .active(let location):
+                setFullscreenTopStripHover(
+                    FullscreenHoverPolicy.isInsideTopStrip(
+                        locationY: location.y,
+                        isFullscreen: isFullscreen,
+                        controlsVisible: showFullscreenControls,
+                        isOverlayPresented: showingSettings || showingConnections
+                    )
+                )
+            case .ended:
+                setFullscreenTopStripHover(false)
+            }
+        }
         .onAppear {
             applyAppAppearance()
-            inputManager.setup(with: webRTCManager)
-            inputManager.setGLKVMClient(kvmDeviceManager.glkvmClient)
-
             updateInputCaptureForUIOverlays()
             applyControlMode()
 
@@ -314,46 +433,58 @@ struct ContentView: View {
         }
         .onChange(of: showingSettings) { _, _ in
             updateInputCaptureForUIOverlays()
+            setFullscreenTopStripHover(false)
         }
         .onChange(of: showingConnections) { _, _ in
             updateInputCaptureForUIOverlays()
+            setFullscreenTopStripHover(false)
         }
-        .onChange(of: controlModeRawValue) { _, _ in
+        .onChange(of: showingManualConnect) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: showingPasswordPrompt) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
+        .onDisappear {
+            inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
+        }
+    }
+
+    private var sessionContent: some View {
+        windowContent
+        .onChange(of: sessionCoordinator.isConnecting) { _, connecting in
+            if connecting {
+                showingPasswordPrompt = false
+                pendingPasswordDevice = nil
+                pendingManualEndpoint = nil
+                pendingPasswordAttemptID = nil
+                pendingPassword = ""
+            }
+        }
+        .onChange(of: controlModeStore.mode) { _, _ in
             applyControlMode()
         }
         .onChange(of: windowRef) { _, newValue in
             isFullscreen = newValue?.styleMask.contains(.fullScreen) ?? false
             showFullscreenControls = false
+            setFullscreenTopStripHover(false)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didEnterFullScreenNotification)) { note in
             guard let window = note.object as? NSWindow else { return }
             guard windowRef === window else { return }
             isFullscreen = true
             showFullscreenControls = false
+            setFullscreenTopStripHover(false)
         }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didExitFullScreenNotification)) { note in
             guard let window = note.object as? NSWindow else { return }
             guard windowRef === window else { return }
             isFullscreen = false
             showFullscreenControls = false
+            setFullscreenTopStripHover(false)
         }
-        .onReceive(kvmDeviceManager.$glkvmClient) { client in
-            inputManager.setGLKVMClient(client)
-        }
-        .onReceive(kvmDeviceManager.$connectedDevice) { device in
-            Task { @MainActor in
-                if let device {
-                    suppressDeviceAutoConnect = true
-                    selectedDevice = device
-                    isConnected = true
-                    DispatchQueue.main.async {
-                        suppressDeviceAutoConnect = false
-                        applyControlMode()
-                    }
-                } else {
-                    isConnected = false
-                }
-            }
+        .onChange(of: kvmDeviceManager.connectedDevice) { _, device in
+            showingSettings = false
+            if let device { selectedDevice = device }
         }
         .onReceive(NotificationCenter.default.publisher(for: .overlookToggleCopyMode)) { _ in
             Task { @MainActor in
@@ -363,6 +494,10 @@ struct ContentView: View {
         .onChange(of: appAppearance) { _, _ in
             applyAppAppearance()
         }
+    }
+
+    var body: some View {
+        sessionContent
         .sheet(isPresented: $isShowingOCRResult) {
             OCRResultView(selectedText: $selectedText)
         }
@@ -383,13 +518,21 @@ struct ContentView: View {
                 password: $pendingPassword,
                 onCancel: {
                     pendingPasswordDevice = nil
+                    pendingManualEndpoint = nil
+                    pendingPasswordAttemptID = nil
                     pendingPassword = ""
                 },
                 onConnect: { password in
-                    if let device = pendingPasswordDevice {
-                        connectToDevice(device, password: password)
+                    if let id = pendingPasswordAttemptID, sessionCoordinator.isCurrent(id) {
+                        if let device = pendingPasswordDevice {
+                            connectToDevice(device, password: password)
+                        } else if let endpoint = pendingManualEndpoint {
+                            connectManually(host: endpoint.host, port: endpoint.port, password: password)
+                        }
                     }
                     pendingPasswordDevice = nil
+                    pendingManualEndpoint = nil
+                    pendingPasswordAttemptID = nil
                     pendingPassword = ""
                 }
             )
@@ -410,12 +553,25 @@ struct ContentView: View {
         .toolbar {
             if isFullscreen == false {
                 ToolbarItemGroup(placement: .automatic) {
-                    Picker("Control mode", selection: $controlModeRawValue) {
+                    Picker(
+                        "Control mode",
+                        selection: Binding(
+                            get: { controlModeStore.mode },
+                            set: { requestedMode in
+                                RunLoop.main.perform(inModes: [.default]) {
+                                    MainActor.assumeIsolated {
+                                        requestControlMode(requestedMode)
+                                    }
+                                }
+                            }
+                        )
+                    ) {
                         ForEach(OverlookControlMode.allCases) { mode in
-                            Text(mode.title).tag(mode.rawValue)
+                            Text(mode.title).tag(mode)
                         }
                     }
                     .pickerStyle(.menu)
+                    .disabled(isChangingControlMode || kvmDeviceManager.isMouseJigglerUpdating)
                     .help("Choose who controls the remote computer")
 
                     Button(action: { showingConnections.toggle() }) {
@@ -432,19 +588,22 @@ struct ContentView: View {
                     Button(action: { toggleOCR() }) {
                         Image(systemName: isOCRModeEnabled ? "text.viewfinder" : "doc.text")
                     }
-                    .disabled(!isConnected)
+                    .disabled(!isConnected || controlMode != .manual)
                     .help(isOCRModeEnabled ? "Disable OCR Selection" : "Enable OCR Selection")
 
                     Button(action: { pasteMacClipboardToRemote() }) {
                         Image(systemName: "doc.on.clipboard")
                     }
-                    .disabled(!isConnected)
+                    .disabled(!isConnected || controlMode != .manual)
+                    .disabled(!inputManager.isKeyboardCaptureEnabled)
                     .help("Paste Mac clipboard into the remote computer")
+
+                    mouseJigglerButton
 
                     Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                         Image(systemName: "gearshape")
                     }
-                    .disabled(!isConnected)
+                    .disabled(!isConnected || controlMode != .manual)
                     .help("Settings")
 
                     Button(role: .destructive, action: { NSApp.terminate(nil) }) {
@@ -458,44 +617,34 @@ struct ContentView: View {
     }
 
     private func connectToDevice(_ device: KVMDevice, password: String? = nil) {
-        guard !isEstablishingConnection else { return }
-        isEstablishingConnection = true
+        let attempt = sessionCoordinator.startConnection(to: device, password: password)
+        observeConnection(attempt, passwordDevice: device)
+    }
 
+    private func observeConnection(
+        _ attempt: SessionConnectionCoordinator.Attempt,
+        passwordDevice: KVMDevice?,
+        manualEndpoint: (host: String, port: Int)? = nil
+    ) {
         Task { @MainActor in
-            defer { isEstablishingConnection = false }
             do {
-                let connectedDevice = try await kvmDeviceManager.connectToDevice(device, password: password)
-                suppressDeviceAutoConnect = true
-                selectedDevice = connectedDevice
-                isConnected = true
+                let device = try await attempt.task.value
+                guard sessionCoordinator.isCurrent(attempt.id) else { return }
+                selectedDevice = device
                 showingConnections = false
-                DispatchQueue.main.async {
-                    suppressDeviceAutoConnect = false
-                }
-
-                if let client = kvmDeviceManager.glkvmClient {
-                    inputManager.setGLKVMClient(client)
-                    inputManager.startFullInputCapture()
-                    try? await client.setHidConnected(true)
-                }
-
- #if canImport(WebRTC)
-                do {
-                    try await webRTCManager.connect(to: connectedDevice)
-                } catch {
-                    print("WebRTC connect failed (API is still connected): \(error)")
-                }
- #endif
+                connectionErrorMessage = nil
+            } catch is CancellationError {
+                return
             } catch {
-                if let kvmError = error as? KVMError, kvmError == .authenticationFailed {
-                    pendingPasswordDevice = device
+                guard sessionCoordinator.isCurrent(attempt.id) else { return }
+                if let error = error as? KVMError, error == .authenticationFailed {
+                    pendingPasswordDevice = passwordDevice
+                    pendingManualEndpoint = manualEndpoint
+                    pendingPasswordAttemptID = attempt.id
                     showingPasswordPrompt = true
                 } else {
-                    print("Failed to connect: \(error)")
-                    isConnected = false
                     connectionErrorMessage = describeConnectionError(error)
                 }
-                return
             }
         }
     }
@@ -520,50 +669,99 @@ struct ContentView: View {
             }
         }
 
-        let port = Int(portString) ?? 443
-        let device = kvmDeviceManager.addManualDevice(host: host, port: port, type: .glinetComet)
+        connectManually(host: host, port: Int(portString) ?? 443, password: password)
+    }
 
-        suppressDeviceAutoConnect = true
-        selectedDevice = device
-        DispatchQueue.main.async {
-            suppressDeviceAutoConnect = false
-        }
-
-        let normalizedPassword = password.trimmingCharacters(in: .whitespacesAndNewlines)
-        connectToDevice(device, password: normalizedPassword.isEmpty ? nil : normalizedPassword)
+    private func connectManually(host: String, port: Int, password: String) {
+        let normalizedPassword = password
+        let attempt = sessionCoordinator.startConnection(
+            deviceFactory: {
+                try await kvmDeviceManager.makeManualDeviceUsingStoredToken(
+                    host: host, port: port, type: .glinetComet
+                )
+            },
+            password: normalizedPassword.isEmpty ? nil : normalizedPassword
+        )
+        observeConnection(attempt, passwordDevice: nil, manualEndpoint: (host, port))
     }
 
     private func describeConnectionError(_ error: Error) -> String {
-        if let describable = error as? CustomStringConvertible {
-            return describable.description
-        }
-        return error.localizedDescription
+        error.localizedDescription
     }
 
     private func toggleConnection() {
-        guard !isEstablishingConnection else { return }
-
-        if isConnected {
-            webRTCManager.disconnect()
-
-            let client = kvmDeviceManager.glkvmClient
-            Task {
-                try? await client?.setHidConnected(false)
-            }
-
-            kvmDeviceManager.disconnectFromDevice()
-            inputManager.setGLKVMClient(nil)
-            inputManager.stopFullInputCapture()
-            isConnected = false
+        if isConnected || isEstablishingConnection {
+            sessionCoordinator.disconnect()
             showingConnections = true
         } else if let device = selectedDevice {
             connectToDevice(device)
         }
     }
-    
+
     @MainActor
     private func toggleOCR() {
         isOCRModeEnabled.toggle()
+    }
+
+    @MainActor
+    private func toggleMouseJiggler() {
+        guard canToggleMouseJiggler, let current = kvmDeviceManager.mouseJigglerEnabled else { return }
+        Task { @MainActor in
+            do {
+                try await kvmDeviceManager.setMouseJigglerEnabled(!current)
+            } catch is CancellationError {
+                return
+            } catch {
+                connectionErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    @MainActor
+    private func requestControlMode(_ requestedMode: OverlookControlMode) {
+        guard requestedMode != controlMode, !isChangingControlMode else { return }
+        guard requestedMode == .codexHeadless else {
+            controlModeStore.setMode(requestedMode)
+            return
+        }
+        guard isConnected else {
+            connectionErrorMessage = "Connect to the KVM before enabling Headless mode."
+            return
+        }
+        guard MouseJigglerPolicy.canEnterHeadless(
+            supportsMouseJiggler: kvmDeviceManager.mouseJigglerSupported,
+            enabledState: kvmDeviceManager.mouseJigglerEnabled
+        ) else {
+            connectionErrorMessage = "Wait until the KVM mouse jiggler state is available before enabling Headless mode."
+            return
+        }
+
+        isChangingControlMode = true
+        showingSettings = false
+        let expectedClient = kvmDeviceManager.glkvmClient
+        let lockOwner = kvmDeviceManager.beginHeadlessConfigurationTransition()
+        Task { @MainActor in
+            defer {
+                kvmDeviceManager.endHeadlessConfigurationTransition(lockOwner)
+                isChangingControlMode = false
+            }
+            do {
+                if kvmDeviceManager.mouseJigglerSupported == true {
+                    try await kvmDeviceManager.setMouseJigglerEnabled(false)
+                    guard kvmDeviceManager.mouseJigglerEnabled == false else {
+                        throw MouseJigglerError.readbackMismatch
+                    }
+                }
+                guard kvmDeviceManager.glkvmClient === expectedClient,
+                      !sessionCoordinator.isConnecting else { return }
+                isOCRModeEnabled = false
+                controlModeStore.setMode(.codexHeadless)
+            } catch is CancellationError {
+                return
+            } catch {
+                connectionErrorMessage = error.localizedDescription
+            }
+        }
     }
 
     @MainActor
@@ -574,14 +772,19 @@ struct ContentView: View {
         }
         activeWindowMode = controlMode
         didApplyControlMode = true
-        NotificationCenter.default.post(name: .overlookControlModeChanged, object: controlMode.rawValue)
         if controlMode == .codexHeadless {
-            inputManager.setLocalInputCaptureAllowed(false)
             isOCRModeEnabled = false
-            restoreWindowFrame(for: controlMode, fallbackToObserverSize: true)
-        } else {
-            inputManager.setLocalInputCaptureAllowed(true)
-            restoreWindowFrame(for: controlMode, fallbackToObserverSize: false)
+        }
+        scheduleWindowFrameRestore(for: controlMode)
+    }
+
+    @MainActor
+    private func scheduleWindowFrameRestore(for mode: OverlookControlMode) {
+        RunLoop.main.perform(inModes: [.default]) {
+            MainActor.assumeIsolated {
+                guard controlMode == mode else { return }
+                restoreWindowFrame(for: mode, fallbackToObserverSize: mode == .codexHeadless)
+            }
         }
     }
 
@@ -597,7 +800,11 @@ struct ContentView: View {
                 frame.origin.x = min(max(frame.minX, visible.minX), visible.maxX - frame.width)
                 frame.origin.y = min(max(frame.minY, visible.minY), visible.maxY - frame.height)
             }
-            window.setFrame(frame, display: true, animate: true)
+            window.setFrame(
+                frame,
+                display: true,
+                animate: ControlModeWindowTransitionPolicy.animatesFrameChanges
+            )
         } else if fallbackToObserverSize {
             resizeForObserverMode()
         }
@@ -615,7 +822,11 @@ struct ContentView: View {
         var newFrame = currentFrame
         newFrame.size = NSSize(width: contentWidth + chromeWidth, height: contentHeight + chromeHeight)
         newFrame.origin.y += currentFrame.height - newFrame.height
-        window.setFrame(newFrame, display: true, animate: true)
+        window.setFrame(
+            newFrame,
+            display: true,
+            animate: ControlModeWindowTransitionPolicy.animatesFrameChanges
+        )
     }
 
     @MainActor
@@ -624,9 +835,10 @@ struct ContentView: View {
             transferStatus = "The Mac clipboard contains no text."
             return
         }
-        Task {
+        let authorization = inputManager.makeLocalKeyboardAuthorization()
+        Task { @MainActor in
             do {
-                try await inputManager.sendTextToRemote(value)
+                try await inputManager.sendTextToRemote(value, authorization: authorization)
                 transferStatus = "\(value.count) characters transferred"
                 Task { @MainActor in
                     try? await Task.sleep(nanoseconds: 2_000_000_000)
@@ -672,43 +884,12 @@ struct ContentView: View {
 
     @MainActor
     private func updateInputCaptureForUIOverlays() {
-        let overlayOpen = showingSettings || showingConnections
-
-        if overlayOpen {
-            if isInputCapturePausedForUI == false {
-                pausedCaptureKeyboardWasEnabled = inputManager.isKeyboardCaptureEnabled
-                pausedCaptureMouseWasEnabled = inputManager.isMouseCaptureEnabled
-
-                if inputManager.isKeyboardCaptureEnabled {
-                    inputManager.stopKeyboardCapture()
-                }
-                if inputManager.isMouseCaptureEnabled {
-                    inputManager.stopMouseCapture()
-                }
-
-                isInputCapturePausedForUI = true
-            }
-            return
-        }
-
-        guard isInputCapturePausedForUI else { return }
-
-        if isConnected {
-            if let wasKeyboard = pausedCaptureKeyboardWasEnabled {
-                if wasKeyboard {
-                    inputManager.startKeyboardCapture()
-                }
-            }
-            if let wasMouse = pausedCaptureMouseWasEnabled {
-                if wasMouse {
-                    inputManager.startMouseCapture()
-                }
-            }
-        }
-
-        pausedCaptureKeyboardWasEnabled = nil
-        pausedCaptureMouseWasEnabled = nil
-        isInputCapturePausedForUI = false
+        inputManager.setLocalUIBlocked(
+            showingSettings || showingConnections || showingManualConnect
+                || showingPasswordPrompt || isShowingOCRResult || isOCRModeEnabled
+                || connectionErrorMessage != nil,
+            owner: inputCaptureOwner
+        )
     }
 }
 

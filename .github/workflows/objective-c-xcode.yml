@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [ "main" ]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     name: Build Overlook (macOS)
@@ -38,7 +41,23 @@ jobs:
           set -euo pipefail
           xcodebuild -resolvePackageDependencies \
             -project Overlook.xcodeproj \
-            -scheme Overlook
+            -scheme Overlook \
+            -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/SourcePackages" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+      - name: Run policy tests
+        if: matrix.configuration == 'Debug'
+        run: |
+          set -euo pipefail
+          scripts/test-agent-control.sh swift
+
+      - name: Test Overlook MCP
+        if: matrix.configuration == 'Debug'
+        working-directory: mcp/overlook-control
+        run: |
+          set -euo pipefail
+          npm ci
+          npm test
 
       - name: Build (${{ matrix.configuration }})
         run: |

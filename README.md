@@ -95,6 +95,15 @@ Overlook uses the Swift Package:
 2. Select the `Overlook` scheme.
 3. Build + Run.
 
+For a local command-line Release build, use `scripts/build-agent-release.sh`.
+It sets `CC` to the local `scripts/clang-pipe-compat` helper for the older
+SwiftBuild Clang-discovery pipe behavior. The helper preserves complete
+stdout and stderr output and delegates every other compiler invocation to the
+original Xcode Clang; it does not change Xcode or Apple compiler files. The
+underlying SwiftBuild stream fix is tracked in [Apple SwiftBuild PR #1315](https://github.com/swiftlang/swift-build/commit/5d489960935c30989d6f4398b675be6218913fac).
+Detailed recovery evidence and complete build outputs are retained under
+`/Users/doebber/Documents/Wago/work/overlook-session-refactor-evidence-2026-09-15/compiler-recovery-2026-09-15/`.
+
 ---
 
 ## Quick Start (How to use Overlook)
@@ -286,6 +295,8 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
   - WebRTC peer connection + Janus signaling.
   - Receiver stats collection.
   - Optional audio/mic track.
+- `Overlook/LocalInputCapture.swift`
+  - Combines session, mode, window focus, local dialogs, and requested capture preferences.
 - `Overlook/InputManager.swift`
   - Keyboard/mouse capture.
   - Local→remote paste (`⌘V`).
@@ -296,9 +307,35 @@ Overlook’s settings UI lives in `Overlook/WebUISettingsPanel.swift` and is des
 - `Overlook/GLKVMClient.swift`
   - Device HTTP APIs (streamer params, system config, EDID, HID print, etc.).
 - `Overlook/KVMDeviceManager.swift`
-  - Discovery, saved devices, authentication.
+  - Discovery, saved devices, and side-effect-free connection preparation followed by a current-attempt commit.
+- `Overlook/SessionConnectionCoordinator.swift`
+  - Shared connection ownership for the main window and menu, with cancellation and ordered input/HID teardown.
 - `Overlook/MenuBarAgent.swift`
   - Menu bar UI + quick actions.
+
+### Local verification and build inventory
+
+The Xcode target lists its Swift source files explicitly. The MCP package compiles
+`src/**/*.ts`; alternate source copies must be kept outside those source folders.
+The release script fingerprints the app, project, build scripts, and MCP sources,
+then writes the revision and content digest into the app and its build manifest.
+
+- `scripts/test-agent-control.sh all`: local fixtures for session replacement,
+  input capture, AppKit keyboard routing, HTTP/WebSocket contracts, snapshots,
+  control server, and the MCP package. Set `OVERLOOK_WEBRTC_FRAMEWORK_DIR` to the
+  parent of the resolved macOS `WebRTC.framework`. Install the locked MCP
+  dependencies before running the MCP suite.
+- `scripts/build-agent-release.sh <output-directory>`: creates and verifies an
+  Apple Development signed Release artifact without installing or restarting
+  Overlook. Set `OVERLOOK_SIGN_IDENTITY` to an available Apple Development
+  identity; the script signs the embedded framework before the app and checks
+  that both signatures carry the same Team ID. An external output directory can
+  keep build products out of the source provider, for example
+  `$HOME/Library/Caches/Overlook/agent-release`. `OVERLOOK_SOURCE_PACKAGES_PATH`
+  can reuse an existing resolved package cache.
+
+Capture tests use hidden native AppKit windows and fake transport sinks. They do
+not establish visible text-field behavior or acceptance against a live KVM.
 
 ### Security notes
 

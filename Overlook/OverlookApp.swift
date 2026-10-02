@@ -4,6 +4,7 @@ import WebRTC
 #endif
 import Vision
 import Network
+import Combine
 
 @main
 struct OverlookApp: App {
@@ -16,6 +17,8 @@ struct OverlookApp: App {
                 .environmentObject(appDelegate.inputManager)
                 .environmentObject(appDelegate.ocrManager)
                 .environmentObject(appDelegate.kvmDeviceManager)
+                .environmentObject(appDelegate.controlModeStore)
+                .environmentObject(appDelegate.sessionCoordinator)
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact)
@@ -31,9 +34,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let inputManager = InputManager()
     let ocrManager = OCRManager()
     let kvmDeviceManager = KVMDeviceManager()
+    let controlModeStore = ControlModeStore()
     let localControlServer = LocalControlServer()
+    lazy var sessionCoordinator = SessionConnectionCoordinator(dependencies: .init(
+        prepare: { [unowned self] device, password in
+            try await kvmDeviceManager.prepareConnection(device, password: password)
+        },
+        commit: { [unowned self] prepared in kvmDeviceManager.commitConnection(prepared) },
+        invalidateSession: { [unowned self] in
+            controlModeStore.setMode(.manual)
+            inputManager.setSessionAvailable(false)
+            webRTCManager.disconnect()
+            kvmDeviceManager.disconnectFromDevice()
+        },
+        drainSession: { [unowned self] in
+            await localControlServer.waitForMutationsToDrain()
+            await inputManager.disconnectInputForSession()
+        },
+        installInput: { [unowned self] client in
+            inputManager.setGLKVMClient(client)
+            inputManager.setSessionAvailable(true)
+        },
+        setHIDConnected: { client, connected in try await client.setHidConnected(connected) },
+        connectVideo: { [unowned self] device in try await webRTCManager.connect(to: device) },
+        setConnectionTransitioning: { [unowned self] transitioning in
+            inputManager.setConnectionTransitioning(transitioning)
+        }
+    ))
     private var isTerminating = false
-    private var controlModeObserver: NSObjectProtocol?
+    private var observedClientIdentity: ObjectIdentifier?
+    private var cancellables = Set<AnyCancellable>()
     
     func applicationDidFinishLaunching(_ notification: Notification) {
         // LaunchServices and the Dock can retain the generic icon for locally
@@ -44,44 +74,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.applicationIconImage = icon
         }
 
+        inputManager.setup(with: webRTCManager)
         menuBarAgent = MenuBarAgent(
             kvmDeviceManager: kvmDeviceManager,
-            webRTCManager: webRTCManager,
             inputManager: inputManager,
+            sessionCoordinator: sessionCoordinator,
             showMainWindow: { [weak self] in
                 self?.showMainWindow()
             }
         )
         menuBarAgent?.setup()
-        localControlServer.setCommandGate {
-            let raw = UserDefaults.standard.string(forKey: "overlook.controlMode") ?? ""
-            let mode = OverlookControlMode(rawValue: raw) ?? .manual
-            return ControlMutationPolicy.allows(.mutation, in: mode)
-        }
-        let currentMode = OverlookControlMode(
-            rawValue: UserDefaults.standard.string(forKey: "overlook.controlMode") ?? ""
-        ) ?? .manual
-        if currentMode == .codexHeadless {
-            localControlServer.start(inputManager: inputManager)
-        }
-        controlModeObserver = NotificationCenter.default.addObserver(
-            forName: .overlookControlModeChanged,
-            object: nil,
-            queue: .main
-        ) { [weak self] note in
-            Task { @MainActor in
-                guard let self else { return }
-                let raw = note.object as? String ?? ""
-                self.localControlServer.stop()
-                if OverlookControlMode(rawValue: raw) == .codexHeadless {
-                    self.localControlServer.start(inputManager: self.inputManager)
-                }
+        bindControlSafetyState()
+        controlModeStore.configureInputCapture(
+            { [weak self] allowed in
+                self?.inputManager.setLocalInputCaptureAllowed(allowed)
+            },
+            waitForRemoteMutations: { [weak self] in
+                await self?.localControlServer.waitForMutationsToDrain()
             }
+        )
+        localControlServer.setModeProvider { [weak self] in
+            self?.controlModeStore.snapshot ?? ControlModeSnapshot(mode: .manual, generation: 0)
         }
+        localControlServer.setSnapshotProvider(webRTCManager)
+        localControlServer.start(inputManager: inputManager)
         
         // Configure app for KVM control
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func bindControlSafetyState() {
+        controlModeStore.$mode
+            .sink { [weak self] mode in
+                self?.kvmDeviceManager.setHeadlessModeActive(mode == .codexHeadless)
+            }
+            .store(in: &cancellables)
+
+        kvmDeviceManager.$glkvmClient
+            .sink { [weak self] client in
+                guard let self else { return }
+                let nextIdentity = client.map(ObjectIdentifier.init)
+                defer { self.observedClientIdentity = nextIdentity }
+                guard self.observedClientIdentity != nextIdentity else { return }
+                self.controlModeStore.setMode(.manual)
+            }
+            .store(in: &cancellables)
     }
 
     private func showMainWindow() {
@@ -97,15 +135,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard !isTerminating else { return .terminateLater }
         isTerminating = true
         menuBarAgent?.cleanup()
-        if let controlModeObserver {
-            NotificationCenter.default.removeObserver(controlModeObserver)
-            self.controlModeObserver = nil
-        }
         localControlServer.stop()
         Task { @MainActor in
             kvmDeviceManager.cancelScan()
+            await sessionCoordinator.disconnect().value
             await inputManager.shutdown()
-            webRTCManager.disconnect()
             sender.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater

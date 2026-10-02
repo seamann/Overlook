@@ -3,6 +3,7 @@ import Network
 import Combine
 import CryptoKit
 import Security
+import LocalAuthentication
 
 @MainActor
 final class KVMDeviceManager: NSObject, ObservableObject {
@@ -12,12 +13,23 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     @Published var isScanning = false
     @Published var scanProgress: Double = 0.0
     @Published var autoScanEnabled: Bool = false
+    @Published private(set) var mouseJigglerEnabled: Bool?
+    @Published private(set) var mouseJigglerSupported: Bool?
+    @Published private(set) var isMouseJigglerUpdating = false
+    @Published private(set) var connectionSessionID: UUID?
     
     private var networkMonitor: NWPathMonitor?
     private var scanTimer: Timer?
     private var scanTask: Task<Void, Never>?
     private var scanGeneration = 0
     private var deviceDiscoverySessions: [NWBrowser] = []
+    private var persistedDeviceLoadTask: Task<Void, Never>?
+    private var connectionGeneration = 0
+    private var configurationGeneration = 0
+    private var mouseJigglerRefreshTask: Task<Void, Never>?
+    private var headlessConfigurationLockState = HeadlessConfigurationLockState()
+    private var mouseJigglerOperationState = OperationOwnershipState()
+    private let systemConfigMutationGate = RemoteMutationGate(maximumPendingMutations: 4)
 
     private final class InsecureTLSDelegate: NSObject, URLSessionDelegate {
         func urlSession(
@@ -48,7 +60,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
 
     private static let savedDevicesKey = "overlook.saved_devices.v1"
 
-    private struct PersistedDevice: Codable, Hashable {
+    private struct PersistedDevice: Codable, Hashable, Sendable {
         let host: String
         let port: Int
         let name: String
@@ -686,12 +698,29 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         availableDevices.append(device)
         return device
     }
-    
+
+    func makeManualDeviceUsingStoredToken(host: String, port: Int, type: KVMDeviceType) async throws -> KVMDevice {
+        try Task.checkCancellation()
+        let storedToken = await Task.detached(priority: .userInitiated) {
+            KVMTokenStore.load(host: host, port: port)
+        }.value
+        try Task.checkCancellation()
+        return KVMDevice(
+            id: "manual-\(UUID().uuidString)",
+            name: "Manual KVM @ \(host):\(port)",
+            host: host,
+            port: port,
+            type: type,
+            authToken: storedToken ?? "",
+            capabilities: [.videoStreaming, .keyboardInput, .mouseInput]
+        )
+    }
+
     func removeDevice(_ device: KVMDevice) {
         availableDevices.removeAll { $0.id == device.id }
         
         if connectedDevice?.id == device.id {
-            connectedDevice = nil
+            clearConnectedDevice()
         }
     }
 
@@ -699,67 +728,323 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         let host = device.host
         let port = device.port
 
-        var current = readPersistedDevices()
+        var current = EndpointRecordPolicy.keepingLast(readPersistedDevices()) {
+            "\($0.host):\($0.port)"
+        }
         current.removeAll { $0.host == host && $0.port == port }
         writePersistedDevices(current)
 
         availableDevices.removeAll { $0.host == host && $0.port == port }
         if connectedDevice?.host == host, connectedDevice?.port == port {
-            connectedDevice = nil
-            glkvmClient = nil
+            clearConnectedDevice()
         }
     }
     
-    @discardableResult
-    func connectToDevice(_ device: KVMDevice, authToken: String? = nil, password: String? = nil, user: String = "admin") async throws -> KVMDevice {
-        // Validate device connection
+    // Preparation may overlap a newer attempt. Publication and persistence are
+    // reserved for the coordinator's synchronous, generation-checked commit.
+    func prepareConnection(
+        _ device: KVMDevice,
+        authToken: String? = nil,
+        password: String? = nil,
+        user: String = "admin"
+    ) async throws -> PreparedKVMConnection {
+        try Task.checkCancellation()
         let isValid = try await validateDeviceConnection(device)
-        guard isValid else {
-            throw KVMError.connectionFailed
-        }
-        
-        // Update device auth token if provided
-        var finalDevice: KVMDevice
-        if let token = authToken {
-            var updatedDevice = device
-            updatedDevice.authToken = token
+        try Task.checkCancellation()
+        guard isValid else { throw KVMError.connectionFailed }
 
-            // Update in available devices
-            if let index = availableDevices.firstIndex(where: { $0.id == device.id }) {
-                availableDevices[index] = updatedDevice
+        let candidate = KVMDevice(
+            id: device.id, name: device.name, host: device.host, port: device.port,
+            type: device.type, authToken: authToken ?? device.authToken,
+            capabilities: device.capabilities
+        )
+        let client = try GLKVMClient(device: candidate, allowInsecureTLS: true)
+        do {
+            try await client.authCheck()
+            try Task.checkCancellation()
+            return PreparedKVMConnection(device: candidate, client: client)
+        } catch {
+            try Task.checkCancellation()
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw CancellationError()
             }
+            guard let password, !password.isEmpty else { throw KVMError.authenticationFailed }
+            let token = try await client.authLogin(user: user, password: password)
+            try Task.checkCancellation()
+            client.authToken = token
+            let authenticated = KVMDevice(
+                id: candidate.id, name: candidate.name, host: candidate.host, port: candidate.port,
+                type: candidate.type, authToken: token, capabilities: candidate.capabilities
+            )
+            return PreparedKVMConnection(device: authenticated, client: client)
+        }
+    }
 
-            finalDevice = updatedDevice
-        } else {
-            finalDevice = device
+    @discardableResult
+    func commitConnection(_ prepared: PreparedKVMConnection) -> KVMDevice {
+        let persisted = persistDevice(prepared.device)
+        connectionGeneration &+= 1
+        configurationGeneration &+= 1
+        mouseJigglerRefreshTask?.cancel()
+        mouseJigglerRefreshTask = nil
+        mouseJigglerOperationState.reset()
+        connectionSessionID = UUID()
+        connectedDevice = persisted
+        glkvmClient = prepared.client
+        mouseJigglerEnabled = nil
+        mouseJigglerSupported = nil
+        isMouseJigglerUpdating = false
+        scheduleMouseJigglerRefresh(client: prepared.client, deviceID: persisted.id, generation: connectionGeneration)
+        return persisted
+    }
+
+    func refreshMouseJigglerState() async {
+        guard let client = glkvmClient, let deviceID = connectedDevice?.id else {
+            mouseJigglerEnabled = nil
+            mouseJigglerSupported = nil
+            return
         }
 
-        guard let client = try? GLKVMClient(device: finalDevice, allowInsecureTLS: true) else {
-            throw KVMError.connectionFailed
+        await refreshMouseJigglerState(
+            client: client,
+            deviceID: deviceID,
+            generation: connectionGeneration
+        )
+    }
+
+    func setMouseJigglerEnabled(_ enabled: Bool) async throws {
+        guard MouseJigglerPolicy.allowsRequestedState(
+            enabled,
+            isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
+        ) else {
+            throw MouseJigglerError.settingsLockedForHeadless
+        }
+        guard let client = glkvmClient, let deviceID = connectedDevice?.id else {
+            throw MouseJigglerError.unavailable
+        }
+
+        let generation = connectionGeneration
+        configurationGeneration &+= 1
+        let operationGeneration = configurationGeneration
+        let operationOwner = mouseJigglerOperationState.begin()
+        isMouseJigglerUpdating = true
+        defer {
+            mouseJigglerOperationState.end(operationOwner)
+            isMouseJigglerUpdating = mouseJigglerOperationState.isActive
         }
 
         do {
-            try await client.authCheck()
-        } catch {
-            if let password, !password.isEmpty {
-                let token = try await client.authLogin(user: user, password: password)
-                client.authToken = token
-
-                var updated = finalDevice
-                updated.authToken = token
-                if let index = availableDevices.firstIndex(where: { $0.id == updated.id }) {
-                    availableDevices[index] = updated
+            let readback = try await systemConfigMutationGate.perform { [weak self] in
+                guard let self,
+                      self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                      self.configurationGeneration == operationGeneration
+                else {
+                    throw CancellationError()
                 }
-                finalDevice = updated
-            } else {
-                throw KVMError.authenticationFailed
+                guard MouseJigglerPolicy.allowsRequestedState(
+                    enabled,
+                    isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+                ) else {
+                    throw MouseJigglerError.settingsLockedForHeadless
+                }
+
+                var current = try await client.getSystemConfig()
+                guard current.supportsMouseJiggle else {
+                    throw MouseJigglerError.unavailable
+                }
+                guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                      self.configurationGeneration == operationGeneration
+                else {
+                    throw CancellationError()
+                }
+                guard MouseJigglerPolicy.allowsRequestedState(
+                    enabled,
+                    isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+                ) else {
+                    throw MouseJigglerError.settingsLockedForHeadless
+                }
+
+                current.mouseJiggle = enabled
+                _ = try await client.setSystemConfig(current)
+                guard self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                      self.configurationGeneration == operationGeneration
+                else {
+                    throw CancellationError()
+                }
+                guard MouseJigglerPolicy.allowsRequestedState(
+                    enabled,
+                    isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+                ) else {
+                    throw MouseJigglerError.settingsLockedForHeadless
+                }
+
+                return try await client.getSystemConfig()
             }
+
+            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                  configurationGeneration == operationGeneration
+            else {
+                throw CancellationError()
+            }
+            guard MouseJigglerPolicy.allowsRequestedState(
+                enabled,
+                isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
+            ) else {
+                throw MouseJigglerError.settingsLockedForHeadless
+            }
+            guard MouseJigglerPolicy.acceptsReadback(requested: enabled, returned: readback.mouseJiggle) else {
+                throw MouseJigglerError.readbackMismatch
+            }
+            guard readback.supportsMouseJiggle else {
+                throw MouseJigglerError.unavailable
+            }
+            mouseJigglerSupported = true
+            mouseJigglerEnabled = readback.mouseJiggle
+        } catch {
+            if isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+               configurationGeneration == operationGeneration {
+                mouseJigglerEnabled = nil
+                scheduleMouseJigglerRefresh(client: client, deviceID: deviceID, generation: generation)
+            }
+            throw error
+        }
+    }
+
+    func applySystemConfig(
+        _ config: GLKVMSystemConfig,
+        connectionSessionID expectedSessionID: UUID
+    ) async throws -> GLKVMSystemConfig {
+        guard MouseJigglerPolicy.allowsSettingsApply(
+            isHeadlessConfigurationLocked: headlessConfigurationLockState.isLocked
+        ) else {
+            throw MouseJigglerError.settingsLockedForHeadless
+        }
+        guard connectionSessionID == expectedSessionID,
+              let client = glkvmClient,
+              let deviceID = connectedDevice?.id
+        else {
+            throw MouseJigglerError.unavailable
+        }
+        let generation = connectionGeneration
+        let operationGeneration = configurationGeneration
+
+        let updated = try await systemConfigMutationGate.perform { [weak self] in
+            guard let self,
+                  self.connectionSessionID == expectedSessionID,
+                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                  self.configurationGeneration == operationGeneration
+            else {
+                throw CancellationError()
+            }
+            guard MouseJigglerPolicy.allowsSettingsApply(
+                isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+            ) else {
+                throw MouseJigglerError.settingsLockedForHeadless
+            }
+            let current = try await client.getSystemConfig()
+            guard self.connectionSessionID == expectedSessionID,
+                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                  self.configurationGeneration == operationGeneration
+            else {
+                throw CancellationError()
+            }
+            guard MouseJigglerPolicy.allowsSettingsApply(
+                isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+            ) else {
+                throw MouseJigglerError.settingsLockedForHeadless
+            }
+            var merged = config
+            merged.mouseJiggle = current.mouseJiggle
+            merged.supportsMouseJiggle = current.supportsMouseJiggle
+            let updated = try await client.setSystemConfig(merged)
+            guard self.connectionSessionID == expectedSessionID,
+                  self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+                  self.configurationGeneration == operationGeneration
+            else {
+                throw CancellationError()
+            }
+            guard MouseJigglerPolicy.allowsSettingsApply(
+                isHeadlessConfigurationLocked: self.headlessConfigurationLockState.isLocked
+            ) else {
+                throw MouseJigglerError.settingsLockedForHeadless
+            }
+            return updated
         }
 
-        let persisted = persistDevice(finalDevice)
-        connectedDevice = persisted
-        glkvmClient = client
-        return persisted
+        guard connectionSessionID == expectedSessionID,
+              isCurrentConnection(client: client, deviceID: deviceID, generation: generation),
+              configurationGeneration == operationGeneration
+        else {
+            throw CancellationError()
+        }
+        mouseJigglerSupported = updated.supportsMouseJiggle
+        mouseJigglerEnabled = updated.supportsMouseJiggle ? updated.mouseJiggle : nil
+        return updated
+    }
+
+    func beginHeadlessConfigurationTransition() -> UUID {
+        configurationGeneration &+= 1
+        return headlessConfigurationLockState.beginTransition()
+    }
+
+    func endHeadlessConfigurationTransition(_ owner: UUID) {
+        headlessConfigurationLockState.endTransition(owner)
+    }
+
+    func setHeadlessModeActive(_ isActive: Bool) {
+        configurationGeneration &+= 1
+        headlessConfigurationLockState.setHeadlessModeActive(isActive)
+    }
+
+    private func scheduleMouseJigglerRefresh(client: GLKVMClient, deviceID: String, generation: Int) {
+        mouseJigglerRefreshTask?.cancel()
+        mouseJigglerRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            await self.refreshMouseJigglerState(client: client, deviceID: deviceID, generation: generation)
+            if self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation) {
+                self.mouseJigglerRefreshTask = nil
+            }
+        }
+    }
+
+    private func refreshMouseJigglerState(client: GLKVMClient, deviceID: String, generation: Int) async {
+        do {
+            let config = try await systemConfigMutationGate.perform { [weak self] in
+                guard let self,
+                      self.isCurrentConnection(client: client, deviceID: deviceID, generation: generation)
+                else {
+                    throw CancellationError()
+                }
+                return try await client.getSystemConfig()
+            }
+            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+            mouseJigglerSupported = config.supportsMouseJiggle
+            mouseJigglerEnabled = config.supportsMouseJiggle ? config.mouseJiggle : nil
+        } catch {
+            guard isCurrentConnection(client: client, deviceID: deviceID, generation: generation) else { return }
+            mouseJigglerEnabled = nil
+        }
+    }
+
+    private func isCurrentConnection(client: GLKVMClient, deviceID: String, generation: Int) -> Bool {
+        connectionGeneration == generation
+            && glkvmClient === client
+            && connectedDevice?.id == deviceID
+    }
+
+    private func clearConnectedDevice() {
+        connectionGeneration &+= 1
+        configurationGeneration &+= 1
+        mouseJigglerRefreshTask?.cancel()
+        mouseJigglerRefreshTask = nil
+        mouseJigglerEnabled = nil
+        mouseJigglerSupported = nil
+        mouseJigglerOperationState.reset()
+        isMouseJigglerUpdating = false
+        headlessConfigurationLockState.reset()
+        connectionSessionID = nil
+        connectedDevice = nil
+        glkvmClient = nil
     }
 
     private func persistDevice(_ device: KVMDevice) -> KVMDevice {
@@ -773,16 +1058,14 @@ final class KVMDeviceManager: NSObject, ObservableObject {
             capabilities: device.capabilities
         )
 
-        var current = readPersistedDevices()
-        if let index = current.firstIndex(where: { $0.host == device.host && $0.port == device.port }) {
-            current[index] = record
-        } else {
-            current.append(record)
-        }
+        let current = EndpointRecordPolicy.replacing(
+            readPersistedDevices(),
+            with: record
+        ) { "\($0.host):\($0.port)" }
         writePersistedDevices(current)
 
         var saved = device
-        saved.id = savedDeviceId(host: device.host, port: device.port)
+        saved.id = Self.savedDeviceId(host: device.host, port: device.port)
 
         availableDevices.removeAll { $0.host == device.host && $0.port == device.port }
         availableDevices.append(saved)
@@ -791,34 +1074,78 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
 
     private func loadPersistedDevices() {
-        let records = readPersistedDevices()
+        let records = EndpointRecordPolicy.keepingLast(readPersistedDevices()) {
+            "\($0.host):\($0.port)"
+        }
         guard !records.isEmpty else { return }
 
-        let devices: [KVMDevice] = records.map { record in
-            let token = KVMTokenStore.load(host: record.host, port: record.port) ?? record.authToken ?? ""
-            if !token.isEmpty, record.authToken != nil {
-                _ = KVMTokenStore.save(token, host: record.host, port: record.port)
-            }
-            return KVMDevice(
-                id: savedDeviceId(host: record.host, port: record.port),
-                name: record.name,
-                host: record.host,
-                port: record.port,
-                type: record.type,
-                authToken: token,
-                capabilities: record.capabilities
-            )
-        }
-        availableDevices = removeDuplicates(from: devices).sorted { $0.name < $1.name }
-        if records.contains(where: { $0.authToken != nil }) {
-            writePersistedDevices(records.map {
-                let persisted = KVMTokenStore.load(host: $0.host, port: $0.port) != nil
-                return PersistedDevice(host: $0.host, port: $0.port, name: $0.name, type: $0.type, authToken: persisted ? nil : $0.authToken, capabilities: $0.capabilities)
-            })
+        mergePersistedDevices(records.map { record in
+            persistedKVMDevice(from: record, authToken: record.authToken ?? "")
+        })
+
+        persistedDeviceLoadTask?.cancel()
+        persistedDeviceLoadTask = Task { @MainActor [weak self] in
+            let loaded = await Task.detached(priority: .userInitiated) {
+                records.map { record in
+                    let keychainToken = KVMTokenStore.load(host: record.host, port: record.port)
+                    let token = keychainToken ?? record.authToken ?? ""
+                    return KVMDevice(
+                        id: Self.savedDeviceId(host: record.host, port: record.port),
+                        name: record.name,
+                        host: record.host,
+                        port: record.port,
+                        type: record.type,
+                        authToken: token,
+                        capabilities: record.capabilities
+                    )
+                }
+            }.value
+
+            guard let self, !Task.isCancelled else { return }
+            self.mergePersistedDevices(loaded)
+            self.persistedDeviceLoadTask = nil
         }
     }
 
-    private func savedDeviceId(host: String, port: Int) -> String {
+    private func persistedKVMDevice(from record: PersistedDevice, authToken: String) -> KVMDevice {
+        KVMDevice(
+            id: Self.savedDeviceId(host: record.host, port: record.port),
+            name: record.name,
+            host: record.host,
+            port: record.port,
+            type: record.type,
+            authToken: authToken,
+            capabilities: record.capabilities
+        )
+    }
+
+    private func mergePersistedDevices(_ loadedDevices: [KVMDevice]) {
+        var merged = availableDevices
+
+        for loaded in loadedDevices {
+            if let index = merged.firstIndex(where: { $0.host == loaded.host && $0.port == loaded.port }) {
+                let current = merged[index]
+                merged[index] = KVMDevice(
+                    id: loaded.id,
+                    name: current.name,
+                    host: current.host,
+                    port: current.port,
+                    type: current.type,
+                    authToken: CredentialMergePolicy.preferredToken(
+                        current: current.authToken,
+                        loaded: loaded.authToken
+                    ),
+                    capabilities: current.capabilities.union(loaded.capabilities)
+                )
+            } else {
+                merged.append(loaded)
+            }
+        }
+
+        availableDevices = removeDuplicates(from: merged).sorted { $0.name < $1.name }
+    }
+
+    private nonisolated static func savedDeviceId(host: String, port: Int) -> String {
         let safeHost = host.replacingOccurrences(of: ":", with: "_")
         return "saved-\(safeHost)-\(port)"
     }
@@ -834,7 +1161,8 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     private func validateDeviceConnection(_ device: KVMDevice) async throws -> Bool {
-        guard let port = NWEndpoint.Port(rawValue: UInt16(device.port)) else {
+        guard let rawPort = UInt16(exactly: device.port),
+              let port = NWEndpoint.Port(rawValue: rawPort) else {
             return false
         }
 
@@ -884,12 +1212,13 @@ final class KVMDeviceManager: NSObject, ObservableObject {
     }
     
     func disconnectFromDevice() {
-        connectedDevice = nil
-        glkvmClient = nil
+        clearConnectedDevice()
     }
     
     deinit {
         scanTask?.cancel()
+        persistedDeviceLoadTask?.cancel()
+        mouseJigglerRefreshTask?.cancel()
         networkMonitor?.cancel()
         scanTimer?.invalidate()
         deviceDiscoverySessions.forEach { $0.cancel() }
@@ -904,114 +1233,43 @@ private enum KVMTokenStore {
     @discardableResult
     static func save(_ token: String, host: String, port: Int) -> Bool {
         let account = account(host: host, port: port)
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
-                                    kSecAttrService as String: service,
-                                    kSecAttrAccount as String: account]
-        SecItemDelete(query as CFDictionary)
-        var item = query
-        item[kSecValueData as String] = Data(token.utf8)
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { return false }
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
+        let baseQuery: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        var updateQuery = baseQuery
+        updateQuery[kSecUseAuthenticationContext as String] = authenticationContext
+        let attributes: [String: Any] = [kSecValueData as String: Data(token.utf8)]
+        let updateStatus = SecItemUpdate(updateQuery as CFDictionary, attributes as CFDictionary)
+
+        if updateStatus == errSecItemNotFound {
+            var item = baseQuery
+            item[kSecValueData as String] = Data(token.utf8)
+            item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            guard SecItemAdd(item as CFDictionary, nil) == errSecSuccess else { return false }
+        } else if updateStatus != errSecSuccess {
+            return false
+        }
+
         return load(host: host, port: port) == token
     }
 
     static func load(host: String, port: Int) -> String? {
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = true
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword,
                                     kSecAttrService as String: service,
                                     kSecAttrAccount as String: account(host: host, port: port),
                                     kSecReturnData as String: true,
-                                    kSecMatchLimit as String: kSecMatchLimitOne]
+                                    kSecMatchLimit as String: kSecMatchLimitOne,
+                                    kSecUseAuthenticationContext as String: authenticationContext]
         var result: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
-    }
-}
-
-// MARK: - KVM Device Model
-struct KVMDevice: Identifiable, Codable {
-    var id: String
-    var name: String
-    let host: String
-    let port: Int
-    var type: KVMDeviceType
-    var authToken: String
-    let capabilities: Set<KVMCapability>
-    
-    var connectionString: String {
-        return "\(host):\(port)"
-    }
-
-    var httpScheme: String {
-        GLKVMClient.defaultHTTPScheme(for: port)
-    }
-
-    var webSocketScheme: String {
-        GLKVMClient.defaultWebSocketScheme(for: port)
-    }
-
-    var originURL: String {
-        return "\(httpScheme)://\(host):\(port)"
-    }
-    
-    var webRTCURL: String {
-        return "\(webSocketScheme)://\(host):\(port)/janus/ws"
-    }
-}
-
-extension KVMDevice: Hashable {
-    static func == (lhs: KVMDevice, rhs: KVMDevice) -> Bool {
-        lhs.id == rhs.id
-    }
-
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-}
-
-enum KVMDeviceType: String, Codable, CaseIterable {
-    case glinetComet = "glinet_comet"
-    case generic = "generic"
-    case tailscale = "tailscale"
-    case custom = "custom"
-    
-    var displayName: String {
-        switch self {
-        case .glinetComet:
-            return "GL.iNet Comet"
-        case .generic:
-            return "Generic KVM"
-        case .tailscale:
-            return "Tailscale KVM"
-        case .custom:
-            return "Custom KVM"
-        }
-    }
-}
-
-enum KVMCapability: String, Codable, CaseIterable {
-    case videoStreaming = "video_streaming"
-    case keyboardInput = "keyboard_input"
-    case mouseInput = "mouse_input"
-    case virtualMedia = "virtual_media"
-    case powerManagement = "power_management"
-    case ocrSupport = "ocr_support"
-    
-    var displayName: String {
-        switch self {
-        case .videoStreaming:
-            return "Video Streaming"
-        case .keyboardInput:
-            return "Keyboard Input"
-        case .mouseInput:
-            return "Mouse Input"
-        case .virtualMedia:
-            return "Virtual Media"
-        case .powerManagement:
-            return "Power Management"
-        case .ocrSupport:
-            return "OCR Support"
-        }
     }
 }
 
@@ -1034,6 +1292,26 @@ enum KVMError: Error, LocalizedError {
             return "Device does not support this capability"
         case .networkUnavailable:
             return "Network is not available"
+        }
+    }
+}
+
+enum MouseJigglerError: Error, LocalizedError {
+    case unavailable
+    case operationInProgress
+    case readbackMismatch
+    case settingsLockedForHeadless
+
+    var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            return "Mouse jiggler is unavailable for the current connection"
+        case .operationInProgress:
+            return "Mouse jiggler is already being updated"
+        case .readbackMismatch:
+            return "The KVM did not confirm the requested mouse jiggler state"
+        case .settingsLockedForHeadless:
+            return "KVM settings are locked while Headless mode is active"
         }
     }
 }

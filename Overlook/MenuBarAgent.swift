@@ -11,11 +11,12 @@ class MenuBarAgent: NSObject, ObservableObject {
     private var globalKeyMonitor: Any?
 
     private let kvmDeviceManager: KVMDeviceManager
-    private let webRTCManager: WebRTCManager
     private let inputManager: InputManager
+    private let sessionCoordinator: SessionConnectionCoordinator
     private let showMainWindow: () -> Void
     
     @Published var isConnected = false
+    @Published var isConnecting = false
     @Published var currentDevice: KVMDevice?
     @Published var availableDevices: [KVMDevice] = []
     
@@ -23,13 +24,13 @@ class MenuBarAgent: NSObject, ObservableObject {
 
     init(
         kvmDeviceManager: KVMDeviceManager,
-        webRTCManager: WebRTCManager,
         inputManager: InputManager,
+        sessionCoordinator: SessionConnectionCoordinator,
         showMainWindow: @escaping () -> Void
     ) {
         self.kvmDeviceManager = kvmDeviceManager
-        self.webRTCManager = webRTCManager
         self.inputManager = inputManager
+        self.sessionCoordinator = sessionCoordinator
         self.showMainWindow = showMainWindow
         super.init()
     }
@@ -39,7 +40,6 @@ class MenuBarAgent: NSObject, ObservableObject {
         createMenu()
         setupKeyboardShortcuts()
 
-        inputManager.setup(with: webRTCManager)
         bindManagers()
     }
 
@@ -47,6 +47,7 @@ class MenuBarAgent: NSObject, ObservableObject {
         availableDevices = kvmDeviceManager.availableDevices
         currentDevice = kvmDeviceManager.connectedDevice
         isConnected = (kvmDeviceManager.connectedDevice != nil)
+        isConnecting = sessionCoordinator.isConnecting
         updateStatusIcon()
         updateDeviceMenu()
 
@@ -66,6 +67,14 @@ class MenuBarAgent: NSObject, ObservableObject {
                 self.updateStatusIcon()
                 self.updateStatusMenuItem()
                 self.updateDeviceMenu()
+            }
+            .store(in: &cancellables)
+
+        sessionCoordinator.$isConnecting
+            .sink { [weak self] connecting in
+                guard let self else { return }
+                self.isConnecting = connecting
+                self.updateStatusMenuItem(isConnecting: connecting)
             }
             .store(in: &cancellables)
     }
@@ -236,17 +245,26 @@ class MenuBarAgent: NSObject, ObservableObject {
         }
     }
 
-    private func updateStatusMenuItem() {
+    private func updateStatusMenuItem(isConnecting: Bool? = nil) {
+        let connecting = isConnecting ?? self.isConnecting
         if let statusItem = menu?.items.first(where: { $0.tag == 100 }) {
-            if let device = kvmDeviceManager.connectedDevice {
+            if connecting {
+                statusItem.title = "Connecting..."
+            } else if let device = currentDevice {
                 statusItem.title = "Connected to \(device.name)"
             } else {
                 statusItem.title = "Status: Disconnected"
             }
         }
         if let disconnectItem = menu?.items.first(where: { $0.tag == 101 }) {
-            disconnectItem.isEnabled = (kvmDeviceManager.connectedDevice != nil)
+            disconnectItem.isEnabled = connecting || currentDevice != nil
         }
+    }
+
+    private func runLocalModal(alert: NSAlert, owner: UUID) -> NSApplication.ModalResponse {
+        inputManager.setLocalUIBlocked(true, owner: owner)
+        defer { inputManager.setLocalUIBlocked(false, owner: owner) }
+        return alert.runModal()
     }
 
     private func promptForPassword(deviceName: String) -> String? {
@@ -261,10 +279,10 @@ class MenuBarAgent: NSObject, ObservableObject {
         passwordField.placeholderString = "Password"
         alert.accessoryView = passwordField
 
-        let response = alert.runModal()
+        let response = runLocalModal(alert: alert, owner: UUID())
         guard response == .alertFirstButtonReturn else { return nil }
 
-        let pw = passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pw = passwordField.stringValue
         return pw.isEmpty ? nil : pw
     }
 
@@ -274,7 +292,7 @@ class MenuBarAgent: NSObject, ObservableObject {
         alert.informativeText = message
         alert.alertStyle = .warning
         alert.addButton(withTitle: "OK")
-        alert.runModal()
+        _ = runLocalModal(alert: alert, owner: UUID())
     }
     
     @objc private func togglePopover(_ sender: Any?) {
@@ -298,16 +316,16 @@ class MenuBarAgent: NSObject, ObservableObject {
                     onShowWindow: { [weak self] in self?.showMainWindow() },
                     onScan: { [weak self] in self?.kvmDeviceManager.scanForDevices() },
                     onConnect: { [weak self] device in
-                        guard let self else { return }
-                        Task { await self.connectSession(to: device) }
+                        self?.connectSession(to: device)
                     },
                     onDisconnect: { [weak self] in
-                        guard let self else { return }
-                        self.disconnectSession()
+                        self?.disconnectSession()
                     },
                     onForget: { [weak self] device in
-                        guard let self else { return }
-                        self.kvmDeviceManager.forgetDevice(device)
+                        self?.forgetSavedDevice(device)
+                    },
+                    onRemove: { [weak self] device in
+                        self?.removeManualEntry(device)
                     }
                 )
             )
@@ -323,48 +341,59 @@ class MenuBarAgent: NSObject, ObservableObject {
     @objc private func connectToDevice(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? KVMDevice else { return }
 
-        Task { await connectSession(to: device) }
+        connectSession(to: device)
     }
 
-    private func connectSession(to device: KVMDevice) async {
+    private func connectSession(to device: KVMDevice) {
         showMainWindow()
+        let attempt = sessionCoordinator.startConnection(to: device)
+        handleConnection(
+            attempt,
+            deviceName: device.name,
+            retry: { [sessionCoordinator] password in
+                sessionCoordinator.startConnection(to: device, password: password)
+            }
+        )
+    }
 
+    private func handleConnection(
+        _ attempt: SessionConnectionCoordinator.Attempt,
+        deviceName: String,
+        retry: @escaping @MainActor (String) -> SessionConnectionCoordinator.Attempt
+    ) {
+        Task { @MainActor [weak self] in
+            await self?.awaitConnection(attempt, deviceName: deviceName, retry: retry)
+        }
+    }
+
+    private func awaitConnection(
+        _ attempt: SessionConnectionCoordinator.Attempt,
+        deviceName: String,
+        retry: @escaping @MainActor (String) -> SessionConnectionCoordinator.Attempt
+    ) async {
         do {
-            let connected = try await kvmDeviceManager.connectToDevice(device)
-            await finishSessionConnect(connected)
+            _ = try await attempt.task.value
+            guard sessionCoordinator.isCurrent(attempt.id) else { return }
+            closePopover()
         } catch {
+            if Self.isCancellation(error) { return }
+            guard sessionCoordinator.isCurrent(attempt.id) else { return }
+
             if let kvmError = error as? KVMError, kvmError == .authenticationFailed {
-                guard let password = promptForPassword(deviceName: device.name) else { return }
-                do {
-                    let connected = try await kvmDeviceManager.connectToDevice(device, password: password)
-                    await finishSessionConnect(connected)
-                } catch {
-                    showError(title: "Failed to connect", message: String(describing: error))
-                }
+                guard let password = promptForPassword(deviceName: deviceName) else { return }
+                guard sessionCoordinator.isCurrent(attempt.id) else { return }
+                let retryAttempt = retry(password)
+                await awaitConnection(retryAttempt, deviceName: deviceName, retry: retry)
                 return
             }
 
-            showError(title: "Failed to connect", message: String(describing: error))
+            guard sessionCoordinator.isCurrent(attempt.id) else { return }
+            showError(title: "Failed to connect", message: error.localizedDescription)
         }
     }
 
-    private func finishSessionConnect(_ connectedDevice: KVMDevice) async {
-        if let client = kvmDeviceManager.glkvmClient {
-            inputManager.setGLKVMClient(client)
-            inputManager.startFullInputCapture()
-            try? await client.setHidConnected(true)
-        }
-
-        closePopover()
-
-#if canImport(WebRTC)
-        do {
-            try await webRTCManager.connect(to: connectedDevice)
-        } catch {
-            // still consider ourselves connected at the API layer
-            showError(title: "WebRTC connect failed", message: String(describing: error))
-        }
-#endif
+    private static func isCancellation(_ error: Error) -> Bool {
+        error is CancellationError || (error as? URLError)?.code == .cancelled
     }
 
     @objc private func disconnectAction() {
@@ -372,17 +401,7 @@ class MenuBarAgent: NSObject, ObservableObject {
     }
 
     private func disconnectSession() {
-        webRTCManager.disconnect()
-
-        let client = kvmDeviceManager.glkvmClient
-        Task {
-            try? await client?.setHidConnected(false)
-        }
-
-        kvmDeviceManager.disconnectFromDevice()
-        inputManager.setGLKVMClient(nil)
-        inputManager.stopFullInputCapture()
-
+        _ = sessionCoordinator.disconnect()
         closePopover()
     }
     
@@ -413,7 +432,7 @@ class MenuBarAgent: NSObject, ObservableObject {
         view.addSubview(passwordField)
         alert.accessoryView = view
 
-        let response = alert.runModal()
+        let response = runLocalModal(alert: alert, owner: UUID())
         guard response == .alertFirstButtonReturn else { return }
 
         let raw = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -436,22 +455,28 @@ class MenuBarAgent: NSObject, ObservableObject {
         }
 
         let port = Int(portString) ?? 443
-        let device = kvmDeviceManager.addManualDevice(host: host, port: port, type: .glinetComet)
-        let password = passwordField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        Task {
-            if password.isEmpty {
-                await connectSession(to: device)
-            } else {
-                showMainWindow()
-                do {
-                    let connected = try await kvmDeviceManager.connectToDevice(device, password: password)
-                    await finishSessionConnect(connected)
-                } catch {
-                    showError(title: "Failed to connect", message: String(describing: error))
-                }
-            }
+        let password = passwordField.stringValue
+        let deviceName = "Manual KVM @ \(host):\(port)"
+        let deviceFactory: @MainActor () async throws -> KVMDevice = { [kvmDeviceManager] in
+            try await kvmDeviceManager.makeManualDeviceUsingStoredToken(
+                host: host,
+                port: port,
+                type: .glinetComet
+            )
         }
+
+        showMainWindow()
+        let attempt = sessionCoordinator.startConnection(
+            deviceFactory: deviceFactory,
+            password: password.isEmpty ? nil : password
+        )
+        handleConnection(
+            attempt,
+            deviceName: deviceName,
+            retry: { [sessionCoordinator] password in
+                sessionCoordinator.startConnection(deviceFactory: deviceFactory, password: password)
+            }
+        )
     }
     
     @objc private func scanForDevices() {
@@ -498,7 +523,7 @@ class MenuBarAgent: NSObject, ObservableObject {
         
         alert.accessoryView = view
         
-        let response = alert.runModal()
+        let response = runLocalModal(alert: alert, owner: UUID())
         if response == .alertFirstButtonReturn {
             let ip = ipField.stringValue
             let port = portField.integerValue
@@ -511,20 +536,32 @@ class MenuBarAgent: NSObject, ObservableObject {
 
     @objc private func forgetDevice(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? KVMDevice else { return }
-        if kvmDeviceManager.connectedDevice?.host == device.host, kvmDeviceManager.connectedDevice?.port == device.port {
-            showError(title: "Cannot forget", message: "Disconnect before forgetting this device.")
-            return
-        }
+        disconnectIfNeeded(for: device)
         kvmDeviceManager.forgetDevice(device)
     }
 
     @objc private func removeManualDevice(_ sender: NSMenuItem) {
         guard let device = sender.representedObject as? KVMDevice else { return }
-        if kvmDeviceManager.connectedDevice?.host == device.host, kvmDeviceManager.connectedDevice?.port == device.port {
-            showError(title: "Cannot remove", message: "Disconnect before removing this device.")
-            return
-        }
+        disconnectIfNeeded(for: device)
         kvmDeviceManager.removeDevice(device)
+    }
+
+    private func forgetSavedDevice(_ device: KVMDevice) {
+        disconnectIfNeeded(for: device)
+        kvmDeviceManager.forgetDevice(device)
+    }
+
+    private func removeManualEntry(_ device: KVMDevice) {
+        disconnectIfNeeded(for: device)
+        kvmDeviceManager.removeDevice(device)
+    }
+
+    private func disconnectIfNeeded(for device: KVMDevice) {
+        let matchesCurrentEndpoint = kvmDeviceManager.connectedDevice?.host == device.host
+            && kvmDeviceManager.connectedDevice?.port == device.port
+        if isConnecting || matchesCurrentEndpoint {
+            disconnectSession()
+        }
     }
 
     @objc private func showMainWindowAction() {
@@ -622,6 +659,7 @@ struct MenuBarView: View {
     let onConnect: (KVMDevice) -> Void
     let onDisconnect: () -> Void
     let onForget: (KVMDevice) -> Void
+    let onRemove: (KVMDevice) -> Void
     
     var body: some View {
         VStack(spacing: 0) {
@@ -664,7 +702,7 @@ struct MenuBarView: View {
                                     onForget(device)
                                 },
                                 onRemoveManual: {
-                                    kvmDeviceManager.removeDevice(device)
+                                    onRemove(device)
                                 }
                             )
                         }

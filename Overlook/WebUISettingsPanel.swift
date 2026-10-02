@@ -14,6 +14,7 @@ struct WebUISettingsPanel: View {
     @AppStorage("overlook.audio.outputDeviceUID") private var audioOutputDeviceUID: String = ""
 
     @State private var config: GLKVMSystemConfig?
+    @State private var configConnectionSessionID: UUID?
     @State private var keymaps: GLKVMHidKeymapsState?
     @State private var streamerState: GLKVMStreamerState?
     @State private var isLoading = false
@@ -529,12 +530,6 @@ struct WebUISettingsPanel: View {
                                 }
                             }
 
-                            Toggle("Mouse Jiggle", isOn: bindingBool(
-                                get: { $0.mouseJiggle },
-                                set: { $0.mouseJiggle = $1 },
-                                defaultValue: false
-                            ))
-
                             Picker("Mouse mode", selection: bindingBool(
                                 get: { $0.isAbsoluteMouse },
                                 set: { $0.isAbsoluteMouse = $1 },
@@ -719,11 +714,37 @@ struct WebUISettingsPanel: View {
             guard isPresented else { return }
             await load()
         }
+        .onChange(of: isPresented) { _, isPresented in
+            guard !isPresented else { return }
+            applyTask?.cancel()
+            applyTask = nil
+            applyStreamerTask?.cancel()
+            applyStreamerTask = nil
+            config = nil
+            configConnectionSessionID = nil
+            isLoading = false
+            isApplying = false
+            isApplyingStreamer = false
+            isApplyingEdid = false
+        }
+        .onChange(of: kvmDeviceManager.connectionSessionID) { _, _ in
+            guard isPresented else { return }
+            applyTask?.cancel()
+            applyStreamerTask?.cancel()
+            config = nil
+            configConnectionSessionID = nil
+            isLoading = false
+            isApplying = false
+            isApplyingStreamer = false
+            isApplyingEdid = false
+            isPresented = false
+        }
     }
 
     private func applyVideoQualityPreset(_ preset: Int) async {
         guard preset != videoQualityCustomTag else { return }
-        guard let client = kvmDeviceManager.glkvmClient else { return }
+        guard let session = activeSettingsSession() else { return }
+        let client = session.client
 
         var params: [String: String] = [:]
         var streamQuality: Int? = nil
@@ -755,18 +776,23 @@ struct WebUISettingsPanel: View {
         do {
             try await client.setStreamerParams(params)
             try? await Task.sleep(nanoseconds: 300_000_000)
+            guard isActiveSettingsSession(session) else { return }
             let st = try? await client.getStreamerState()
             await MainActor.run {
+                guard isActiveSettingsSession(session) else { return }
                 streamerState = st
                 syncStreamerDraft(from: st)
             }
         } catch {
             await MainActor.run {
-                recordError("Failed to apply quality preset: \(error)")
+                if isActiveSettingsSession(session) {
+                    recordError("Failed to apply quality preset: \(error)")
+                }
             }
         }
 
         await MainActor.run {
+            guard isActiveSettingsSession(session) else { return }
             isApplyingStreamer = false
             if let streamQuality {
                 updateConfig { $0.streamQuality = streamQuality }
@@ -852,9 +878,12 @@ struct WebUISettingsPanel: View {
     }
 
     private func load() async {
-        guard let client = kvmDeviceManager.glkvmClient else {
+        guard let client = kvmDeviceManager.glkvmClient,
+              let connectionSessionID = kvmDeviceManager.connectionSessionID
+        else {
             await MainActor.run {
                 config = nil
+                configConnectionSessionID = nil
                 keymaps = nil
                 streamerState = nil
                 currentEdid = ""
@@ -875,7 +904,14 @@ struct WebUISettingsPanel: View {
             let st = try await streamer
             let edidValue = try await client.getEDID()
             await MainActor.run {
+                guard isPresented,
+                      kvmDeviceManager.connectionSessionID == connectionSessionID
+                else {
+                    isLoading = false
+                    return
+                }
                 self.config = config
+                configConnectionSessionID = connectionSessionID
                 inputManager.setGLKVMAbsoluteMouseMode(config.isAbsoluteMouse)
                 webRTCManager.setPreferLowLatencyPlayout(config.videoProcessing == "low_latency_first")
                 self.keymaps = km
@@ -898,7 +934,9 @@ struct WebUISettingsPanel: View {
         } catch {
             await MainActor.run {
                 isLoading = false
-                recordError("Failed to load settings: \(error)")
+                if isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
+                    recordError("Failed to load settings: \(error)")
+                }
             }
         }
     }
@@ -942,7 +980,8 @@ struct WebUISettingsPanel: View {
 
     @MainActor
     private func applyEdid(_ value: String) async {
-        guard let client = kvmDeviceManager.glkvmClient else { return }
+        guard let session = activeSettingsSession() else { return }
+        let client = session.client
 
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -951,13 +990,17 @@ struct WebUISettingsPanel: View {
 
         do {
             try await client.setEDID(trimmed)
+            guard isActiveSettingsSession(session) else { return }
             let updated = try await client.getEDID()
+            guard isActiveSettingsSession(session) else { return }
             currentEdid = updated
             syncEdidSelectionFromCurrent()
             isApplyingEdid = false
         } catch {
-            isApplyingEdid = false
-            recordError("Failed to apply EDID: \(error)")
+            if isActiveSettingsSession(session) {
+                isApplyingEdid = false
+                recordError("Failed to apply EDID: \(error)")
+            }
         }
     }
 
@@ -991,14 +1034,20 @@ struct WebUISettingsPanel: View {
         guard isProgrammaticStreamerDraftUpdate == false else { return }
         applyStreamerTask?.cancel()
         applyStreamerTask = Task {
-            try? await Task.sleep(nanoseconds: 250_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 250_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isPresented else { return }
             await applyStreamerParams()
         }
     }
 
     @MainActor
     private func applyStreamerParams() async {
-        guard let client = kvmDeviceManager.glkvmClient else { return }
+        guard let session = activeSettingsSession() else { return }
+        let client = session.client
         guard streamerState != nil else { return }
 
         guard isProgrammaticStreamerDraftUpdate == false else { return }
@@ -1045,13 +1094,17 @@ struct WebUISettingsPanel: View {
         do {
             try await client.setStreamerParams(params)
             try? await Task.sleep(nanoseconds: 300_000_000)
+            guard isActiveSettingsSession(session) else { return }
             let st = try? await client.getStreamerState()
+            guard isActiveSettingsSession(session) else { return }
             streamerState = st
             syncStreamerDraft(from: st)
             isApplyingStreamer = false
         } catch {
-            isApplyingStreamer = false
-            recordError("Failed to apply streamer params: \(error)")
+            if isActiveSettingsSession(session) {
+                isApplyingStreamer = false
+                recordError("Failed to apply streamer params: \(error)")
+            }
         }
     }
 
@@ -1159,17 +1212,33 @@ struct WebUISettingsPanel: View {
     private func scheduleApply(_ config: GLKVMSystemConfig) {
         applyTask?.cancel()
         applyTask = Task {
-            try? await Task.sleep(nanoseconds: 150_000_000)
+            do {
+                try await Task.sleep(nanoseconds: 150_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isPresented else { return }
             await apply(config)
         }
     }
 
     private func apply(_ config: GLKVMSystemConfig) async {
-        guard let client = kvmDeviceManager.glkvmClient else { return }
+        guard let connectionSessionID = configConnectionSessionID,
+              kvmDeviceManager.connectionSessionID == connectionSessionID
+        else { return }
         await MainActor.run { isApplying = true }
         do {
-            let updated = try await client.setSystemConfig(config)
+            let updated = try await kvmDeviceManager.applySystemConfig(
+                config,
+                connectionSessionID: connectionSessionID
+            )
             await MainActor.run {
+                guard isPresented,
+                      kvmDeviceManager.connectionSessionID == connectionSessionID
+                else {
+                    isApplying = false
+                    return
+                }
                 self.config = updated
                 inputManager.setGLKVMAbsoluteMouseMode(updated.isAbsoluteMouse)
                 isApplying = false
@@ -1177,19 +1246,44 @@ struct WebUISettingsPanel: View {
         } catch {
             await MainActor.run {
                 isApplying = false
-                recordError("Failed to apply settings: \(error)")
+                if isPresented, kvmDeviceManager.connectionSessionID == connectionSessionID {
+                    recordError("Failed to apply settings: \(error)")
+                }
             }
         }
     }
 
+    private struct ActiveSettingsSession {
+        let id: UUID
+        let client: GLKVMClient
+    }
+
+    private func activeSettingsSession() -> ActiveSettingsSession? {
+        guard isPresented,
+              let configConnectionSessionID,
+              kvmDeviceManager.connectionSessionID == configConnectionSessionID,
+              let client = kvmDeviceManager.glkvmClient
+        else { return nil }
+        return ActiveSettingsSession(id: configConnectionSessionID, client: client)
+    }
+
+    private func isActiveSettingsSession(_ session: ActiveSettingsSession) -> Bool {
+        isPresented
+            && kvmDeviceManager.connectionSessionID == session.id
+            && kvmDeviceManager.glkvmClient === session.client
+    }
+
     private func resetKVM() async {
-        guard let client = kvmDeviceManager.glkvmClient else { return }
+        guard let session = activeSettingsSession() else { return }
         do {
-            try await client.resetHid()
-            try await client.resetStreamer()
+            try await session.client.resetHid()
+            guard isActiveSettingsSession(session) else { return }
+            try await session.client.resetStreamer()
         } catch {
             await MainActor.run {
-                recordError("Failed to reset: \(error)")
+                if isActiveSettingsSession(session) {
+                    recordError("Failed to reset: \(error)")
+                }
             }
         }
     }

@@ -41,6 +41,7 @@ struct VideoSurfaceView: View {
                 if let videoView = webRTCManager.videoView {
                     VideoViewRepresentable(
                         videoView: videoView,
+                        inputManager: inputManager,
                         hidesLocalCursor: hidesLocalCursor,
                         onMouseMove: { pointInView, deltaInView in
                             guard !isOCRModeEnabled else { return }
@@ -258,6 +259,7 @@ struct VideoSurfaceView: View {
 #if canImport(WebRTC)
 struct VideoViewRepresentable: NSViewRepresentable {
     let videoView: RTCMTLNSVideoView
+    let inputManager: InputManager
     let hidesLocalCursor: Bool
     let onMouseMove: (CGPoint, CGSize) -> Void
     let onMouseButton: (MouseButton, Bool, CGPoint) -> Void
@@ -265,6 +267,7 @@ struct VideoViewRepresentable: NSViewRepresentable {
 
     func makeNSView(context: Context) -> TrackingContainerView {
         let container = TrackingContainerView()
+        container.inputManager = inputManager
         container.hidesLocalCursor = hidesLocalCursor
         container.onMouseMove = onMouseMove
         container.onMouseButton = onMouseButton
@@ -273,7 +276,12 @@ struct VideoViewRepresentable: NSViewRepresentable {
         return container
     }
 
+    static func dismantleNSView(_ nsView: TrackingContainerView, coordinator: ()) {
+        nsView.inputManager = nil
+    }
+
     func updateNSView(_ nsView: TrackingContainerView, context: Context) {
+        nsView.inputManager = inputManager
         nsView.hidesLocalCursor = hidesLocalCursor
         nsView.onMouseMove = onMouseMove
         nsView.onMouseButton = onMouseButton
@@ -283,6 +291,10 @@ struct VideoViewRepresentable: NSViewRepresentable {
 }
 
 final class TrackingContainerView: NSView {
+    var inputManager: InputManager? {
+        get { inputSurface.inputManager }
+        set { inputSurface.inputManager = newValue }
+    }
     var onMouseMove: ((CGPoint, CGSize) -> Void)? {
         get { inputSurface.onMouseMove }
         set { inputSurface.onMouseMove = newValue }
@@ -355,6 +367,28 @@ final class TrackingContainerView: NSView {
 /// the WebRTC renderer prevents AppKit from restoring the renderer's cursor
 /// after a click or a cursor-rectangle rebuild.
 final class RemoteInputSurfaceView: NSView {
+    weak var inputManager: InputManager? {
+        didSet {
+            guard oldValue !== inputManager else { return }
+            oldValue?.unregisterRemoteInputSurface(self)
+            if window != nil { inputManager?.registerRemoteInputSurface(self) }
+        }
+    }
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        DispatchQueue.main.async { [weak self] in self?.inputManager?.refreshLocalInputFocus() }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        DispatchQueue.main.async { [weak self] in self?.inputManager?.refreshLocalInputFocus() }
+        return accepted
+    }
+
     var onMouseMove: ((CGPoint, CGSize) -> Void)?
     var onMouseButton: ((MouseButton, Bool, CGPoint) -> Void)?
     var onScrollWheel: ((CGFloat, CGFloat) -> Void)?
@@ -363,7 +397,7 @@ final class RemoteInputSurfaceView: NSView {
         didSet {
             guard oldValue != hidesLocalCursor else { return }
             window?.invalidateCursorRects(for: self)
-            refreshPointerState()
+            refreshPointerState(forceCursorRefresh: true)
         }
     }
 
@@ -371,6 +405,9 @@ final class RemoteInputSurfaceView: NSView {
     private var notificationObservers: [NSObjectProtocol] = []
     private var pointerPresence = RemotePointerPresenceState()
     private var ownsCursorHideLease = false
+    private var invisibleCursorIsApplied = false
+    private var remoteButtonLifecycle = RemoteMouseButtonLifecycle<MouseButton>()
+    private var lastOwnedFlippedPoint: CGPoint?
 
     private static let invisibleCursor: NSCursor = {
         let image = NSImage(size: NSSize(width: 16, height: 16))
@@ -395,6 +432,7 @@ final class RemoteInputSurfaceView: NSView {
 
     deinit {
         removeNotificationObservers()
+        releasePressedRemoteButtonsAtLastOwnedPoint()
         forceShowCursor()
     }
 
@@ -408,7 +446,9 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
+        inputManager?.unregisterRemoteInputSurface(self)
         removeNotificationObservers()
+        releasePressedRemoteButtonsAtLastOwnedPoint()
         forceShowCursor()
         super.viewWillMove(toWindow: newWindow)
     }
@@ -416,14 +456,29 @@ final class RemoteInputSurfaceView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.acceptsMouseMovedEvents = true
+        if window != nil { inputManager?.registerRemoteInputSurface(self) }
         installNotificationObservers()
         window?.invalidateCursorRects(for: self)
-        refreshPointerState()
+        refreshPointerState(forceCursorRefresh: true)
     }
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        addCursorRect(bounds, cursor: hidesLocalCursor ? Self.invisibleCursor : .arrow)
+        guard hidesLocalCursor else {
+            addCursorRect(bounds, cursor: .arrow)
+            return
+        }
+
+        let cursorRects = RemotePointerOwnershipPolicy.cursorRects(
+            in: bounds,
+            topChromeReleaseBandHeight: topChromeReleaseBandHeight
+        )
+        if !cursorRects.remoteSurface.isEmpty {
+            addCursorRect(cursorRects.remoteSurface, cursor: Self.invisibleCursor)
+        }
+        if !cursorRects.topChromeReleaseBand.isEmpty {
+            addCursorRect(cursorRects.topChromeReleaseBand, cursor: .arrow)
+        }
     }
 
     override func updateTrackingAreas() {
@@ -447,11 +502,11 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     override func cursorUpdate(with event: NSEvent) {
-        updatePointerState(with: event)
+        updatePointerState(with: event, forceCursorRefresh: true)
     }
 
     override func mouseEntered(with event: NSEvent) {
-        updatePointerState(with: event)
+        updatePointerState(with: event, forceCursorRefresh: true)
     }
 
     override func mouseExited(with event: NSEvent) {
@@ -460,7 +515,7 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        updatePointerState(with: event)
+        guard updatePointerState(with: event) else { return }
         emitMouseMove(with: event)
     }
 
@@ -491,54 +546,86 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
-        updatePointerState(with: event)
+        let ownsPointer = updatePointerState(with: event)
+        guard remoteButtonLifecycle.shouldForwardMovement(ownsPointer: ownsPointer) else { return }
         emitMouseMove(with: event)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
-        updatePointerState(with: event)
+        let ownsPointer = updatePointerState(with: event)
+        guard remoteButtonLifecycle.shouldForwardMovement(ownsPointer: ownsPointer) else { return }
         emitMouseMove(with: event)
     }
 
     override func otherMouseDragged(with event: NSEvent) {
-        updatePointerState(with: event)
+        let ownsPointer = updatePointerState(with: event)
+        guard remoteButtonLifecycle.shouldForwardMovement(ownsPointer: ownsPointer) else { return }
         emitMouseMove(with: event)
     }
 
     override func scrollWheel(with event: NSEvent) {
-        updatePointerState(with: event)
+        guard updatePointerState(with: event) else { return }
         onScrollWheel?(event.scrollingDeltaX, event.scrollingDeltaY)
     }
 
     private func emitMouseButton(_ button: MouseButton, isPressed: Bool, event: NSEvent) {
-        updatePointerState(with: event)
+        let ownsPointer = updatePointerState(with: event, forceCursorRefresh: true)
         let p = convert(event.locationInWindow, from: nil)
         let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
-        onMouseButton?(button, isPressed, flipped)
+
+        if isPressed {
+            guard ownsPointer else { return }
+            window?.makeFirstResponder(self)
+            inputManager?.refreshLocalInputFocus()
+            remoteButtonLifecycle.press(button)
+            lastOwnedFlippedPoint = flipped
+            onMouseButton?(button, true, flipped)
+            return
+        }
+
+        let hadRemoteButtonDown = remoteButtonLifecycle.release(button)
+        guard ownsPointer || hadRemoteButtonDown else { return }
+        onMouseButton?(button, false, ownsPointer ? flipped : lastOwnedFlippedPoint ?? flipped)
     }
 
     private func emitMouseMove(with event: NSEvent) {
         let p = convert(event.locationInWindow, from: nil)
         let flipped = CGPoint(x: p.x, y: bounds.height - p.y)
         let delta = CGSize(width: event.deltaX, height: -event.deltaY)
+        lastOwnedFlippedPoint = flipped
         onMouseMove?(flipped, delta)
     }
 
-    private func updatePointerState(with event: NSEvent) {
+    @discardableResult
+    private func updatePointerState(with event: NSEvent, forceCursorRefresh: Bool = false) -> Bool {
         let localPoint = convert(event.locationInWindow, from: nil)
         pointerPresence.update(
             isOwnedByRemoteSurface: RemotePointerOwnershipPolicy.ownsCursor(
                 localPoint: localPoint,
                 visibleRect: visibleRect,
-                isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: event.locationInWindow)
+                isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: event.locationInWindow),
+                topChromeReleaseBandHeight: topChromeReleaseBandHeight
             )
         )
-        updateCursorVisibility()
+        updateCursorVisibility(forceCursorRefresh: forceCursorRefresh)
+        return pointerPresence.isInsideRemoteSurface
     }
 
-    private func refreshPointerState() {
+    private func releasePressedRemoteButtonsAtLastOwnedPoint() {
+        let buttons = remoteButtonLifecycle.takeAllPressedButtons()
+        guard !buttons.isEmpty else { return }
+        guard let point = lastOwnedFlippedPoint else {
+            return
+        }
+
+        for button in buttons.sorted(by: { $0.rawValue < $1.rawValue }) {
+            onMouseButton?(button, false, point)
+        }
+    }
+
+    private func refreshPointerState(forceCursorRefresh: Bool = false) {
         pointerPresence.update(isOwnedByRemoteSurface: pointerIsActuallyInside())
-        updateCursorVisibility()
+        updateCursorVisibility(forceCursorRefresh: forceCursorRefresh)
     }
 
     private func pointerIsActuallyInside() -> Bool {
@@ -548,7 +635,14 @@ final class RemoteInputSurfaceView: NSView {
         return RemotePointerOwnershipPolicy.ownsCursor(
             localPoint: localPoint,
             visibleRect: visibleRect,
-            isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: windowPoint)
+            isTopmostInteractiveSurface: isTopmostInteractiveSurface(at: windowPoint),
+            topChromeReleaseBandHeight: topChromeReleaseBandHeight
+        )
+    }
+
+    private var topChromeReleaseBandHeight: CGFloat {
+        RemotePointerOwnershipPolicy.topChromeReleaseBandHeight(
+            isFullscreen: window?.styleMask.contains(.fullScreen) == true
         )
     }
 
@@ -559,24 +653,33 @@ final class RemoteInputSurfaceView: NSView {
         return hitView === self || hitView.isDescendant(of: self)
     }
 
-    private func updateCursorVisibility() {
+    private func updateCursorVisibility(forceCursorRefresh: Bool = false) {
         let shouldHide = hidesLocalCursor
             && pointerPresence.isInsideRemoteSurface
             && window?.isKeyWindow == true
             && NSApp.isActive
 
         if shouldHide {
-            acquireCursorHideLease()
-            Self.invisibleCursor.set()
+            let didAcquireHideLease = acquireCursorHideLease()
+            if CursorRefreshPolicy.shouldApplyInvisibleCursor(
+                isAlreadyApplied: invisibleCursorIsApplied,
+                forceRefresh: forceCursorRefresh,
+                didAcquireHideLease: didAcquireHideLease
+            ) {
+                Self.invisibleCursor.set()
+                invisibleCursorIsApplied = true
+            }
         } else {
             forceShowCursor()
         }
     }
 
-    private func acquireCursorHideLease() {
-        guard !ownsCursorHideLease else { return }
+    @discardableResult
+    private func acquireCursorHideLease() -> Bool {
+        guard !ownsCursorHideLease else { return false }
         NSCursor.hide()
         ownsCursorHideLease = true
+        return true
     }
 
     private func releaseCursorHideLease() {
@@ -586,7 +689,14 @@ final class RemoteInputSurfaceView: NSView {
     }
 
     private func forceShowCursor() {
+        guard CursorRefreshPolicy.shouldApplyArrowCursor(
+            isInvisibleCursorApplied: invisibleCursorIsApplied,
+            ownsHideLease: ownsCursorHideLease
+        ) else {
+            return
+        }
         releaseCursorHideLease()
+        invisibleCursorIsApplied = false
         NSCursor.arrow.set()
     }
 
@@ -595,16 +705,18 @@ final class RemoteInputSurfaceView: NSView {
         let center = NotificationCenter.default
         notificationObservers = [
             center.addObserver(forName: NSWindow.didResignKeyNotification, object: window, queue: .main) { [weak self] _ in
+                self?.releasePressedRemoteButtonsAtLastOwnedPoint()
                 self?.forceShowCursor()
             },
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { [weak self] _ in
-                self?.refreshPointerState()
+                self?.refreshPointerState(forceCursorRefresh: true)
             },
             center.addObserver(forName: NSApplication.didResignActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
+                self?.releasePressedRemoteButtonsAtLastOwnedPoint()
                 self?.forceShowCursor()
             },
             center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: NSApp, queue: .main) { [weak self] _ in
-                self?.refreshPointerState()
+                self?.refreshPointerState(forceCursorRefresh: true)
             },
         ]
     }

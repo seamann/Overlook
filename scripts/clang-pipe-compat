@@ -1,0 +1,52 @@
+#!/usr/bin/python3
+"""Preserve Clang discovery output while supporting sequential pipe readers.
+
+Only Xcode's exact /dev/null macro-discovery shape is adapted. All other calls
+exec the installed Clang unchanged. No compiler diagnostics are removed.
+"""
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+CLANG = '/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang'
+
+
+def is_discovery(args):
+    if args[:3] != ['-v', '-E', '-dM'] or args[-2:] != ['-c', '/dev/null']:
+        return False
+    options = args[3:-2]
+    if len(options) % 2:
+        return False
+    pairs = list(zip(options[::2], options[1::2]))
+    return (all(key in ('-arch', '-isysroot', '-x') for key, _ in pairs)
+            and any(key == '-x' and value in ('c', 'objective-c', 'c++', 'objective-c++')
+                    for key, value in pairs))
+
+
+args = sys.argv[1:]
+if not is_discovery(args):
+    os.execv(CLANG, [CLANG, *args])
+
+with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+    result = subprocess.run([CLANG, *args], stdout=output, stderr=errors, check=False)
+    output.seek(0)
+    shutil.copyfileobj(output, sys.stdout.buffer)
+    sys.stdout.flush()
+    # SwiftBuild before upstream PR #1315 waits for stdout EOF before stderr.
+    stdout_fd = sys.stdout.fileno()
+    closes_descriptor = sys.stdout.buffer.raw.closefd
+    sys.stdout.close()
+    if not closes_descriptor:
+        os.close(stdout_fd)
+    errors.seek(0)
+    shutil.copyfileobj(errors, sys.stderr.buffer)
+    sys.stderr.flush()
+
+if result.returncode < 0:
+    if -result.returncode != signal.SIGKILL:
+        signal.signal(-result.returncode, signal.SIG_DFL)
+    os.kill(os.getpid(), -result.returncode)
+sys.exit(result.returncode)

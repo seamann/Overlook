@@ -32,3 +32,6 @@ janus/
 # .swiftpm
 .build/
 
+## Node.js / MCP build output
+node_modules/
+dist/
