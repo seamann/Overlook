@@ -155,8 +155,7 @@ class WebRTCManager: NSObject, ObservableObject {
     private var janusHandleId: Int?
     private var janusAudioHandleId: Int?
     private var janusKeepAliveTimer: Timer?
-    private var janusWaiters: [String: CheckedContinuation<[String: Any], Error>] = [:]
-    private var janusTimeoutTasks: [String: Task<Void, Never>] = [:]
+    private let janusRequests = JanusRequestCoordinator()
 
     private var isFrameCaptureEnabled: Bool = false
     private var lastFrameCaptureTime: CFTimeInterval = 0
@@ -318,15 +317,23 @@ class WebRTCManager: NSObject, ObservableObject {
         guard lastConnectedDevice != nil else { return }
 
         audioDeviceChangeDebounceTask?.cancel()
-        audioDeviceChangeDebounceTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 800_000_000)
-            await MainActor.run {
-                self?.autoReconnectIfStillNeeded()
-            }
+        let scope = WebRTCConnectionTaskScope(generation: connectionGeneration, socket: webSocketTask)
+        audioDeviceChangeDebounceTask = Task { @MainActor [weak self] in
+            await scope.run(
+                afterNanoseconds: 800_000_000,
+                isCurrent: { self?.owns(scope) == true },
+                operation: { self?.autoReconnectIfStillNeeded(scope: scope) },
+                onFailure: { _ in }
+            )
         }
     }
 
-    private func autoReconnectIfStillNeeded() {
+    private func owns(_ scope: WebRTCConnectionTaskScope) -> Bool {
+        scope.isCurrent(generation: connectionGeneration, socket: webSocketTask)
+    }
+
+    private func autoReconnectIfStillNeeded(scope: WebRTCConnectionTaskScope) {
+        guard owns(scope) else { return }
         guard isAutoReconnectInProgress == false else { return }
         guard let device = lastConnectedDevice else { return }
         guard shouldAutoReconnectForMissingSelectedDevices() else { return }
@@ -341,6 +348,7 @@ class WebRTCManager: NSObject, ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isAutoReconnectInProgress = false }
+            guard !Task.isCancelled, self.owns(scope) else { return }
             await self.reconnect(to: device)
         }
     }
@@ -542,14 +550,9 @@ class WebRTCManager: NSObject, ObservableObject {
         }
 
         // Janus session setup
-        let createTransaction = makeJanusTransaction()
-        try await sendJanusMessage([
+        let createResponse = try await requestJanusMessage([
             "janus": "create",
-            "transaction": createTransaction,
         ])
-        try requireCurrentConnection(generation)
-
-        let createResponse = try await waitForJanusTransaction(createTransaction)
         try requireCurrentConnection(generation)
         guard let data = createResponse["data"] as? [String: Any],
               let sessionId = data["id"] as? Int else {
@@ -557,18 +560,14 @@ class WebRTCManager: NSObject, ObservableObject {
         }
         janusSessionId = sessionId
 
-        let attachTransaction = makeJanusTransaction()
-        try await sendJanusMessage([
+        let attachResponse = try await requestJanusMessage([
             "janus": "attach",
             "plugin": "janus.plugin.ustreamer",
             "opaque_id": "oid-\(UUID().uuidString)",
-            "transaction": attachTransaction,
             "session_id": sessionId,
         ])
         try requireCurrentConnection(generation)
 
-        let attachResponse = try await waitForJanusTransaction(attachTransaction)
-        try requireCurrentConnection(generation)
         guard let attachData = attachResponse["data"] as? [String: Any],
               let handleId = attachData["id"] as? Int else {
             throw WebRTCError.signalingConnectionLost
@@ -596,18 +595,14 @@ class WebRTCManager: NSObject, ObservableObject {
         try requireCurrentConnection(generation)
 
         if (audioEnabled || micEnabled), let audioPeerConnection {
-            let audioAttachTransaction = makeJanusTransaction()
-            try await sendJanusMessage([
+            let audioAttachResponse = try await requestJanusMessage([
                 "janus": "attach",
                 "plugin": "janus.plugin.ustreamer",
                 "opaque_id": "oid-audio-\(UUID().uuidString)",
-                "transaction": audioAttachTransaction,
                 "session_id": sessionId,
             ])
             try requireCurrentConnection(generation)
 
-            let audioAttachResponse = try await waitForJanusTransaction(audioAttachTransaction)
-            try requireCurrentConnection(generation)
             guard let audioAttachData = audioAttachResponse["data"] as? [String: Any],
                   let audioHandleId = audioAttachData["id"] as? Int else {
                 throw WebRTCError.signalingConnectionLost
@@ -641,25 +636,26 @@ class WebRTCManager: NSObject, ObservableObject {
 
     private func startJanusKeepAlive() {
         janusKeepAliveTimer?.invalidate()
+        guard let socket = webSocketTask, let sessionId = janusSessionId else { return }
+        let scope = WebRTCConnectionTaskScope(generation: connectionGeneration, socket: socket)
         janusKeepAliveTimer = Timer.scheduledTimer(withTimeInterval: 25.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                do {
-                    try await self.sendJanusKeepAlive()
-                } catch {
-                    self.requestReconnect(reason: "Signaling keepalive failed")
-                }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await scope.run(
+                    isCurrent: { self.owns(scope) },
+                    operation: { try await self.sendJanusKeepAlive(sessionId: sessionId, socket: socket) },
+                    onFailure: { _ in self.requestReconnect(reason: "Signaling keepalive failed") }
+                )
             }
         }
     }
 
-    private func sendJanusKeepAlive() async throws {
-        guard let sessionId = janusSessionId else { return }
+    private func sendJanusKeepAlive(sessionId: Int, socket: URLSessionWebSocketTask) async throws {
         try await sendJanusMessage([
             "janus": "keepalive",
             "session_id": sessionId,
             "transaction": makeJanusTransaction(),
-        ])
+        ], through: socket)
     }
 
     private func sendJanusTrickleCandidate(_ candidate: RTCIceCandidate, handleId: Int) async throws {
@@ -698,26 +694,35 @@ class WebRTCManager: NSObject, ObservableObject {
         UUID().uuidString.replacingOccurrences(of: "-", with: "")
     }
 
-    private func waitForJanusTransaction(_ transaction: String) async throws -> [String: Any] {
-        try await withCheckedThrowingContinuation { continuation in
-            janusWaiters[transaction] = continuation
-            janusTimeoutTasks[transaction] = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 8_000_000_000)
-                guard !Task.isCancelled, let self,
-                      let waiter = self.janusWaiters.removeValue(forKey: transaction) else { return }
-                self.janusTimeoutTasks.removeValue(forKey: transaction)
-                waiter.resume(throwing: WebRTCError.signalingTimeout)
-            }
-        }
+    private func requestJanusMessage(_ message: [String: Any]) async throws -> [String: Any] {
+        guard let socket = webSocketTask else { throw WebRTCError.signalingConnectionLost }
+        let generation = connectionGeneration
+        let transaction = makeJanusTransaction()
+        let request = message.merging(["transaction": transaction]) { _, transaction in transaction }
+        return try await janusRequests.request(
+            transaction: transaction, timeoutNanoseconds: 8_000_000_000,
+            timeoutError: WebRTCError.signalingTimeout,
+            send: { [weak self] in
+                guard let self else { throw CancellationError() }
+                try self.requireCurrentConnection(generation)
+                guard self.webSocketTask === socket else { throw CancellationError() }
+                try await self.sendJanusMessage(request, through: socket)
+            },
+            abortTransport: { socket.cancel(with: .goingAway, reason: nil) }
+        )
     }
 
     private func sendJanusMessage(_ message: [String: Any]) async throws {
-        guard let webSocketTask = webSocketTask,
-              let data = try? JSONSerialization.data(withJSONObject: message),
+        guard let socket = webSocketTask else { throw WebRTCError.signalingConnectionLost }
+        try await sendJanusMessage(message, through: socket)
+    }
+
+    private func sendJanusMessage(_ message: [String: Any], through socket: URLSessionWebSocketTask) async throws {
+        guard let data = try? JSONSerialization.data(withJSONObject: message),
               let text = String(data: data, encoding: .utf8) else {
             throw WebRTCError.signalingConnectionLost
         }
-        try await webSocketTask.send(.string(text))
+        try await socket.send(.string(text))
     }
 
     private func normalizedWebSocketURL(_ url: URL) -> URL {
@@ -737,13 +742,13 @@ class WebRTCManager: NSObject, ObservableObject {
     }
     
     private func listenForSignalingMessages(socket: URLSessionWebSocketTask, generation: Int) async {
-        while !Task.isCancelled, generation == connectionGeneration {
+        while !Task.isCancelled, generation == connectionGeneration, webSocketTask === socket {
             do {
                 let message = try await socket.receive()
-                guard generation == connectionGeneration else { return }
+                guard generation == connectionGeneration, webSocketTask === socket else { return }
                 await handleSignalingMessage(message)
             } catch {
-                guard !Task.isCancelled, generation == connectionGeneration else { return }
+                guard !Task.isCancelled, generation == connectionGeneration, webSocketTask === socket else { return }
                 print("WebSocket receive error: \(error)")
                 isConnecting = false
                 if isConnected || hasEverConnectedToStream || lastDisconnectReason == nil {
@@ -778,12 +783,7 @@ class WebRTCManager: NSObject, ObservableObject {
     }
 
     private func handleJanusMessage(_ message: [String: Any]) async {
-        if let transaction = message["transaction"] as? String,
-           let waiter = janusWaiters.removeValue(forKey: transaction) {
-            janusTimeoutTasks.removeValue(forKey: transaction)?.cancel()
-            waiter.resume(returning: message)
-            return
-        }
+        if janusRequests.receive(message) { return }
 
         guard let janusType = message["janus"] as? String else { return }
         if janusType == "trickle" {
@@ -1328,6 +1328,8 @@ class WebRTCManager: NSObject, ObservableObject {
     private func tearDown(cancelReconnect: Bool) {
         invalidateSnapshotSource()
         connectionGeneration += 1
+        audioDeviceChangeDebounceTask?.cancel()
+        audioDeviceChangeDebounceTask = nil
         streamStatsRequestID = nil
         signalingListenerTask?.cancel()
         signalingListenerTask = nil
@@ -1346,13 +1348,7 @@ class WebRTCManager: NSObject, ObservableObject {
         janusSessionId = nil
         janusHandleId = nil
         janusAudioHandleId = nil
-        let waiters = janusWaiters
-        janusWaiters.removeAll()
-        janusTimeoutTasks.values.forEach { $0.cancel() }
-        janusTimeoutTasks.removeAll()
-        for (_, waiter) in waiters {
-            waiter.resume(throwing: WebRTCError.signalingConnectionLost)
-        }
+        janusRequests.cancelAll(throwing: WebRTCError.signalingConnectionLost)
         
         webSocketTask?.cancel()
         webSocketTask = nil
