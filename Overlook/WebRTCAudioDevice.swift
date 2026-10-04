@@ -6,11 +6,32 @@ import CoreAudio
 @preconcurrency import WebRTC
 #endif
 
+/// The initialization boundary is injectable without changing real-time callbacks.
+struct AudioUnitOperations {
+    let find: (inout AudioComponentDescription) -> AudioComponent?
+    let create: (AudioComponent, inout AudioComponentInstance?) -> OSStatus
+    let setProperty: (AudioComponentInstance, AudioUnitPropertyID, AudioUnitScope,
+                      AudioUnitElement, UnsafeRawPointer, UInt32) -> OSStatus
+    let initialize: (AudioComponentInstance) -> OSStatus
+    let uninitialize: (AudioComponentInstance) -> OSStatus
+    let dispose: (AudioComponentInstance) -> OSStatus
+
+    static let live = AudioUnitOperations(
+        find: { AudioComponentFindNext(nil, &$0) },
+        create: { AudioComponentInstanceNew($0, &$1) },
+        setProperty: { AudioUnitSetProperty($0, $1, $2, $3, $4, $5) },
+        initialize: AudioUnitInitialize,
+        uninitialize: AudioUnitUninitialize,
+        dispose: AudioComponentInstanceDispose
+    )
+}
+
 final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
     fileprivate var delegate: RTCAudioDeviceDelegate?
 
     private let inputDeviceUID: String?
     private let outputDeviceUID: String?
+    private let audioUnits: AudioUnitOperations
 
     fileprivate var inputUnit: AudioComponentInstance?
     fileprivate var outputUnit: AudioComponentInstance?
@@ -37,9 +58,11 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
     private var inputLatencyValue: TimeInterval = 0
     private var outputLatencyValue: TimeInterval = 0
 
-    init(inputDeviceUID: String?, outputDeviceUID: String?) {
+    init(inputDeviceUID: String?, outputDeviceUID: String?,
+         audioUnits: AudioUnitOperations = .live) {
         self.inputDeviceUID = inputDeviceUID?.isEmpty == true ? nil : inputDeviceUID
         self.outputDeviceUID = outputDeviceUID?.isEmpty == true ? nil : outputDeviceUID
+        self.audioUnits = audioUnits
         super.init()
     }
 
@@ -74,15 +97,15 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
         _ = stopRecording()
 
         if let unit = outputUnit {
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
+            _ = audioUnits.uninitialize(unit)
+            _ = audioUnits.dispose(unit)
         }
         outputUnit = nil
         _isPlayoutInitialized = false
 
         if let unit = inputUnit {
-            AudioUnitUninitialize(unit)
-            AudioComponentInstanceDispose(unit)
+            _ = audioUnits.uninitialize(unit)
+            _ = audioUnits.dispose(unit)
         }
         inputUnit = nil
         _isRecordingInitialized = false
@@ -100,16 +123,20 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
 
     func initializePlayout() -> Bool {
         guard _isInitialized else { return false }
-        guard outputUnit == nil else {
-            _isPlayoutInitialized = true
-            return true
-        }
+        guard outputUnit == nil else { return _isPlayoutInitialized }
 
         guard let unit = createHALOutputUnit(deviceID: resolveOutputDeviceID()) else { return false }
-        outputUnit = unit
+        var initialized = false
+        var initializationAttempted = false
+        defer {
+            if !initialized {
+                if initializationAttempted { _ = audioUnits.uninitialize(unit) }
+                _ = audioUnits.dispose(unit)
+            }
+        }
 
         var format = makeLinearPCMFormat(sampleRate: outputSampleRate, channels: outputChannels)
-        var status = AudioUnitSetProperty(
+        var status = audioUnits.setProperty(
             unit,
             kAudioUnitProperty_StreamFormat,
             kAudioUnitScope_Input,
@@ -123,7 +150,7 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
             inputProc: playoutRenderCallback,
             inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
         )
-        status = AudioUnitSetProperty(
+        status = audioUnits.setProperty(
             unit,
             kAudioUnitProperty_SetRenderCallback,
             kAudioUnitScope_Input,
@@ -133,9 +160,12 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
         )
         guard status == noErr else { return false }
 
-        status = AudioUnitInitialize(unit)
+        initializationAttempted = true
+        status = audioUnits.initialize(unit)
         guard status == noErr else { return false }
 
+        initialized = true
+        outputUnit = unit
         _isPlayoutInitialized = true
         return true
     }
@@ -163,16 +193,20 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
 
     func initializeRecording() -> Bool {
         guard _isInitialized else { return false }
-        guard inputUnit == nil else {
-            _isRecordingInitialized = true
-            return true
-        }
+        guard inputUnit == nil else { return _isRecordingInitialized }
 
         guard let unit = createHALInputUnit(deviceID: resolveInputDeviceID()) else { return false }
-        inputUnit = unit
+        var initialized = false
+        var initializationAttempted = false
+        defer {
+            if !initialized {
+                if initializationAttempted { _ = audioUnits.uninitialize(unit) }
+                _ = audioUnits.dispose(unit)
+            }
+        }
 
         var format = makeLinearPCMFormat(sampleRate: inputSampleRate, channels: inputChannels)
-        var status = AudioUnitSetProperty(
+        var status = audioUnits.setProperty(
             unit,
             kAudioUnitProperty_StreamFormat,
             kAudioUnitScope_Output,
@@ -186,7 +220,7 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
             inputProc: recordingInputCallback,
             inputProcRefCon: Unmanaged.passUnretained(self).toOpaque()
         )
-        status = AudioUnitSetProperty(
+        status = audioUnits.setProperty(
             unit,
             kAudioOutputUnitProperty_SetInputCallback,
             kAudioUnitScope_Global,
@@ -196,13 +230,15 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
         )
         guard status == noErr else { return false }
 
+        initializationAttempted = true
+        status = audioUnits.initialize(unit)
+        guard status == noErr else { return false }
+
         if inputBufferList == nil {
             allocateInputBufferIfNeeded(sampleRate: inputSampleRate)
         }
-
-        status = AudioUnitInitialize(unit)
-        guard status == noErr else { return false }
-
+        initialized = true
+        inputUnit = unit
         _isRecordingInitialized = true
         return true
     }
@@ -278,23 +314,26 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
             componentFlags: 0,
             componentFlagsMask: 0
         )
-        guard let comp = AudioComponentFindNext(nil, &desc) else { return nil }
+        guard let comp = audioUnits.find(&desc) else { return nil }
 
         var unit: AudioComponentInstance?
-        var status = AudioComponentInstanceNew(comp, &unit)
-        guard status == noErr, let unit else { return nil }
+        var status = audioUnits.create(comp, &unit)
+        guard status == noErr, let unit else {
+            if let unit { _ = audioUnits.dispose(unit) }
+            return nil
+        }
 
         var enableIO: UInt32 = 1
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         var disableInput: UInt32 = 0
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disableInput, UInt32(MemoryLayout<UInt32>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &disableInput, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         var device = deviceID
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         return unit
     }
@@ -307,23 +346,26 @@ final class WebRTCAudioDevice: NSObject, RTCAudioDevice {
             componentFlags: 0,
             componentFlagsMask: 0
         )
-        guard let comp = AudioComponentFindNext(nil, &desc) else { return nil }
+        guard let comp = audioUnits.find(&desc) else { return nil }
 
         var unit: AudioComponentInstance?
-        var status = AudioComponentInstanceNew(comp, &unit)
-        guard status == noErr, let unit else { return nil }
+        var status = audioUnits.create(comp, &unit)
+        guard status == noErr, let unit else {
+            if let unit { _ = audioUnits.dispose(unit) }
+            return nil
+        }
 
         var enableInput: UInt32 = 1
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enableInput, UInt32(MemoryLayout<UInt32>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Input, 1, &enableInput, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         var disableOutput: UInt32 = 0
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disableOutput, UInt32(MemoryLayout<UInt32>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_EnableIO, kAudioUnitScope_Output, 0, &disableOutput, UInt32(MemoryLayout<UInt32>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         var device = deviceID
-        status = AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size))
-        guard status == noErr else { AudioComponentInstanceDispose(unit); return nil }
+        status = audioUnits.setProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, UInt32(MemoryLayout<AudioDeviceID>.size))
+        guard status == noErr else { _ = audioUnits.dispose(unit); return nil }
 
         return unit
     }
