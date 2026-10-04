@@ -16,7 +16,6 @@ struct VideoSurfaceView: View {
     @Binding var selectedText: String
     @Binding var isShowingOCRResult: Bool
 
-    let onReconnect: () -> Void
     let hidesLocalCursor: Bool
 
     @State private var ocrDragStart: CGPoint?
@@ -116,35 +115,6 @@ struct VideoSurfaceView: View {
                         )
                 }
 
-                if webRTCManager.isConnecting || webRTCManager.isStreamStalled || (webRTCManager.hasEverConnectedToStream && !webRTCManager.isConnected) {
-                    VStack(spacing: 10) {
-                        Text(webRTCManager.isConnecting ? "Connecting…" : "Connection Lost")
-                            .font(.headline)
-
-                        if let reason = webRTCManager.lastDisconnectReason, !reason.isEmpty {
-                            Text(reason)
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-
-                        if let age = webRTCManager.lastVideoFrameAgeSeconds, webRTCManager.isConnecting == false {
-                            Text("Last video frame: \(age)s ago")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Button("Reconnect") {
-                            onReconnect()
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(webRTCManager.isConnecting)
-                    }
-                    .padding(14)
-                    .background(.ultraThinMaterial)
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding()
-                }
             }
         }
         .onChange(of: isOCRModeEnabled) { _, enabled in

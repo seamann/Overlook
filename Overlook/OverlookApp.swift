@@ -19,6 +19,7 @@ struct OverlookApp: App {
                 .environmentObject(appDelegate.kvmDeviceManager)
                 .environmentObject(appDelegate.controlModeStore)
                 .environmentObject(appDelegate.sessionCoordinator)
+                .environmentObject(appDelegate.localUIRequests)
         }
         .windowStyle(.titleBar)
         .windowToolbarStyle(.unifiedCompact)
@@ -36,6 +37,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let kvmDeviceManager = KVMDeviceManager()
     let controlModeStore = ControlModeStore()
     let localControlServer = LocalControlServer()
+    let localUIRequests = LocalUIRequests()
     lazy var sessionCoordinator = SessionConnectionCoordinator(dependencies: .init(
         prepare: { [unowned self] device, password in
             try await kvmDeviceManager.prepareConnection(device, password: password)
@@ -81,6 +83,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             sessionCoordinator: sessionCoordinator,
             showMainWindow: { [weak self] in
                 self?.showMainWindow()
+            },
+            openSettings: { [weak self] in
+                guard let self else { return }
+                self.localUIRequests.requestSettings()
+                self.showMainWindow()
             }
         )
         menuBarAgent?.setup()

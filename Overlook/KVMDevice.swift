@@ -1,4 +1,5 @@
 import Foundation
+import Network
 
 // MARK: - KVM Device Model
 struct KVMDevice: Identifiable, Codable, Sendable {
@@ -12,6 +13,14 @@ struct KVMDevice: Identifiable, Codable, Sendable {
     
     var connectionString: String {
         return "\(host):\(port)"
+    }
+
+    var networkHost: NWEndpoint.Host {
+        if host.hasPrefix("["), host.hasSuffix("]"),
+           let address = IPv6Address(String(host.dropFirst().dropLast())) {
+            return .ipv6(address)
+        }
+        return NWEndpoint.Host(host)
     }
 
     var httpScheme: String {

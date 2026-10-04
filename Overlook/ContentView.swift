@@ -9,6 +9,7 @@ struct ContentView: View {
     @EnvironmentObject var kvmDeviceManager: KVMDeviceManager
     @EnvironmentObject var controlModeStore: ControlModeStore
     @EnvironmentObject var sessionCoordinator: SessionConnectionCoordinator
+    @EnvironmentObject var localUIRequests: LocalUIRequests
     
     @State private var selectedDevice: KVMDevice?
     @State private var isOCRModeEnabled = false
@@ -29,6 +30,7 @@ struct ContentView: View {
     @State private var pendingManualEndpoint: (host: String, port: Int)?
     @State private var pendingPassword = ""
     @State private var connectionErrorMessage: String?
+    @State private var errorKind: LocalActionErrorKind = .connection
     @State private var isChangingControlMode = false
     @State private var isRecoveringInput = false
 
@@ -53,6 +55,51 @@ struct ContentView: View {
 
     private var controlMode: OverlookControlMode {
         controlModeStore.mode
+    }
+
+    private var settingsAccessReason: String? {
+        LocalSettingsAccessPolicy.denialReason(mode: controlMode, isConnected: isConnected)
+    }
+
+    private var recoveryPresentation: LocalRecoveryPresentation {
+        LocalRecoveryPresentation(
+            mode: controlMode,
+            isVideoConnecting: webRTCManager.isConnecting,
+            isStreamStalled: webRTCManager.isStreamStalled,
+            hasEverConnectedToStream: webRTCManager.hasEverConnectedToStream,
+            isVideoConnected: webRTCManager.isConnected,
+            hasDevice: kvmDeviceManager.connectedDevice != nil,
+            isSessionConnecting: isEstablishingConnection,
+            isPanelPresented: showingSettings || showingConnections || showingManualConnect
+                || showingPasswordPrompt || isShowingOCRResult || connectionErrorMessage != nil
+        )
+    }
+
+    private var videoRecoveryOverlay: some View {
+        VStack(spacing: 10) {
+            Text(webRTCManager.isConnecting ? "Connecting…" : "Connection Lost")
+                .font(.headline)
+            if let reason = webRTCManager.lastDisconnectReason, !reason.isEmpty {
+                Text(reason).font(.subheadline).foregroundColor(.secondary)
+            }
+            if let age = webRTCManager.lastVideoFrameAgeSeconds, !webRTCManager.isConnecting {
+                Text("Last video frame: \(age)s ago").font(.caption).foregroundColor(.secondary)
+            }
+            Button("Reconnect") {
+                guard recoveryPresentation.canReconnect,
+                      let device = kvmDeviceManager.connectedDevice else { return }
+                connectToDevice(device)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!recoveryPresentation.canReconnect)
+            .accessibilityIdentifier("local-video-reconnect")
+        }
+        .padding(14)
+        .background(.ultraThinMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding()
+        .allowsHitTesting(!showingSettings && !showingConnections)
     }
 
     private var preferredColorScheme: ColorScheme? {
@@ -239,26 +286,22 @@ struct ContentView: View {
                     isOCRModeEnabled: $isOCRModeEnabled,
                     selectedText: $selectedText,
                     isShowingOCRResult: $isShowingOCRResult,
-                    onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        connectToDevice(device)
-                    },
                     hidesLocalCursor: shouldHideLocalCursor
                 )
                 .ignoresSafeArea()
-                .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
+                .allowsHitTesting(recoveryPresentation.allowsRemoteInput)
             } else {
                 VideoSurfaceView(
                     isOCRModeEnabled: $isOCRModeEnabled,
                     selectedText: $selectedText,
                     isShowingOCRResult: $isShowingOCRResult,
-                    onReconnect: {
-                        guard let device = kvmDeviceManager.connectedDevice else { return }
-                        connectToDevice(device)
-                    },
                     hidesLocalCursor: shouldHideLocalCursor
                 )
-                .allowsHitTesting(controlMode == .manual && !showingSettings && !showingConnections)
+                .allowsHitTesting(recoveryPresentation.allowsRemoteInput)
+            }
+
+            if recoveryPresentation.showsRecovery {
+                videoRecoveryOverlay
             }
 
             if let transferStatus {
@@ -302,7 +345,7 @@ struct ContentView: View {
                             Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                                 Image(systemName: "gearshape")
                             }
-                            .disabled(!isConnected || controlMode != .manual)
+                            .disabled(settingsAccessReason != nil)
                             .help("Settings")
                         }
                         .padding(.horizontal, 12)
@@ -445,10 +488,10 @@ struct ContentView: View {
         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
-            if let message { connectionErrorMessage = message }
+            if let message { showLocalError(message, kind: .mouseJiggler) }
         }
         .onChange(of: kvmDeviceManager.credentialStorageWarningGeneration, initial: true) { _, _ in
-            if let message = kvmDeviceManager.credentialStorageWarning { connectionErrorMessage = message }
+            if let message = kvmDeviceManager.credentialStorageWarning { showLocalError(message, kind: .credentials) }
         }
         .onDisappear {
             inputManager.setLocalUIBlocked(false, owner: inputCaptureOwner)
@@ -497,6 +540,16 @@ struct ContentView: View {
                 isOCRModeEnabled.toggle()
             }
         }
+        .onChange(of: localUIRequests.settingsRequested, initial: true) { _, requested in
+            guard requested, localUIRequests.consumeSettingsRequest() else { return }
+            if let reason = settingsAccessReason {
+                showingSettings = false
+                showLocalError(reason, kind: .settings)
+                return
+            }
+            showingConnections = false
+            showingSettings = true
+        }
         .onChange(of: appAppearance) { _, _ in
             applyAppAppearance()
         }
@@ -544,8 +597,7 @@ struct ContentView: View {
             )
         }
         .alert(
-            connectionErrorMessage == kvmDeviceManager.credentialStorageWarning
-                ? "Credentials Not Saved" : "Connection Failed",
+            errorKind.title,
             isPresented: Binding(
                 get: { connectionErrorMessage != nil },
                 set: { if !$0 { connectionErrorMessage = nil } }
@@ -610,7 +662,7 @@ struct ContentView: View {
                     Button(action: { withAnimation(.easeInOut(duration: 0.2)) { showingSettings.toggle() } }) {
                         Image(systemName: "gearshape")
                     }
-                    .disabled(!isConnected || controlMode != .manual)
+                    .disabled(settingsAccessReason != nil)
                     .help("Settings")
 
                     Button(role: .destructive, action: { NSApp.terminate(nil) }) {
@@ -639,7 +691,11 @@ struct ContentView: View {
                 guard sessionCoordinator.isCurrent(attempt.id) else { return }
                 selectedDevice = device
                 showingConnections = false
-                connectionErrorMessage = kvmDeviceManager.credentialStorageWarning
+                if let warning = kvmDeviceManager.credentialStorageWarning {
+                    showLocalError(warning, kind: .credentials)
+                } else {
+                    connectionErrorMessage = nil
+                }
             } catch is CancellationError {
                 return
             } catch {
@@ -650,33 +706,24 @@ struct ContentView: View {
                     pendingPasswordAttemptID = attempt.id
                     showingPasswordPrompt = true
                 } else {
-                    connectionErrorMessage = describeConnectionError(error)
+                    showLocalError(describeConnectionError(error), kind: .connection)
                 }
             }
         }
     }
 
     private func manualConnect(password: String) {
-        let trimmed = manualHostPort.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-
-        var host = trimmed
-        var portString = manualPort.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if let schemeRange = host.range(of: "://") {
-            host = String(host[schemeRange.upperBound...])
+        do {
+            let endpoint = try ManualConnectionEndpoint.parse(hostPort: manualHostPort, port: manualPort)
+            connectManually(host: endpoint.host, port: endpoint.port, password: password)
+        } catch {
+            showLocalError(error.localizedDescription, kind: .endpoint)
         }
+    }
 
-        if let colonIndex = host.lastIndex(of: ":") {
-            let maybeHost = String(host[..<colonIndex])
-            let maybePort = String(host[host.index(after: colonIndex)...])
-            if !maybeHost.isEmpty, !maybePort.isEmpty {
-                host = maybeHost
-                portString = maybePort
-            }
-        }
-
-        connectManually(host: host, port: Int(portString) ?? 443, password: password)
+    private func showLocalError(_ message: String, kind: LocalActionErrorKind) {
+        errorKind = kind
+        connectionErrorMessage = message
     }
 
     private func connectManually(host: String, port: Int, password: String) {
@@ -719,7 +766,7 @@ struct ContentView: View {
             } catch is CancellationError {
                 return
             } catch {
-                connectionErrorMessage = error.localizedDescription
+                showLocalError(error.localizedDescription, kind: .mouseJiggler)
             }
         }
     }
@@ -732,14 +779,14 @@ struct ContentView: View {
             return
         }
         guard isConnected else {
-            connectionErrorMessage = "Connect to the KVM before enabling Headless mode."
+            showLocalError("Connect to the KVM before enabling Headless mode.", kind: .controlMode)
             return
         }
         guard MouseJigglerPolicy.canEnterHeadless(
             supportsMouseJiggler: kvmDeviceManager.mouseJigglerSupported,
             enabledState: kvmDeviceManager.mouseJigglerEnabled
         ) else {
-            connectionErrorMessage = "Wait until the KVM mouse jiggler state is available before enabling Headless mode."
+            showLocalError("Wait until the KVM mouse jiggler state is available before enabling Headless mode.", kind: .controlMode)
             return
         }
 
@@ -764,7 +811,7 @@ struct ContentView: View {
             } catch is CancellationError {
                 return
             } catch {
-                connectionErrorMessage = error.localizedDescription
+                showLocalError(error.localizedDescription, kind: .controlMode)
             }
         }
     }
@@ -1196,6 +1243,9 @@ struct ConnectionsPopoverView: View {
     let onForgetSelectedDevice: () -> Void
 
     var body: some View {
+        let connectionAction = LocalConnectionAction(
+            isConnected: isConnected, isConnecting: isConnecting, hasSelectedDevice: selectedDevice != nil
+        )
         let resolutionText: String = {
             guard let videoSize, videoSize.width > 0, videoSize.height > 0 else { return "—" }
             return "\(Int(videoSize.width))x\(Int(videoSize.height))"
@@ -1237,7 +1287,16 @@ struct ConnectionsPopoverView: View {
             .frame(maxWidth: .infinity)
             .disabled(isConnected || isConnecting)
 
-            if isConnected {
+            if connectionAction == .cancel {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Connecting…")
+                    Spacer()
+                    Button("Cancel", action: onToggleConnection)
+                        .buttonStyle(.bordered)
+                        .accessibilityIdentifier("cancel-connection-attempt")
+                }
+            } else if connectionAction == .disconnect {
                 Button(role: .destructive, action: onToggleConnection) {
                     Text("Disconnect")
                         .frame(maxWidth: .infinity)
@@ -1247,17 +1306,13 @@ struct ConnectionsPopoverView: View {
             } else {
                 Button(action: onToggleConnection) {
                     HStack(spacing: 8) {
-                        if isConnecting {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                        Text(isConnecting ? "Connecting…" : "Connect")
+                        Text("Connect")
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .disabled(selectedDevice == nil || isConnecting)
+                .disabled(!connectionAction.isEnabled)
                 .keyboardShortcut(.defaultAction)
             }
 

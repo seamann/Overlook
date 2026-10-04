@@ -14,6 +14,7 @@ class MenuBarAgent: NSObject, ObservableObject {
     private let inputManager: InputManager
     private let sessionCoordinator: SessionConnectionCoordinator
     private let showMainWindow: () -> Void
+    private let openSettings: () -> Void
     
     @Published var isConnected = false
     @Published var isConnecting = false
@@ -26,12 +27,14 @@ class MenuBarAgent: NSObject, ObservableObject {
         kvmDeviceManager: KVMDeviceManager,
         inputManager: InputManager,
         sessionCoordinator: SessionConnectionCoordinator,
-        showMainWindow: @escaping () -> Void
+        showMainWindow: @escaping () -> Void,
+        openSettings: @escaping () -> Void
     ) {
         self.kvmDeviceManager = kvmDeviceManager
         self.inputManager = inputManager
         self.sessionCoordinator = sessionCoordinator
         self.showMainWindow = showMainWindow
+        self.openSettings = openSettings
         super.init()
     }
     
@@ -435,26 +438,17 @@ class MenuBarAgent: NSObject, ObservableObject {
         let response = runLocalModal(alert: alert, owner: UUID())
         guard response == .alertFirstButtonReturn else { return }
 
-        let raw = hostField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else { return }
-
-        var host = raw
-        var portString = portField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if let schemeRange = host.range(of: "://") {
-            host = String(host[schemeRange.upperBound...])
+        let endpoint: ManualConnectionEndpoint
+        do {
+            endpoint = try ManualConnectionEndpoint.parse(
+                hostPort: hostField.stringValue, port: portField.stringValue
+            )
+        } catch {
+            showError(title: LocalActionErrorKind.endpoint.title, message: error.localizedDescription)
+            return
         }
-
-        if let colonIndex = host.lastIndex(of: ":") {
-            let maybeHost = String(host[..<colonIndex])
-            let maybePort = String(host[host.index(after: colonIndex)...])
-            if !maybeHost.isEmpty, !maybePort.isEmpty {
-                host = maybeHost
-                portString = maybePort
-            }
-        }
-
-        let port = Int(portString) ?? 443
+        let host = endpoint.host
+        let port = endpoint.port
         let password = passwordField.stringValue
         let deviceName = "Manual KVM @ \(host):\(port)"
         let deviceFactory: @MainActor () async throws -> KVMDevice = { [kvmDeviceManager] in
@@ -493,7 +487,8 @@ class MenuBarAgent: NSObject, ObservableObject {
     }
     
     @objc private func showPreferences() {
-        showMainWindow()
+        closePopover()
+        openSettings()
     }
     
     @objc private func showAddDevice() {
@@ -525,11 +520,13 @@ class MenuBarAgent: NSObject, ObservableObject {
         
         let response = runLocalModal(alert: alert, owner: UUID())
         if response == .alertFirstButtonReturn {
-            let ip = ipField.stringValue
-            let port = portField.integerValue
-            
-            if !ip.isEmpty && port > 0 {
-                _ = kvmDeviceManager.addManualDevice(host: ip, port: port, type: .glinetComet)
+            do {
+                let endpoint = try ManualConnectionEndpoint.parse(
+                    hostPort: ipField.stringValue, port: portField.stringValue
+                )
+                _ = kvmDeviceManager.addManualDevice(host: endpoint.host, port: endpoint.port, type: .glinetComet)
+            } catch {
+                showError(title: LocalActionErrorKind.endpoint.title, message: error.localizedDescription)
             }
         }
     }

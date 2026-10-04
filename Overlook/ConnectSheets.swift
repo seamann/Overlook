@@ -11,7 +11,17 @@ struct ManualConnectSheet: View {
     @State private var submissionGate = ConnectSubmissionGate()
 
     private var canConnect: Bool {
-        ConnectSubmissionPolicy.canSubmitManualConnection(hostPort: hostPort)
+        (try? ManualConnectionEndpoint.parse(hostPort: hostPort, port: port)) != nil
+    }
+
+    private var endpointValidationMessage: String? {
+        guard !hostPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        do {
+            _ = try ManualConnectionEndpoint.parse(hostPort: hostPort, port: port)
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
     }
 
     var body: some View {
@@ -24,6 +34,13 @@ struct ManualConnectSheet: View {
 
             TextField("Port", text: $port)
                 .textFieldStyle(.roundedBorder)
+
+            if let endpointValidationMessage {
+                Text(endpointValidationMessage)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             SecureField("Password", text: $password)
                 .textFieldStyle(.roundedBorder)

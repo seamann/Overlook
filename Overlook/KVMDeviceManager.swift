@@ -1335,7 +1335,7 @@ final class KVMDeviceManager: NSObject, ObservableObject {
         }
 
         let queue = DispatchQueue(label: "com.overlook.validate")
-        let connection = NWConnection(host: NWEndpoint.Host(device.host), port: port, using: .tcp)
+        let connection = NWConnection(host: device.networkHost, port: port, using: .tcp)
 
         return await withCheckedContinuation { continuation in
             let finished = Flag()
