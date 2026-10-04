@@ -27,20 +27,31 @@ run_swift() {
 }
 
 if [[ "$suite" != mcp ]]; then
+  framework_parent="${OVERLOOK_WEBRTC_FRAMEWORK_DIR:-$repo_root/.build/SourcePackages/artifacts/webrtc/WebRTC/WebRTC.xcframework/macos-x86_64_arm64}"
+  bash scripts/test-webrtc-compatibility.sh --preflight "$framework_parent" "$test_dir/preflight"
   run_swift ControlMode Overlook/ControlMode.swift tests/ControlModeTests.swift
   run_swift ReliabilityPolicy Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift tests/ReliabilityPolicyTests.swift
   run_swift MouseJigglerLifecycle Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
     Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
+  run_swift KVMDeviceEndpoint Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
+    Overlook/KVMDevice.swift tests/KVMDeviceEndpointTests.swift
   run_swift CredentialConfig Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
     Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
   run_swift StatsGeneration Overlook/FrameDeliveryState.swift tests/StatsGenerationTests.swift
   run_swift MainWindowLifecycle Overlook/MainWindowLifecycle.swift tests/MainWindowLifecycleTests.swift
+  run_swift LocalRecoveryPolicy Overlook/ControlMode.swift Overlook/LocalRecoveryPolicies.swift tests/LocalRecoveryPolicyTests.swift
   run_swift RemoteActionState Overlook/RemoteActionState.swift tests/RemoteActionStateTests.swift
   run_swift SessionConnectionCoordinator Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     Overlook/KVMDevice.swift Overlook/SessionConnectionCoordinator.swift tests/SessionConnectionCoordinatorTests.swift
+  run_swift JanusRequestCoordinator Overlook/JanusRequestCoordinator.swift tests/JanusRequestCoordinatorTests.swift
+  run_swift WebRTCConnectionTaskScope Overlook/JanusRequestCoordinator.swift tests/WebRTCConnectionTaskScopeTests.swift
+  run_swift AudioUnitInitialization -F "$framework_parent" -framework WebRTC \
+    -Xlinker -rpath -Xlinker "$framework_parent" \
+    -import-objc-header Overlook/RTCAudioDeviceShim.h \
+    Overlook/CoreAudioDevices.swift Overlook/WebRTCAudioDevice.swift tests/AudioUnitInitializationTests.swift
   capture_sources=(Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift Overlook/JSONValue.swift
     Overlook/GLKVMClient.swift Overlook/RemoteActionState.swift Overlook/RemoteSnapshot.swift
     Overlook/LocalInputCapture.swift Overlook/InputManager.swift tests/InputCaptureTestSupport.swift)
@@ -65,17 +76,7 @@ if [[ "$suite" != mcp ]]; then
   kill "$fixture_pid" 2>/dev/null || true
   wait "$fixture_pid" || true
   fixture_pid=''
-  framework_parent="${OVERLOOK_WEBRTC_FRAMEWORK_DIR:-$repo_root/.build/SourcePackages/artifacts/webrtc/WebRTC/WebRTC.xcframework/macos-x86_64_arm64}"
-  if [[ ! -d "$framework_parent/WebRTC.framework" ]]; then
-    printf 'Set OVERLOOK_WEBRTC_FRAMEWORK_DIR to the resolved macOS framework parent.\n' >&2
-    exit 1
-  fi
-  run_swift FrameDelivery -F "$framework_parent" -framework WebRTC \
-    -Xlinker -rpath -Xlinker "$framework_parent" \
-    Overlook/FrameDeliveryState.swift Overlook/RemoteSnapshot.swift tests/FrameDeliveryTests.swift
-  run_swift RemoteSnapshot -F "$framework_parent" -framework WebRTC \
-    -Xlinker -rpath -Xlinker "$framework_parent" \
-    Overlook/RemoteSnapshot.swift tests/RemoteSnapshotTests.swift
+  bash scripts/test-webrtc-compatibility.sh "$framework_parent" "$test_dir/native-compatibility"
   run_swift LocalControlServer Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/RemoteActionState.swift Overlook/RemoteSnapshot.swift Overlook/LocalControlServer.swift \
     tests/LocalControlServerStubs.swift tests/LocalControlServerTests.swift

@@ -229,6 +229,14 @@ final class RemoteSnapshotProvider {
         failCurrentRequest(.unsupportedPixelBuffer)
     }
 
+    /// Captures can settle before synchronous ImageIO work stops. Await the
+    /// existing encoder owner, including its MainActor cleanup, without changing
+    /// readiness, requests or cancellation. This also makes late-result tests
+    /// observe actual resource settlement instead of an assumed elapsed delay.
+    func waitForEncodingSettlement() async {
+        await encodingTask?.value
+    }
+
     func capture(region: SnapshotRegion? = nil) async throws -> RemoteSnapshot {
         try Task.checkCancellation()
         guard isReady else { throw RemoteSnapshotError.notReady }

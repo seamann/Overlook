@@ -45,7 +45,13 @@ jobs:
             -clonedSourcePackagesDirPath "$GITHUB_WORKSPACE/.build/SourcePackages" \
             -onlyUsePackageVersionsFromResolvedFile
 
-      - name: Run policy tests
+      - name: Check native WebRTC import guard
+        if: matrix.configuration == 'Debug'
+        run: |
+          set -euo pipefail
+          bash tests/WebRTCImportGuardTests.sh "$GITHUB_WORKSPACE/.build/SourcePackages/artifacts/webrtc/WebRTC/WebRTC.xcframework/macos-x86_64_arm64"
+
+      - name: Run policy and native WebRTC compatibility tests
         if: matrix.configuration == 'Debug'
         run: |
           set -euo pipefail

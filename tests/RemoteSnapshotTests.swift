@@ -238,7 +238,7 @@ struct RemoteSnapshotTests {
     }
 
     @MainActor
-    private static func readyProvider(limits: SnapshotLimits = .standard, encoder: @escaping RemoteSnapshotProvider.Encoder = SnapshotPNGEncoder.encode) -> RemoteSnapshotProvider {
+    private static func readyProvider(limits: SnapshotLimits = .standard, encoder: @escaping RemoteSnapshotProvider.Encoder = { try SnapshotPNGEncoder.encode($0, region: $1, limits: $2) }) -> RemoteSnapshotProvider {
         let provider = RemoteSnapshotProvider(limits: limits, encoder: encoder)
         provider.setReady(true, sourceID: provider.sourceID)
         return provider
@@ -332,31 +332,49 @@ struct RemoteSnapshotTests {
 
     @MainActor
     private static func testLateEncoding() async throws {
-        let provider = readyProvider { input, region, limits in
-            Thread.sleep(forTimeInterval: 0.05)
-            return try SnapshotPNGEncoder.encode(input, region: region, limits: limits)
-        }
+        let gate = ControlledSnapshotEncoder()
+        defer { gate.release() }
+        let provider = readyProvider { try gate.encode($0, $1, $2) }
         let capture = Task { try await provider.capture() }
         try await waitForRequest(provider)
         provider.receive(try frame(sourceID: provider.sourceID))
+        await gate.waitUntilStarted()
         provider.resetSource()
         try await expectAsyncError(.sourceChanged) { _ = try await capture.value }
-        try await Task.sleep(nanoseconds: 80_000_000)
+        gate.release()
+        await provider.waitForEncodingSettlement()
         try check(!provider.isReady && !provider.isWaitingForFrame, "Late encoding reactivated old source")
+        provider.setReady(true, sourceID: provider.sourceID)
+        let replacement = Task { try await provider.capture() }
+        try await waitForRequest(provider)
+        let freshFrame = try frame(sourceID: provider.sourceID)
+        provider.receive(freshFrame)
+        try check(try await replacement.value.frameID == freshFrame.frameID, "Encoder slot did not settle for replacement source")
     }
 
     @MainActor
     private static func testEncodingDeadline() async throws {
         let limits = SnapshotLimits(encodingTimeoutNanoseconds: 10_000_000)
-        let provider = readyProvider(limits: limits) { input, region, limits in
-            Thread.sleep(forTimeInterval: 0.1)
-            return try SnapshotPNGEncoder.encode(input, region: region, limits: limits)
-        }
+        let gate = ControlledSnapshotEncoder()
+        defer { gate.release() }
+        let provider = readyProvider(limits: limits) { try gate.encode($0, $1, $2) }
         let capture = Task { try await provider.capture() }
         try await waitForRequest(provider)
         provider.receive(try frame(sourceID: provider.sourceID))
+        await gate.waitUntilStarted()
         try await expectAsyncError(.encodingTimedOut) { _ = try await capture.value }
         try await expectAsyncError(.busy) { _ = try await provider.capture() }
+        gate.release()
+        await provider.waitForEncodingSettlement()
+        let replacement = Task { try await provider.capture() }
+        try await waitForRequest(provider)
+        // Starting a new waiter proves slot release. Encoding that request under
+        // the deliberately tiny deadline would test scheduler speed instead.
+        replacement.cancel()
+        do {
+            _ = try await replacement.value
+            throw SnapshotTestFailure(description: "Cancelled replacement capture succeeded")
+        } catch is CancellationError { }
     }
 
     @MainActor
@@ -366,5 +384,60 @@ struct RemoteSnapshotTests {
         try await waitForRequest(provider)
         provider.receiveUnsupportedFrame(sourceID: provider.sourceID, receivedAt: ProcessInfo.processInfo.systemUptime)
         try await expectAsyncError(.unsupportedPixelBuffer) { _ = try await capture.value }
+    }
+}
+
+// NSCondition protects the release state; NSLock protects the async start signal.
+// The synchronous encoder intentionally ignores cancellation while gated, matching
+// ImageIO work that can outlive the capture deadline. No scheduler delay is assumed.
+private final class ControlledSnapshotEncoder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let releaseCondition = NSCondition()
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func waitUntilStarted() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if started {
+                lock.unlock()
+                continuation.resume()
+            } else {
+                startWaiters.append(continuation)
+                lock.unlock()
+            }
+        }
+    }
+
+    func encode(_ input: SnapshotFrame, _ region: SnapshotRegion?, _ limits: SnapshotLimits) throws -> RemoteSnapshot {
+        let snapshot: RemoteSnapshot
+        do {
+            snapshot = try SnapshotPNGEncoder.encode(input, region: region, limits: limits)
+        } catch {
+            signalStarted()
+            throw error
+        }
+        signalStarted()
+        releaseCondition.lock()
+        while !released { releaseCondition.wait() }
+        releaseCondition.unlock()
+        return snapshot
+    }
+
+    private func signalStarted() {
+        lock.lock()
+        started = true
+        let waiters = startWaiters
+        startWaiters = []
+        lock.unlock()
+        waiters.forEach { $0.resume() }
+    }
+
+    func release() {
+        releaseCondition.lock()
+        released = true
+        releaseCondition.broadcast()
+        releaseCondition.unlock()
     }
 }
