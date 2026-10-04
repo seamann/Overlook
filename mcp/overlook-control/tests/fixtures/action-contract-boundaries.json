@@ -1,0 +1,37 @@
+{
+  "maximum_action_sequence": 9007199254740990,
+  "sequence_cases": [
+    { "name": "minimum", "value": 1, "accepted": true },
+    { "name": "integral JSON number", "value": 1.0, "accepted": true },
+    { "name": "maximum", "value": 9007199254740990, "accepted": true },
+    { "name": "maximum plus one", "value": 9007199254740991, "accepted": false },
+    { "name": "zero", "value": 0, "accepted": false },
+    { "name": "negative", "value": -1, "accepted": false },
+    { "name": "fraction", "value": 1.5, "accepted": false },
+    { "name": "boolean true", "value": true, "accepted": false },
+    { "name": "boolean false", "value": false, "accepted": false },
+    { "name": "null", "value": null, "accepted": false },
+    { "name": "numeric string", "value": "1", "accepted": false },
+    { "name": "missing", "accepted": false }
+  ],
+  "action_cases": [
+    { "name": "scroll lower boundary", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": -10 }, "accepted": true },
+    { "name": "scroll upper boundary", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 10 }, "accepted": true },
+    { "name": "scroll negative step", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": -1 }, "accepted": true },
+    { "name": "scroll positive step", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 1 }, "accepted": true },
+    { "name": "scroll below lower boundary", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": -11 }, "accepted": false },
+    { "name": "scroll above upper boundary", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 11 }, "accepted": false },
+    { "name": "scroll zero", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 0 }, "accepted": false },
+    { "name": "scroll boolean", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": true }, "accepted": false },
+    { "name": "scroll null", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": null }, "accepted": false },
+    { "name": "scroll fraction", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 0.5 }, "accepted": false },
+    { "name": "scroll numeric string", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": "1" }, "accepted": false },
+    { "name": "scroll missing delta", "action": { "type": "scroll", "x": 0, "y": 0 }, "accepted": false },
+    { "name": "scroll extra field", "action": { "type": "scroll", "x": 0, "y": 0, "delta_y": 1, "extra": 1 }, "accepted": false },
+    { "name": "click maximum coordinate", "action": { "type": "click", "x": 16383, "y": 16383 }, "accepted": true },
+    { "name": "click coordinate overflow", "action": { "type": "click", "x": 16384, "y": 0 }, "accepted": false },
+    { "name": "click boolean coordinate", "action": { "type": "click", "x": true, "y": 0 }, "accepted": false },
+    { "name": "click null coordinate", "action": { "type": "click", "x": null, "y": 0 }, "accepted": false },
+    { "name": "click fractional coordinate", "action": { "type": "click", "x": 0.5, "y": 0 }, "accepted": false }
+  ]
+}

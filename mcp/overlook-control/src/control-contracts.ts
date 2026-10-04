@@ -3,6 +3,8 @@ import { ACTION_STATES, ControlError } from "./control-errors.js";
 
 export const MAXIMUM_PNG_BYTES = 4 * 1024 * 1024;
 export const MAXIMUM_FRAME_PIXELS = 8_000_000;
+// Keep identical to native RemoteActionCommand.maximumSequence.
+export const MAXIMUM_ACTION_SEQUENCE = 9_007_199_254_740_990;
 export const REMOTE_SHORTCUT_KEYS = [
   "ControlLeft", "ShiftLeft", "AltLeft", "MetaLeft", "KeyA", "KeyC", "KeyV", "KeyX", "KeyZ",
   "Enter", "Escape", "Tab", "Backspace", "Delete", "Home", "End",
@@ -12,7 +14,7 @@ export type RemoteShortcutKey = (typeof REMOTE_SHORTCUT_KEYS)[number];
 const identifier = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const coordinate = z.number().int().min(0).max(16_383);
 const dimension = z.number().int().min(1).max(16_384);
-const sequence = z.number().int().min(1).max(Number.MAX_SAFE_INTEGER);
+const sequence = z.number().int().min(1).max(MAXIMUM_ACTION_SEQUENCE);
 export const regionSchema = z.strictObject({ x: coordinate, y: coordinate, width: dimension, height: dimension });
 export const observeInputSchema = z.strictObject({ region: regionSchema.optional() });
 export const shortcutKeysSchema = z.array(z.enum(REMOTE_SHORTCUT_KEYS)).min(1).max(4)
@@ -22,7 +24,7 @@ export const actInputSchema = actionReferenceSchema.extend({
   frame_id: identifier,
   action: z.discriminatedUnion("type", [
     z.strictObject({ type: z.literal("click"), x: coordinate, y: coordinate }),
-    z.strictObject({ type: z.literal("scroll"), x: coordinate, y: coordinate, delta_y: z.number().int().min(-10).max(10) }),
+    z.strictObject({ type: z.literal("scroll"), x: coordinate, y: coordinate, delta_y: z.number().int().min(-10).max(10).refine((value) => value !== 0, "Scroll delta must be nonzero") }),
     z.strictObject({ type: z.literal("drag"), x: coordinate, y: coordinate, to_x: coordinate, to_y: coordinate, duration_ms: z.number().int().min(100).max(2000) }),
     z.strictObject({ type: z.literal("text"), value: z.string().min(1).max(262_144).refine((value) => Buffer.byteLength(value, "utf8") <= 262_144, "Text is too large") }),
     z.strictObject({ type: z.literal("shortcut"), keys: shortcutKeysSchema }),

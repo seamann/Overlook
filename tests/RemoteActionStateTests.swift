@@ -5,11 +5,12 @@ struct RemoteActionStateTests {
     @MainActor
     static func main() async throws {
         try testValidation()
+        try testSharedContractFixture()
         try testDeduplicationAndEviction()
         try testFrameLifetimeAndSessions()
         try await testCancellationWaitsForRelease()
         try await testUnconfirmedReleaseFailsClosed()
-        print("RemoteActionStateTests passed (5 behavioral groups)")
+        print("RemoteActionStateTests passed (6 behavioral groups)")
     }
 
     private static func testValidation() throws {
@@ -30,6 +31,45 @@ struct RemoteActionStateTests {
             ["type": "shortcut", "keys": ["Enter", "Enter"]],
             ["type": "batch", "actions": []]
         ] { try expect(.invalidRequest) { _ = try RemoteActionCommand.parse(invalid) } }
+    }
+
+    @MainActor
+    private static func testSharedContractFixture() throws {
+        let repository = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
+        let path = repository.appendingPathComponent("mcp/overlook-control/tests/fixtures/action-contract-boundaries.json")
+        let data = try Data(contentsOf: path)
+        guard let fixture = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sequenceCases = fixture["sequence_cases"] as? [[String: Any]],
+              let actionCases = fixture["action_cases"] as? [[String: Any]] else {
+            preconditionFailure("Missing shared native/MCP contract cases")
+        }
+        let maximum = try RemoteActionCommand.integer(fixture["maximum_action_sequence"])
+        precondition(maximum == RemoteActionCommand.maximumSequence)
+        for item in sequenceCases {
+            let name = item["name"] as! String
+            let accepted = item["accepted"] as! Bool
+            let ledger = RemoteActionLedger(bootID: "shared-contract")
+            let session = ledger.synchronize(sourceID: "video", transportID: "input", modeGeneration: 1)
+            do {
+                let sequence = try RemoteActionCommand.integer(item["value"])
+                _ = try ledger.reserve(sessionID: session, sequence: sequence, digest: "fixture")
+                precondition(accepted, "Native accepted invalid sequence: \(name)")
+            } catch let error as RemoteActionError {
+                precondition(!accepted && error == .invalidRequest, "Native rejected valid sequence: \(name)")
+            }
+        }
+        for item in actionCases {
+            let name = item["name"] as! String
+            let accepted = item["accepted"] as! Bool
+            let action = item["action"] as! [String: Any]
+            do {
+                _ = try RemoteActionCommand.parse(action)
+                precondition(accepted, "Native accepted invalid action: \(name)")
+            } catch let error as RemoteActionError {
+                precondition(!accepted && error == .invalidRequest, "Native rejected valid action: \(name)")
+            }
+        }
+        print("Shared action contract: \(sequenceCases.count + actionCases.count) cases passed")
     }
 
     @MainActor
