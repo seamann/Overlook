@@ -31,15 +31,17 @@ if [[ "$suite" != mcp ]]; then
   bash scripts/test-webrtc-compatibility.sh --preflight "$framework_parent" "$test_dir/preflight"
   run_swift ControlMode Overlook/ControlMode.swift tests/ControlModeTests.swift
   run_swift ReliabilityPolicy Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift tests/ReliabilityPolicyTests.swift
+  run_swift MicroMouseJiggler Overlook/MicroMouseJiggler.swift tests/MicroMouseJigglerTests.swift
+  run_swift MicroJigglerPreference Overlook/MicroJigglerPreference.swift tests/MicroJigglerPreferenceTests.swift
   run_swift MouseJigglerLifecycle Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
-    Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
+    Overlook/MicroJigglerPreference.swift Overlook/KVMDeviceManager.swift tests/MouseJigglerLifecycleTests.swift
   run_swift GLKVMResponse Overlook/JSONValue.swift Overlook/GLKVMClient.swift tests/GLKVMSystemConfigTests.swift
   run_swift KVMDeviceEndpoint Overlook/JSONValue.swift Overlook/GLKVMClient.swift \
     Overlook/KVMDevice.swift tests/KVMDeviceEndpointTests.swift
   run_swift CredentialConfig Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift \
     Overlook/JSONValue.swift Overlook/GLKVMClient.swift Overlook/KVMDevice.swift \
-    Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
+    Overlook/MicroJigglerPreference.swift Overlook/KVMDeviceManager.swift tests/CredentialConfigIntegrationTests.swift
   run_swift StatsGeneration Overlook/FrameDeliveryState.swift tests/StatsGenerationTests.swift
   run_swift MainWindowLifecycle Overlook/MainWindowLifecycle.swift tests/MainWindowLifecycleTests.swift
   run_swift LocalRecoveryPolicy Overlook/ControlMode.swift Overlook/LocalRecoveryPolicies.swift tests/LocalRecoveryPolicyTests.swift
@@ -54,7 +56,7 @@ if [[ "$suite" != mcp ]]; then
     Overlook/CoreAudioDevices.swift Overlook/WebRTCAudioDevice.swift tests/AudioUnitInitializationTests.swift
   capture_sources=(Overlook/ControlMode.swift Overlook/ReliabilityPolicies.swift Overlook/JSONValue.swift
     Overlook/GLKVMClient.swift Overlook/RemoteActionState.swift Overlook/RemoteSnapshot.swift
-    Overlook/LocalInputCapture.swift Overlook/InputManager.swift tests/InputCaptureTestSupport.swift)
+    Overlook/LocalInputCapture.swift Overlook/MicroMouseJiggler.swift Overlook/InputManager.swift tests/InputCaptureTestSupport.swift)
   run_swift LocalInputCapture "${capture_sources[@]}" tests/LocalInputCaptureTests.swift
   run_swift InputManagerCapture "${capture_sources[@]}" tests/InputManagerCaptureTests.swift
   run_swift InputManagerGLKVM "${capture_sources[@]}" tests/InputManagerGLKVMTests.swift

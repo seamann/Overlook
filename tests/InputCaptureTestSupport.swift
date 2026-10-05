@@ -41,7 +41,9 @@ final class CaptureFixture {
     var modalWindow: NSWindow?
     private(set) var manager: InputManager!
 
-    init(connected: Bool = true, startCaptureExplicitly: Bool = false, clipboardText: String? = nil) {
+    init(connected: Bool = true, startCaptureExplicitly: Bool = false, clipboardText: String? = nil,
+         microJigglerClock: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+         microJigglerSleeper: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }) {
         NSApplication.shared.setActivationPolicy(.prohibited)
         window = Self.makeWindow()
         otherWindow = Self.makeWindow()
@@ -55,7 +57,8 @@ final class CaptureFixture {
                 keyWindow: self?.keyWindow,
                 modalWindow: self?.modalWindow
             )
-        }, clipboardText: { clipboardText })
+        }, clipboardText: { clipboardText }, microJigglerClock: microJigglerClock,
+           microJigglerSleeper: microJigglerSleeper)
         manager.setup(with: fakeHID)
         manager.setTransportMode(.webRTC)
         manager.registerRemoteInputSurface(surface)

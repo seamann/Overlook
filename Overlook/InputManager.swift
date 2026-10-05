@@ -27,6 +27,15 @@ class InputManager: ObservableObject {
     private var keyboardCaptureGeneration = 0
     private var mouseCaptureGeneration = 0
     private var activePrintOperations = 0
+    private var activeShortcutOperations = 0
+    private var activeMouseGestures = 0
+    private var heldRemoteKeys: Set<UInt16> = []
+    private var heldRemoteButtons: Set<Int> = []
+    private var microJiggler = MicroMouseJiggler()
+    private var microJigglerTimer: Task<Void, Never>?
+    private var microVideoWidth: Int?
+    private let microJigglerClock: @MainActor () -> TimeInterval
+    private let microJigglerSleeper: @Sendable (UInt64) async throws -> Void
     private var activePrintDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var transportID = UUID().uuidString
     @Published private(set) var inputBlocked = false
@@ -34,6 +43,7 @@ class InputManager: ObservableObject {
     private struct PendingAbsoluteMouseMove: Equatable, Sendable {
         let toX: Int
         let toY: Int
+        let videoWidth: Int?
     }
 
     private struct PendingRelativeMouseMove: Equatable, Sendable {
@@ -64,6 +74,7 @@ class InputManager: ObservableObject {
         let move: PendingMouseMoveCommand
         let mode: TransportMode
         let ws: GLKVMClient.WebSocketClient?
+        let owner: String
     }
 
     private var mouseMoveBuffer = LatestMouseMoveCommandBuffer<PendingMouseMoveCommand>()
@@ -95,10 +106,14 @@ class InputManager: ObservableObject {
         },
         clipboardText: @escaping @MainActor () -> String? = {
             NSPasteboard.general.string(forType: .string)
-        }
+        },
+        microJigglerClock: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        microJigglerSleeper: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
     ) {
         localInputCapture = LocalInputCaptureContext(focusEnvironment: inputFocusEnvironment)
         self.clipboardText = clipboardText
+        self.microJigglerClock = microJigglerClock
+        self.microJigglerSleeper = microJigglerSleeper
         observeLocalInputFocusChanges()
         installKeyboardMonitorIfNeeded()
         refreshLocalInputFocus()
@@ -106,6 +121,117 @@ class InputManager: ObservableObject {
     
     func setup(with webRTCManager: WebRTCManager) {
         self.webRTCManager = webRTCManager
+    }
+
+    /// Local user intent only; firmware mouse jiggling stays disabled.
+    func setMicroJigglerEnabled(_ enabled: Bool) {
+        microJiggler.setEnabled(enabled, now: microJigglerClock())
+        microJigglerTimer?.cancel()
+        microJigglerTimer = nil
+        if enabled { scheduleMicroJiggler() }
+    }
+
+    private var microJigglerEligible: Bool {
+        acceptsHIDCommands && localInputCapture.sessionAvailable
+            && !localInputCapture.connectionTransitioning && isLocalInputCaptureAllowed
+            && !inputBlocked && transportMode == .glkvmWebSocket
+            && heldRemoteKeys.isEmpty && heldRemoteButtons.isEmpty
+            && activePrintOperations == 0 && activeShortcutOperations == 0 && activeMouseGestures == 0
+            && !commandKeySentToRemote
+    }
+
+    private func scheduleMicroJiggler() {
+        guard microJiggler.enabled, microJigglerTimer == nil else { return }
+        let sleeper = microJigglerSleeper
+        microJigglerTimer = Task { [weak self] in
+            while !Task.isCancelled {
+                let seconds = self.map { max(0.001, $0.microJiggler.delayUntilNextPulse(now: $0.microJigglerClock())) } ?? 60
+                do { try await sleeper(UInt64(seconds * 1_000_000_000)) }
+                catch { return }
+                guard !Task.isCancelled, let self, self.microJiggler.enabled else { return }
+                await self.performMicroJigglerTick()
+                // If an absolute origin is unavailable or input is held, retry
+                // after another complete interval rather than spinning at zero.
+                if self.microJiggler.delayUntilNextPulse(now: self.microJigglerClock()) == 0 {
+                    do { try await sleeper(60_000_000_000) }
+                    catch { return }
+                    guard !Task.isCancelled else { return }
+                    await self.performMicroJigglerTick()
+                }
+            }
+        }
+    }
+
+    private func invalidateMicroJiggler() {
+        microJiggler.invalidate(now: microJigglerClock())
+        microJigglerTimer?.cancel()
+        microJigglerTimer = nil
+        microVideoWidth = nil
+        scheduleMicroJiggler()
+    }
+
+    private func recordMicroJigglerActivity() {
+        microJiggler.recordActivity(now: microJigglerClock())
+    }
+
+    private func updateMicroVideoWidth(_ width: CGFloat?) {
+        let extent: Int?
+        if let width, width.isFinite, width >= 2, width <= 65535 {
+            extent = Int(width.rounded())
+        } else { extent = nil }
+        if extent != microVideoWidth {
+            microJiggler.invalidate(now: microJigglerClock())
+            microVideoWidth = extent
+        }
+    }
+
+    private func recordDispatchedMouseMove(_ snapshot: PendingMouseMoveCommandSnapshot, generation: Int) {
+        guard transportID == snapshot.owner, generation == mouseMoveGeneration,
+              glkvmWebSocketClient === snapshot.ws else { return }
+        switch snapshot.move {
+        case .absolute(let move):
+            microJiggler.recordAbsoluteOrigin(owner: transportID, x: move.toX, y: move.toY,
+                                             width: move.videoWidth, currentWidth: microVideoWidth, now: microJigglerClock())
+        case .relative:
+            recordMicroJigglerActivity()
+        }
+    }
+
+    // Internal to allow local fixture tests to advance the injected clock.
+    func performMicroJigglerTick() async {
+        guard microJigglerEligible, let ws = glkvmWebSocketClient else { return }
+        let owner = transportID
+        guard await ws.isConnected, transportID == owner, glkvmWebSocketClient === ws,
+              microJigglerEligible,
+              let pulse = microJiggler.beginPulse(owner: owner, absolute: isGLKVMAbsoluteMouseMode,
+                                                  eligible: true, now: microJigglerClock()) else { return }
+        let task = enqueueHIDCommand(label: "Mouse keep-awake", completion: { [weak self] _ in
+            self?.microJiggler.finish(pulse)
+        }, successFeedback: .errorsOnly) { [weak self] in
+            for move in [pulse.outward, pulse.returning] {
+                guard let self,
+                      await self.microPulseMayDispatch(pulse, through: ws) else { return }
+                switch move {
+                case .absolute(let x, let y): try await ws.sendHidMouseMove(toX: x, toY: y)
+                case .relative(let x, let y): try await ws.sendHidMouseRelative(deltaX: x, deltaY: y)
+                }
+                if move == pulse.outward { try await self.microJigglerSleeper(20_000_000) }
+            }
+        }
+        await task?.value
+    }
+
+    func waitForHIDCommandsToDrain() async {
+        await hidCommandTail?.value
+    }
+
+    private func microPulseMayDispatch(_ pulse: MicroMouseJiggler.Pulse,
+                                       through ws: GLKVMClient.WebSocketClient) async -> Bool {
+        guard !Task.isCancelled, microJigglerEligible, glkvmWebSocketClient === ws,
+              microJiggler.isCurrent(pulse, owner: transportID) else { return false }
+        let connected = await ws.isConnected
+        return connected && !Task.isCancelled && microJigglerEligible
+            && glkvmWebSocketClient === ws && microJiggler.isCurrent(pulse, owner: transportID)
     }
 
     func setGLKVMClient(_ client: GLKVMClient?) {
@@ -141,6 +267,7 @@ class InputManager: ObservableObject {
 
     func setGLKVMAbsoluteMouseMode(_ isAbsolute: Bool) {
         guard isGLKVMAbsoluteMouseMode != isAbsolute else { return }
+        invalidateMicroJiggler()
         isGLKVMAbsoluteMouseMode = isAbsolute
         stopMouseMoveSender()
     }
@@ -148,6 +275,7 @@ class InputManager: ObservableObject {
     func handleVideoMouseMove(pointInView: CGPoint, deltaInView: CGSize = .zero, viewSize: CGSize, videoSize: CGSize?) {
         refreshLocalInputFocus()
         guard isMouseCaptureEnabled else { return }
+        updateMicroVideoWidth(videoSize?.width)
         let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
         let moveEvent = MouseMoveEvent(position: normalized, delta: deltaInView, timestamp: CACurrentMediaTime())
         if transportMode == .glkvmWebSocket {
@@ -163,15 +291,16 @@ class InputManager: ObservableObject {
 
     private func enqueueAbsoluteMouseMoveEvent(_ event: MouseMoveEvent) {
         guard isNormalized(event.position) else { return }
+        recordMicroJigglerActivity()
         let (toX, toY) = glkvmAbsolutePoint(fromNormalized: event.position)
-        enqueueMouseMoveCommand(.absolute(PendingAbsoluteMouseMove(toX: toX, toY: toY)))
+        enqueueMouseMoveCommand(.absolute(PendingAbsoluteMouseMove(toX: toX, toY: toY, videoWidth: microVideoWidth)))
     }
 
     private func enqueueRelativeMouseMoveEvent(_ event: MouseMoveEvent) {
         let deltaX = Int(event.delta.width.rounded())
         let deltaY = Int(event.delta.height.rounded())
         guard deltaX != 0 || deltaY != 0 else { return }
-
+        recordMicroJigglerActivity()
         enqueueMouseMoveCommand(.relative(PendingRelativeMouseMove(deltaX: deltaX, deltaY: deltaY)))
     }
 
@@ -198,6 +327,7 @@ class InputManager: ObservableObject {
             guard let snapshot, snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws else { return }
 
             try await Self.sendMouseMoveCommand(snapshot.move, through: ws)
+            await MainActor.run { manager.recordDispatchedMouseMove(snapshot, generation: generation) }
         }
     }
 
@@ -209,11 +339,11 @@ class InputManager: ObservableObject {
         else {
             return nil
         }
-
         return PendingMouseMoveCommandSnapshot(
             move: move,
             mode: transportMode,
-            ws: glkvmWebSocketClient
+            ws: glkvmWebSocketClient,
+            owner: transportID
         )
     }
 
@@ -246,6 +376,7 @@ class InputManager: ObservableObject {
             guard let snapshot, snapshot.mode == .glkvmWebSocket, let ws = snapshot.ws else { return }
 
             try await Self.sendMouseMoveCommand(snapshot.move, through: ws)
+            await MainActor.run { manager.recordDispatchedMouseMove(snapshot, generation: generation) }
         }
     }
 
@@ -258,7 +389,8 @@ class InputManager: ObservableObject {
         return PendingMouseMoveCommandSnapshot(
             move: command,
             mode: transportMode,
-            ws: glkvmWebSocketClient
+            ws: glkvmWebSocketClient,
+            owner: transportID
         )
     }
 
@@ -270,6 +402,7 @@ class InputManager: ObservableObject {
     func handleVideoMouseButton(button: MouseButton, isDown: Bool, pointInView: CGPoint, viewSize: CGSize, videoSize: CGSize?) {
         refreshLocalInputFocus()
         guard isMouseCaptureEnabled else { return }
+        updateMicroVideoWidth(videoSize?.width)
         let normalized = normalizePointInViewToVideo(pointInView: pointInView, viewSize: viewSize, videoSize: videoSize)
         let buttonEvent = MouseButtonEvent(button: button, isDown: isDown, position: normalized, timestamp: CACurrentMediaTime())
         sendMouseButtonEvent(buttonEvent)
@@ -284,6 +417,7 @@ class InputManager: ObservableObject {
 
     func setTransportMode(_ mode: TransportMode) {
         guard transportMode != mode else { return }
+        invalidateMicroJiggler()
         transportID = UUID().uuidString
         transportMode = mode
         switch mode {
@@ -298,6 +432,7 @@ class InputManager: ObservableObject {
     }
 
     func disconnectGLKVMWebSocket() {
+        invalidateMicroJiggler()
         transportID = UUID().uuidString
         stopMouseMoveSender()
         let ws = glkvmWebSocketClient
@@ -396,6 +531,7 @@ class InputManager: ObservableObject {
             refreshLocalInputFocus()
             return
         }
+        invalidateMicroJiggler()
         isLocalInputCaptureAllowed = allowed
         localInputCapture.modeReady = allowed
         refreshLocalInputFocus()
@@ -411,11 +547,13 @@ class InputManager: ObservableObject {
     }
 
     func setSessionAvailable(_ available: Bool) {
+        if localInputCapture.sessionAvailable != available { invalidateMicroJiggler() }
         localInputCapture.sessionAvailable = available
         refreshLocalInputFocus()
     }
 
     func setConnectionTransitioning(_ transitioning: Bool) {
+        if localInputCapture.connectionTransitioning != transitioning { invalidateMicroJiggler() }
         localInputCapture.connectionTransitioning = transitioning
         refreshLocalInputFocus()
     }
@@ -460,7 +598,13 @@ class InputManager: ObservableObject {
 
         if LocalInputCapturePolicy.revoked(from: previous, to: next),
            let ws = glkvmWebSocketClient {
-            enqueueHIDCommand(label: "Local input released") {
+            let owner = transportID
+            enqueueHIDCommand(label: "Local input released", completion: { [weak self] result in
+                guard case .success = result, let self, self.transportID == owner else { return }
+                self.heldRemoteKeys = []
+                self.heldRemoteButtons = []
+                self.recordMicroJigglerActivity()
+            }) {
                 try await ws.releaseAllHIDInputs()
             }
         }
@@ -503,6 +647,8 @@ class InputManager: ObservableObject {
                     activeCommandKeyCode = pending
                     pendingCommandKeyCode = nil
                     commandKeySentToRemote = true
+                    heldRemoteKeys.insert(pending)
+                    heldRemoteKeys.insert(keyCode)
 
                     enqueueLocalKeyboardHIDCommand(label: "Key combination") {
                         try await ws.sendHidKey(key: metaKey, state: true)
@@ -582,6 +728,7 @@ class InputManager: ObservableObject {
            let ws = glkvmWebSocketClient,
            let code = activeCommandKeyCode,
            let metaKey = glkvmKeyForMacKeyCode(code) {
+            heldRemoteKeys.remove(code)
             enqueueLocalKeyboardHIDCommand(label: "Modifier released") {
                 try await ws.sendHidKey(key: metaKey, state: false)
             }
@@ -679,12 +826,14 @@ class InputManager: ObservableObject {
     }
 
     private func beginPrintOperation() {
+        recordMicroJigglerActivity()
         activePrintOperations += 1
     }
 
     private func finishPrintOperation() {
         precondition(activePrintOperations > 0)
         activePrintOperations -= 1
+        recordMicroJigglerActivity()
         guard activePrintOperations == 0 else { return }
         let waiters = activePrintDrainWaiters
         activePrintDrainWaiters = []
@@ -716,6 +865,12 @@ class InputManager: ObservableObject {
         }
 
         try willDispatch()
+        recordMicroJigglerActivity()
+        activeShortcutOperations += 1
+        defer {
+            activeShortcutOperations -= 1
+            recordMicroJigglerActivity()
+        }
         do {
             try await client.sendHidShortcut(keys: keys)
             try Task.checkCancellation()
@@ -735,6 +890,8 @@ class InputManager: ObservableObject {
     ) async throws {
         let x = Self.clampInt(signedX, min: -32_767, max: 32_767)
         let y = Self.clampInt(signedY, min: -32_767, max: 32_767)
+        let owner = transportID
+        let width = microVideoWidth
         try await sendRemoteMouseGesture(
             label: "Codex click", authorization: authorization, willDispatch: willDispatch
         ) { ws in
@@ -746,6 +903,9 @@ class InputManager: ObservableObject {
                 body: { try await Task.sleep(nanoseconds: 50_000_000) },
                 release: { try await ws.sendHidMouseButton(button: "left", state: false) }
             )
+        }
+        if transportID == owner, isGLKVMAbsoluteMouseMode {
+            microJiggler.recordAbsoluteOrigin(owner: owner, x: x, y: y, width: width, currentWidth: microVideoWidth, now: microJigglerClock())
         }
     }
 
@@ -809,6 +969,12 @@ class InputManager: ObservableObject {
         guard transportMode == .glkvmWebSocket, isGLKVMAbsoluteMouseMode, let ws = glkvmWebSocketClient else {
             throw RemoteTextInputError.notConnected
         }
+        microJiggler.invalidate(now: microJigglerClock())
+        activeMouseGestures += 1
+        defer {
+            activeMouseGestures -= 1
+            recordMicroJigglerActivity()
+        }
         let expectedTransport = transportID
         let cancellationHandle = HIDCommandCancellationHandle()
         let commandContinuation = CancellableCommandContinuation()
@@ -864,6 +1030,7 @@ class InputManager: ObservableObject {
     }
 
     private func latchUnconfirmedInput() {
+        invalidateMicroJiggler()
         inputBlocked = true
         refreshLocalInputFocus()
         activityStatus = "Input blocked: previous remote outcome is unknown"
@@ -888,6 +1055,7 @@ class InputManager: ObservableObject {
         }
         try Task.checkCancellation()
         inputBlocked = false
+        invalidateMicroJiggler()
         transportID = UUID().uuidString
         activityStatus = "Manual review acknowledged; input release transmitted"
         lastInputError = nil
@@ -960,6 +1128,9 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket,
            let key = glkvmKeyForMacKeyCode(event.keyCode),
            let ws = glkvmWebSocketClient {
+            recordMicroJigglerActivity()
+            if event.isKeyDown { heldRemoteKeys.insert(event.keyCode) }
+            else { heldRemoteKeys.remove(event.keyCode) }
             enqueueLocalKeyboardHIDCommand(label: event.isKeyDown ? "Key down" : "Key up") {
                 let isShiftKey = key == "ShiftLeft" || key == "ShiftRight"
                 let carriesSyntheticShift = !isShiftKey && event.modifiers.contains(.shift)
@@ -991,11 +1162,23 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket,
            let button = glkvmMouseButtonName(event.button),
            let ws = glkvmWebSocketClient {
+            recordMicroJigglerActivity()
+            if event.isDown { heldRemoteButtons.insert(event.button.rawValue) }
+            else { heldRemoteButtons.remove(event.button.rawValue) }
             let shouldMove = isGLKVMAbsoluteMouseMode && isNormalized(event.position)
             let absolutePoint = shouldMove ? glkvmAbsolutePoint(fromNormalized: event.position) : nil
+            let owner = transportID
+            let width = microVideoWidth
+            let generation = mouseMoveGeneration
+            let manager = self
             enqueueLocalMouseHIDCommand(label: event.isDown ? "Mouse down" : "Mouse up") {
                 if let absolutePoint {
                     try await ws.sendHidMouseMove(toX: absolutePoint.0, toY: absolutePoint.1)
+                    await MainActor.run {
+                        guard manager.transportID == owner, manager.mouseMoveGeneration == generation else { return }
+                        manager.microJiggler.recordAbsoluteOrigin(owner: owner, x: absolutePoint.0, y: absolutePoint.1,
+                                                                 width: width, currentWidth: manager.microVideoWidth, now: manager.microJigglerClock())
+                    }
                 }
                 try await ws.sendHidMouseButton(button: button, state: event.isDown)
             }
@@ -1043,6 +1226,7 @@ class InputManager: ObservableObject {
         if transportMode == .glkvmWebSocket, let ws = glkvmWebSocketClient {
             let dx = Self.clampInt(Int(event.deltaX.rounded()), min: -127, max: 127)
             let dy = Self.clampInt(Int(event.deltaY.rounded()), min: -127, max: 127)
+            recordMicroJigglerActivity()
             enqueueLocalMouseHIDCommand(label: "Mouse wheel", successFeedback: .errorsOnly) {
                 try await ws.sendHidMouseWheel(deltaX: dx, deltaY: dy)
             }
@@ -1175,6 +1359,7 @@ class InputManager: ObservableObject {
     }
     
     deinit {
+        microJigglerTimer?.cancel()
         for observer in localInputFocusObservers {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -1197,6 +1382,7 @@ class InputManager: ObservableObject {
     }
 
     func shutdown() async {
+        setMicroJigglerEnabled(false)
         acceptsHIDCommands = false
         stopFullInputCapture()
         stopMouseMoveSender()
@@ -1240,6 +1426,9 @@ class InputManager: ObservableObject {
                   glkvmClient === client,
                   transportID == expectedTransport else { return }
             let ws = try? client.makeWebSocketClient(stream: false)
+            invalidateMicroJiggler()
+            heldRemoteKeys = []
+            heldRemoteButtons = []
             glkvmWebSocketClient = ws
             transportID = UUID().uuidString
             let installedTransport = transportID
@@ -1266,6 +1455,7 @@ class InputManager: ObservableObject {
         successFeedback: HIDCommandSuccessFeedbackMode = .publishChanges,
         operation: @escaping @Sendable () async throws -> Void
     ) {
+        recordMicroJigglerActivity()
         let generation = keyboardCaptureGeneration
         enqueueHIDCommand(
             label: label,
@@ -1284,6 +1474,7 @@ class InputManager: ObservableObject {
         successFeedback: HIDCommandSuccessFeedbackMode = .publishChanges,
         operation: @escaping @Sendable () async throws -> Void
     ) {
+        recordMicroJigglerActivity()
         let generation = mouseCaptureGeneration
         enqueueHIDCommand(
             label: label,

@@ -5,6 +5,16 @@ import Combine
 struct MouseJigglerLifecycleTests {
     @MainActor static func main() async throws {
         let tests: [(String, @MainActor () async throws -> Void)] = [
+            ("firmware jiggler migrates to local micro intent", testMigration),
+            ("micro enable never enables firmware", testMicroEnable),
+            ("daemon and config are independently confirmed", testIndependentFirmwareStates),
+            ("malformed daemon state fails closed", testMalformedDaemon),
+            ("daemon readback mismatch fails closed", testDaemonReadbackMismatch),
+            ("config readback mismatch fails closed", testConfigReadbackMismatch),
+            ("local intent survives app relaunch per endpoint", testPreferenceRelaunch),
+            ("stored local off overrides old firmware intent", testPreferenceOffMigration),
+            ("failed safety confirmation retains explicit local off", testFailedDisablePreference),
+            ("refresh supersedes in-flight local activation", testRefreshSupersedesActivation),
             ("enabled jiggler resumes only after remote drain", testRestoreAfterDrain),
             ("previously disabled jiggler stays disabled", testPriorOff),
             ("failed disable recovers in Manual", testFailedDisable),
@@ -33,6 +43,7 @@ struct MouseJigglerLifecycleTests {
             do { try await test(); print("PASS: \(name)") }
             catch { failures.append("\(name): \(error)") }
         }
+        if JigglerURLProtocol.anyFirmwareTrueWrite { failures.append("A lifecycle scenario sent firmware true") }
         failures.forEach { FileHandle.standardError.write(Data("FAIL: \($0)\n".utf8)) }
         guard failures.isEmpty else { throw TestFailure.message("\(failures.count) lifecycle regressions") }
         print("MouseJigglerLifecycleTests: \(tests.count) scenarios passed; URLProtocol only, no KVM or persisted state")
@@ -40,19 +51,138 @@ struct MouseJigglerLifecycleTests {
 
     @MainActor private static func setup(enabled: Bool = true, supported: Bool = true) async throws -> (KVMDeviceManager, JigglerFixture) {
         let fixture = JigglerFixture(enabled: enabled, supported: supported)
+        return (try await setup(fixture: fixture), fixture)
+    }
+
+    @MainActor private static func setup(fixture: JigglerFixture, preference: MicroJigglerPreference = .disabled) async throws -> KVMDeviceManager {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [JigglerURLProtocol.self]
         let client = try GLKVMClient(host: fixture.host, authToken: "fixture-only", allowInsecureTLS: false, sessionConfiguration: configuration)
         let device = KVMDevice(id: fixture.host, name: "Synthetic KVM", host: fixture.host, port: 80, type: .custom, authToken: "", capabilities: [])
-        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
+        let manager = KVMDeviceManager(startsServices: false, persistsConnections: false, microJigglerPreference: preference)
         manager.commitConnection(PreparedKVMConnection(device: device, client: client))
         try await eventually { manager.mouseJigglerSupported != nil }
-        return (manager, fixture)
+        return manager
+    }
+
+    @MainActor private static func testMigration() async throws {
+        let (manager, fixture) = try await setup()
+        try expect(manager.mouseJigglerEnabled == true, "Existing enabled intent was lost")
+        try expect(!fixture.enabled && !fixture.daemonEnabled, "Large firmware jiggler was not disabled")
+        try expect(fixture.posts == [false] && fixture.daemonPosts == [false], "Migration did not disable both actual daemon and config")
+    }
+
+    @MainActor private static func testMicroEnable() async throws {
+        let (manager, fixture) = try await setup(enabled: false)
+        try await manager.setMouseJigglerEnabled(true)
+        try expect(manager.mouseJigglerEnabled == true, "Confirmed micro intent was not published")
+        try expect(!fixture.enabled && !fixture.daemonEnabled, "Micro enable activated large firmware jiggler")
+        try expect(fixture.posts == [false] && fixture.daemonPosts == [false], "Micro enable must only send firmware false")
+    }
+
+    @MainActor private static func testIndependentFirmwareStates() async throws {
+        for configEnabled in [false, true] {
+            let fixture = JigglerFixture(enabled: configEnabled, supported: true)
+            fixture.simulateDaemonEnabled(!configEnabled)
+            let manager = try await setup(fixture: fixture)
+            try expect(manager.mouseJigglerEnabled == true, "Separate enabled firmware intent was not adopted")
+            try expect(!fixture.enabled && !fixture.daemonEnabled, "Config/daemon disagreed after migration")
+            try expect(fixture.posts.allSatisfy { !$0 } && fixture.daemonPosts.allSatisfy { !$0 }, "Firmware true was sent")
+            manager.disconnectFromDevice()
+        }
+    }
+
+    @MainActor private static func testMalformedDaemon() async throws {
+        let (manager, fixture) = try await setup(enabled: false)
+        for payload in [#"{"ok":true,"result":{}}"#, #"{"ok":true,"result":{"jiggler":{"active":"false"}}}"#,
+                        #"{"ok":true,"result":{"jiggler":{"active":0}}}"#, #"{"ok":true,"result":{"jiggler":{"active":null}}}"#] {
+            fixture.setDaemonPayload(payload)
+            do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Invalid HID granted micro enable") }
+            catch GLKVMClient.ClientError.decodingFailed {}
+            try expect(manager.mouseJigglerEnabled != true && manager.mouseJigglerErrorMessage != nil, "Malformed HID did not stop movement")
+        }
+        try expect(fixture.posts.isEmpty && fixture.daemonPosts.isEmpty, "Malformed HID emitted a firmware write")
+    }
+
+    @MainActor private static func testDaemonReadbackMismatch() async throws {
+        let (manager, fixture) = try await setup(enabled: false)
+        fixture.ignoreDaemonDisable = true
+        fixture.simulateDaemonEnabled(true)
+        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Active daemon allowed micro enable") }
+        catch MouseJigglerError.readbackMismatch {}
+        try expect(manager.mouseJigglerEnabled != true && fixture.daemonPosts == [false], "Daemon mismatch was hidden")
+    }
+
+    @MainActor private static func testConfigReadbackMismatch() async throws {
+        let (manager, fixture) = try await setup(enabled: false)
+        fixture.ignoreConfigDisable = true
+        fixture.simulateFirmwareEnabled(true)
+        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Enabled config allowed micro enable") }
+        catch MouseJigglerError.readbackMismatch {}
+        try expect(manager.mouseJigglerEnabled != true && fixture.posts == [false], "Config mismatch was hidden")
+    }
+
+    @MainActor private static func testPreferenceRelaunch() async throws {
+        let memory = MemoryMicroPreference()
+        let fixture = JigglerFixture(enabled: false, supported: true)
+        let first = try await setup(fixture: fixture, preference: memory.dependencies)
+        try await first.setMouseJigglerEnabled(true)
+        first.disconnectFromDevice()
+        let second = try await setup(fixture: fixture, preference: memory.dependencies)
+        try expect(second.mouseJigglerEnabled == true && !fixture.enabled && !fixture.daemonEnabled, "Relaunch did not restore only local intent")
+        let other = JigglerFixture(enabled: false, supported: true)
+        let unrelated = try await setup(fixture: other, preference: memory.dependencies)
+        try expect(unrelated.mouseJigglerEnabled == false, "Preference crossed endpoints")
+        try await second.setMouseJigglerEnabled(false)
+        second.disconnectFromDevice()
+        let third = try await setup(fixture: fixture, preference: memory.dependencies)
+        try expect(third.mouseJigglerEnabled == false, "Explicit local off was not retained")
+    }
+
+    @MainActor private static func testPreferenceOffMigration() async throws {
+        let memory = MemoryMicroPreference()
+        let fixture = JigglerFixture(enabled: true, supported: true)
+        memory.values[MicroJigglerPreference.endpointKey(host: fixture.host, port: 80)] = false
+        let manager = try await setup(fixture: fixture, preference: memory.dependencies)
+        try expect(manager.mouseJigglerEnabled == false && !fixture.enabled && !fixture.daemonEnabled, "Legacy firmware overrode explicit local off")
+    }
+
+    @MainActor private static func testFailedDisablePreference() async throws {
+        let memory = MemoryMicroPreference()
+        let fixture = JigglerFixture(enabled: false, supported: true)
+        let manager = try await setup(fixture: fixture, preference: memory.dependencies)
+        try await manager.setMouseJigglerEnabled(true)
+        fixture.setDaemonPayload(#"{"ok":true,"result":{}}"#)
+        do { try await manager.setMouseJigglerEnabled(false); throw TestFailure.message("Missing daemon confirmation succeeded") }
+        catch GLKVMClient.ClientError.decodingFailed {}
+        manager.disconnectFromDevice()
+        fixture.setDaemonPayload(nil)
+        let relaunched = try await setup(fixture: fixture, preference: memory.dependencies)
+        try expect(relaunched.mouseJigglerEnabled == false, "Failed confirmation erased explicit local off intent")
+    }
+
+    @MainActor private static func testRefreshSupersedesActivation() async throws {
+        let (manager, fixture) = try await setup(enabled: false)
+        fixture.holdNextPost()
+        let enabling = Task { try await manager.setMouseJigglerEnabled(true) }
+        try await eventually { fixture.hasHeldRequest }
+        fixture.holdNextGet()
+        let refresh = Task { await manager.refreshMouseJigglerState() }
+        await spin()
+        fixture.releaseHeldRequests()
+        do { try await enabling.value; throw TestFailure.message("Obsolete activation was published") }
+        catch is CancellationError {}
+        try await eventually { fixture.hasHeldRequest }
+        try expect(manager.mouseJigglerEnabled != true, "Activation resumed before new firmware confirmation")
+        fixture.releaseHeldRequests()
+        await refresh.value
+        try expect(manager.mouseJigglerEnabled == true && !fixture.enabled && !fixture.daemonEnabled, "Latest refresh did not restore local intent safely")
     }
 
     @MainActor private static func enterHeadless(_ manager: KVMDeviceManager) async throws {
         let owner = manager.beginHeadlessConfigurationTransition()
         defer { manager.endHeadlessConfigurationTransition(owner) }
+        try expect(manager.mouseJigglerEnabled == false, "Transition must synchronously stop local movement")
         try await manager.pauseMouseJigglerForHeadless()
         manager.setHeadlessModeActive(true)
     }
@@ -79,7 +209,7 @@ struct MouseJigglerLifecycleTests {
         try expect(!fixture.enabled && manager.mouseJigglerEnabled == false, "Headless must confirm off")
         store.setMode(.manual)
         await spin()
-        try expect(fixture.posts == [false] && captures == [true, false], "Restore and capture must wait for real drain")
+        try expect(fixture.posts == [false, false] && captures == [true, false], "Restore and capture must wait for real drain")
         fixture.holdNextPost()
         await blocker.release()
         _ = try await mutation.value
@@ -87,7 +217,7 @@ struct MouseJigglerLifecycleTests {
         try expect(captures == [true, false, true], "Firmware restore delayed Manual capture after drain")
         fixture.releaseHeldRequests()
         try await eventually { manager.mouseJigglerEnabled == true }
-        try expect(fixture.posts == [false, true] && manager.mouseJigglerEnabled == true, "Enabled state was not restored")
+        try expect(fixture.posts == [false, false, false] && fixture.daemonPosts == [false, false, false] && manager.mouseJigglerEnabled == true, "Enabled state was not restored")
     }
 
     @MainActor private static func testPriorOff() async throws {
@@ -107,7 +237,7 @@ struct MouseJigglerLifecycleTests {
         catch { }
         manager.endHeadlessConfigurationTransition(owner)
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.enabled && manager.mouseJigglerEnabled == true, "Manual failure recovery lost prior enabled state")
+        try expect(!fixture.enabled && !fixture.daemonEnabled && manager.mouseJigglerEnabled == true, "Manual failure recovery lost prior enabled state")
     }
 
     @MainActor private static func testManualSupersession() async throws {
@@ -153,7 +283,7 @@ struct MouseJigglerLifecycleTests {
         _ = try? await restore.value
         try await manual.value
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(!fixture.enabled && fixture.posts == [false, true, false], "Sent restore overrode newer Manual toggle")
+        try expect(!fixture.enabled && fixture.posts == [false, false, false, false], "Sent restore overrode newer Manual toggle")
     }
 
     @MainActor private static func testDisconnect() async throws {
@@ -167,7 +297,7 @@ struct MouseJigglerLifecycleTests {
         fixture.releaseHeldRequests()
         _ = try? await restore.value
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.posts == [false] && manager.mouseJigglerEnabled == nil, "Disconnected session was restored")
+        try expect(fixture.posts == [false, false] && manager.mouseJigglerEnabled == nil, "Disconnected session was restored")
     }
 
     @MainActor private static func testReheadlessDuringReadback() async throws {
@@ -207,7 +337,7 @@ struct MouseJigglerLifecycleTests {
         catch { }
         try expect(manager.mouseJigglerErrorMessage != nil, "Restore failure was hidden")
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.enabled && manager.mouseJigglerErrorMessage == nil, "Restore could not recover")
+        try expect(!fixture.enabled && !fixture.daemonEnabled && manager.mouseJigglerEnabled == true && manager.mouseJigglerErrorMessage == nil, "Restore could not recover")
     }
 
     @MainActor private static func testStoreCancellation() async throws {
@@ -251,25 +381,25 @@ struct MouseJigglerLifecycleTests {
         manager.endHeadlessConfigurationTransition(owner)
         store.resumeManualCaptureIfNeeded()
         await spin()
-        try expect(fixture.posts == [false] && captures == [true], "Failed-transition recovery bypassed drain")
+        try expect(fixture.posts == [false, false] && captures == [true], "Failed-transition recovery bypassed drain")
         await blocker.release()
         _ = try await mutation.value
-        try await eventually { fixture.enabled }
+        try await eventually { manager.mouseJigglerEnabled == true }
         try expect(captures == [true, true], "Failure hook delayed Manual capture")
-        try expect(fixture.enabled, "Shared failure hook did not restore previous state")
+        try expect(manager.mouseJigglerEnabled == true && !fixture.enabled, "Shared failure hook did not restore previous state")
     }
 
     @MainActor private static func testLockedRestore() async throws {
         let (manager, fixture) = try await setup()
         try await enterHeadless(manager)
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.posts == [false], "Locked restore sent enable")
+        try expect(fixture.posts == [false, false], "Locked restore sent enable")
         do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Locked Manual toggle succeeded") }
         catch is TestFailure { throw TestFailure.message("Locked Manual toggle succeeded") }
         catch { }
         manager.setHeadlessModeActive(false)
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.enabled, "Locked request erased prior true intent")
+        try expect(manager.mouseJigglerEnabled == true && !fixture.enabled, "Locked request erased prior true intent")
     }
 
     @MainActor private static func testRefreshOwnership() async throws {
@@ -319,7 +449,7 @@ struct MouseJigglerLifecycleTests {
         refresh.cancel()
         await refresh.value
         fixture.releaseHeldRequests()
-        try expect(manager.mouseJigglerEnabled == true, "Cancellation erased confirmed state")
+        try expect(manager.mouseJigglerEnabled == false, "Cancelled refresh must leave local movement stopped")
     }
 
     @MainActor private static func testTransientRefresh() async throws {
@@ -351,7 +481,9 @@ struct MouseJigglerLifecycleTests {
         manager.endHeadlessConfigurationTransition(owner)
         manager.setHeadlessModeActive(false)
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(fixture.posts.isEmpty, "Unsupported firmware received a configuration write")
+        do { try await manager.setMouseJigglerEnabled(true); throw TestFailure.message("Unsupported firmware granted micro activation") }
+        catch MouseJigglerError.unavailable {}
+        try expect(fixture.posts.isEmpty && fixture.daemonPosts.isEmpty, "Unsupported firmware received a configuration write")
     }
 
     @MainActor private static func testReplacementSession() async throws {
@@ -361,7 +493,7 @@ struct MouseJigglerLifecycleTests {
         manager.commitConnection(PreparedKVMConnection(device: replacement.connectedDevice!, client: replacement.glkvmClient!))
         manager.setHeadlessModeActive(false)
         try await manager.resumeMouseJigglerAfterHeadless()
-        try expect(first.posts == [false] && second.posts.isEmpty, "Restoration crossed session boundary")
+        try expect(first.posts == [false, false] && second.posts.isEmpty, "Restoration crossed session boundary")
     }
 
     @MainActor private static func testDisconnectedState() async throws {
@@ -382,7 +514,7 @@ struct MouseJigglerLifecycleTests {
         try await eventually { fixture.getCount > before }
         refresh.cancel()
         await refresh.value
-        try expect(fixture.getCount - before == 1 && manager.mouseJigglerEnabled == true, "Cancelled backoff retried or erased state")
+        try expect(fixture.getCount - before == 1 && manager.mouseJigglerEnabled == false, "Cancelled backoff must leave local movement stopped")
     }
 
     @MainActor private static func eventually(_ condition: () -> Bool) async throws {
@@ -409,10 +541,22 @@ private actor TestBarrier {
     func release() { released = true; let current = waiters; waiters = []; current.forEach { $0.resume() } }
 }
 
+private final class MemoryMicroPreference {
+    var values: [String: Bool] = [:]
+    var dependencies: MicroJigglerPreference {
+        MicroJigglerPreference(read: { self.values[$0] }, write: { self.values[$1] = $0 })
+    }
+}
+
 private final class JigglerFixture: @unchecked Sendable {
     let host = "jiggler-\(UUID().uuidString.lowercased()).invalid"
     private let lock = NSLock()
     private var currentEnabled: Bool
+    private var daemonActive: Bool
+    private var daemonWrites: [Bool] = []
+    private var daemonPayload: String?
+    var ignoreDaemonDisable = false
+    var ignoreConfigDisable = false
     private let supported: Bool
     private var writes: [Bool] = []
     private var gets = 0
@@ -424,16 +568,20 @@ private final class JigglerFixture: @unchecked Sendable {
     private var remainingFailures = 0
     private var failureStatus: Int?
     init(enabled: Bool, supported: Bool) {
-        currentEnabled = enabled; self.supported = supported
+        currentEnabled = enabled; daemonActive = enabled; self.supported = supported
         JigglerURLProtocol.register(self)
     }
     var enabled: Bool { lock.withLock { currentEnabled } }
     var posts: [Bool] { lock.withLock { writes } }
+    var daemonEnabled: Bool { lock.withLock { daemonActive } }
+    var daemonPosts: [Bool] { lock.withLock { daemonWrites } }
     var getCount: Int { lock.withLock { gets } }
     var hasHeldRequest: Bool { lock.withLock { !held.isEmpty } }
     func holdNextGet() { lock.withLock { holdGet = true } }
     func holdGet(number: Int) { lock.withLock { holdGetNumber = number } }
     func simulateFirmwareEnabled(_ enabled: Bool) { lock.withLock { currentEnabled = enabled } }
+    func simulateDaemonEnabled(_ enabled: Bool) { lock.withLock { daemonActive = enabled } }
+    func setDaemonPayload(_ payload: String?) { lock.withLock { daemonPayload = payload } }
     func holdNextPost() { lock.withLock { holdPost = true } }
     func failNextPostAfterApplying() { lock.withLock { rejectPost = true } }
     func failNextGets(count: Int, status: Int?) { lock.withLock { remainingFailures = count; failureStatus = status } }
@@ -444,12 +592,22 @@ private final class JigglerFixture: @unchecked Sendable {
     func handle(_ request: URLRequest, reply: @escaping (Int?, String?) -> Void) {
         let body = Self.bodyData(request)
         let callback: (() -> Void)? = lock.withLock {
+            if request.url?.path == "/api/hid" {
+                let payload = daemonPayload ?? "{\"ok\":true,\"result\":{\"jiggler\":{\"enabled\":true,\"active\":\(daemonActive),\"interval\":60,\"schedule\":[]}}}"
+                return { reply(200, payload) }
+            }
+            if request.url?.path == "/api/hid/set_params" {
+                let value = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "jiggler" })?.value
+                guard value == "false" || value == "true" else { return { reply(400, #"{"ok":false}"#) } }
+                if !ignoreDaemonDisable { daemonActive = value == "true" }; daemonWrites.append(value == "true")
+                return { reply(200, #"{"ok":true,"result":{}}"#) }
+            }
             let isPost = request.httpMethod == "POST"
             if isPost {
                 guard let body, let object = try? JSONSerialization.jsonObject(with: body) as? [String: Any], let enabled = object["mouse_jiggle"] as? Bool else {
                     return { reply(400, #"{"ok":false}"#) }
                 }
-                currentEnabled = enabled; writes.append(enabled)
+                if !ignoreConfigDisable { currentEnabled = enabled }; writes.append(enabled)
             } else { gets += 1 }
             let shouldHold = isPost ? holdPost : (holdGet || holdGetNumber == gets)
             if isPost { holdPost = false } else { holdGet = false }
@@ -489,6 +647,9 @@ private final class JigglerURLProtocol: URLProtocol, @unchecked Sendable {
     private let stateLock = NSLock()
     private var stopped = false
     static func register(_ fixture: JigglerFixture) { lock.withLock { fixtures[fixture.host] = fixture } }
+    static var anyFirmwareTrueWrite: Bool {
+        lock.withLock { fixtures.values.contains { $0.posts.contains(true) || $0.daemonPosts.contains(true) } }
+    }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {

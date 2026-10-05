@@ -41,9 +41,10 @@ struct CredentialConfigIntegrationTests {
         let manager = KVMDeviceManager(startsServices: false, persistsConnections: false)
         manager.commitConnection(PreparedKVMConnection(device: device(fixture.host), client: client))
         let updated = try await manager.applySystemConfig(draft, editedFields: ["keymap"], connectionSessionID: manager.connectionSessionID!)
-        let expected = try values(#"{"keymap":"en-us","stream_quality":3,"mouse_jiggle":true,"future":{"mode":"new"},"added_after_open":42}"#)
+        let expected = try values(#"{"keymap":"en-us","stream_quality":3,"mouse_jiggle":false,"future":{"mode":"new"},"added_after_open":42}"#)
         try expect(fixture.postedPayloads.last == expected, "Full config POST overwrote newer firmware data")
         try expect(updated.streamQuality == 3, "Updated state lost fresh setting")
+        try expect(!fixture.postedPayloads.contains { $0["mouse_jiggle"] == .bool(true) }, "Settings re-enabled the large firmware jiggler")
         manager.disconnectFromDevice()
     }
 
@@ -339,6 +340,14 @@ private final class ConfigFixture: @unchecked Sendable {
     }
     func response(to request: URLRequest) throws -> Data {
         lock.lock(); defer { lock.unlock() }
+        if request.url?.path == "/api/hid" {
+            return Data(#"{"ok":true,"result":{"jiggler":{"enabled":true,"active":false}}}"#.utf8)
+        }
+        if request.url?.path == "/api/hid/set_params" {
+            let jiggler = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "jiggler" })?.value
+            guard jiggler == "false" else { throw URLError(.cannotDecodeContentData) }
+            return Data(#"{"ok":true,"result":{}}"#.utf8)
+        }
         if request.httpMethod == "POST" {
             var body = request.httpBody
             if body == nil, let stream = request.httpBodyStream {

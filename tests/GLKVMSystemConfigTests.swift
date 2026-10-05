@@ -43,6 +43,7 @@ struct GLKVMSystemConfigTests {
         var failedContracts = 0
         do { try testLosslessConfigContract() } catch { failedContracts += 1 }
         do { try await testLoginContract() } catch { failedContracts += 1 }
+        do { try await testHIDReadbackContract() } catch { failedContracts += 1 }
         do { try testConfigEditContract() } catch { failedContracts += 1 }
         guard failedContracts == 0 else { throw ContractFailure.regressions(failedContracts) }
         print("GLKVMSystemConfigTests passed")
@@ -121,6 +122,28 @@ struct GLKVMSystemConfigTests {
         let largeRoundtrip = try decoder.decode(GLKVMJSONObject.self, from: JSONEncoder().encode(largeConfig))
         guard largeRoundtrip == large else { throw ContractFailure.regressions(1) }
         print("Config edit contract: all 17 settings, unchanged/protected merge and 10k unknown entries passed")
+    }
+
+    private static func testHIDReadbackContract() async throws {
+        let cases: [(String, Bool?)] = [
+            ("hid-off", false), ("hid-on", true), ("hid-missing", nil),
+            ("hid-missing-active", nil), ("hid-null", nil), ("hid-string", nil),
+            ("hid-number", nil), ("hid-disabled-active", true),
+        ]
+        var failures = 0
+        for (scenario, expected) in cases {
+            let config = URLSessionConfiguration.ephemeral
+            config.protocolClasses = [GLKVMResponseFixtureProtocol.self]
+            let client = try GLKVMClient(host: "\(scenario).invalid", allowInsecureTLS: false, sessionConfiguration: config)
+            do {
+                let result = try await client.getHIDJigglerState()
+                if result != expected { failures += 1 }
+            } catch GLKVMClient.ClientError.decodingFailed {
+                if expected != nil { failures += 1 }
+            } catch { failures += 1 }
+        }
+        guard failures == 0 else { throw ContractFailure.regressions(failures) }
+        print("HID daemon contract: \(cases.count) strict boolean scenarios passed")
     }
 
     private static func testLoginContract() async throws {
@@ -247,6 +270,14 @@ private final class GLKVMResponseFixtureProtocol: URLProtocol {
 
     private static func payload(for scenario: String) -> String {
         switch scenario {
+        case "hid-off": return #"{"ok":true,"result":{"jiggler":{"enabled":true,"active":false,"interval":20}}}"#
+        case "hid-on": return #"{"ok":true,"result":{"jiggler":{"enabled":true,"active":true}}}"#
+        case "hid-missing": return #"{"ok":true,"result":{}}"#
+        case "hid-missing-active": return #"{"ok":true,"result":{"jiggler":{"enabled":true}}}"#
+        case "hid-null": return #"{"ok":true,"result":{"jiggler":{"active":null}}}"#
+        case "hid-string": return #"{"ok":true,"result":{"jiggler":{"active":"false"}}}"#
+        case "hid-number": return #"{"ok":true,"result":{"jiggler":{"active":0}}}"#
+        case "hid-disabled-active": return #"{"ok":true,"result":{"jiggler":{"enabled":false,"active":true}}}"#
         case "login-token": return #"{"ok":true,"result":{"token":"fixture-token"}}"#
         case "login-invalid-ok-cookie": return #"{"ok":"true"}"#
         case "login-empty-cookie": return #"{"ok":true}"#

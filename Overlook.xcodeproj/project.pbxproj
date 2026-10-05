@@ -41,6 +41,8 @@
 		01000029 /* MainWindowLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002B /* MainWindowLifecycle.swift */; };
 		0100002A /* JanusRequestCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002C /* JanusRequestCoordinator.swift */; };
 		0100002B /* LocalRecoveryPolicies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002D /* LocalRecoveryPolicies.swift */; };
+		0100002C /* MicroMouseJiggler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002E /* MicroMouseJiggler.swift */; };
+		0100002D /* MicroJigglerPreference.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0200002F /* MicroJigglerPreference.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -82,6 +84,8 @@
 		0200002B /* MainWindowLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MainWindowLifecycle.swift; sourceTree = "<group>"; };
 		0200002C /* JanusRequestCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JanusRequestCoordinator.swift; sourceTree = "<group>"; };
 		0200002D /* LocalRecoveryPolicies.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalRecoveryPolicies.swift; sourceTree = "<group>"; };
+		0200002E /* MicroMouseJiggler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicroMouseJiggler.swift; sourceTree = "<group>"; };
+		0200002F /* MicroJigglerPreference.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MicroJigglerPreference.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -118,6 +122,8 @@
 				0200002A /* FrameDeliveryState.swift */,
 				0200002C /* JanusRequestCoordinator.swift */,
 				0200002D /* LocalRecoveryPolicies.swift */,
+				0200002E /* MicroMouseJiggler.swift */,
+				0200002F /* MicroJigglerPreference.swift */,
 				0200002B /* MainWindowLifecycle.swift */,
 				02000028 /* SessionConnectionCoordinator.swift */,
 				02000027 /* KVMDevice.swift */,
@@ -243,6 +249,8 @@
 				01000028 /* FrameDeliveryState.swift in Sources */,
 				0100002A /* JanusRequestCoordinator.swift in Sources */,
 				0100002B /* LocalRecoveryPolicies.swift in Sources */,
+				0100002C /* MicroMouseJiggler.swift in Sources */,
+				0100002D /* MicroJigglerPreference.swift in Sources */,
 				01000029 /* MainWindowLifecycle.swift in Sources */,
 				01000026 /* SessionConnectionCoordinator.swift in Sources */,
 				01000025 /* KVMDevice.swift in Sources */,

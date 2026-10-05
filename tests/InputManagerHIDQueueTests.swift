@@ -83,21 +83,34 @@ struct InputManagerHIDQueueTests {
             fputs("InputManagerHIDQueueTests fixture identity check FAILED: \(error)\n", stderr)
             exit(1)
         }
-        let cases: [(String, @MainActor (CaptureFixture) async throws -> Void)] = [
-            ("actual WebSocket dispatch", testActualWebSocketDispatch),
-            ("scheduled move revoked at execution", testScheduledMoveRevoked),
-            ("frozen moves revoked at execution", testFrozenMovesRevoked),
-            ("queued key and wheel revoked at execution", testKeyAndWheelRevoked),
-            ("queued inputs invalidated by disconnect", testQueuedInputsDisconnected),
-            ("headless false-to-false emits no extra release", testHeadlessRefreshDoesNotReleaseAgain),
+        let cases: [(String, @MainActor (CaptureFixture, MicroClock) async throws -> Void)] = [
+            ("actual WebSocket dispatch", { fixture, _ in try await testActualWebSocketDispatch(fixture) }),
+            ("scheduled move revoked at execution", { fixture, _ in try await testScheduledMoveRevoked(fixture) }),
+            ("frozen moves revoked at execution", { fixture, _ in try await testFrozenMovesRevoked(fixture) }),
+            ("queued key and wheel revoked at execution", { fixture, _ in try await testKeyAndWheelRevoked(fixture) }),
+            ("queued inputs invalidated by disconnect", { fixture, _ in try await testQueuedInputsDisconnected(fixture) }),
+            ("headless false-to-false emits no extra release", { fixture, _ in try await testHeadlessRefreshDoesNotReleaseAgain(fixture) }),
+            ("micro one pixel background Manual", testMicroBackground),
+            ("micro automatic scheduler after toolbar enable", testMicroAutomaticScheduler),
+            ("micro no unknown width", testMicroUnknownWidth),
+            ("micro revoked queued origin", testMicroRevokedOrigin),
+            ("micro held key survives mouse-mode invalidation", testMicroHeldKey),
+            ("micro held button", testMicroHeldButton),
+            ("micro held command key after modifier up", testMicroCommandKey),
+            ("micro user move cancels stale return", testMicroUserActivity),
+            ("micro Headless cancels return", testMicroHeadless),
+            ("micro relative plus minus one", testMicroRelative),
         ]
         var failures: [String] = []
         for (name, run) in cases {
-            let fixture = CaptureFixture()
+            let clock = MicroClock()
+            let fixture = CaptureFixture(microJigglerClock: { clock.now }, microJigglerSleeper: { delay in
+                try await clock.sleep(delay)
+            })
             do {
                 try await connect(fixture, port: port)
                 try await control.reset()
-                try await run(fixture)
+                try await run(fixture, clock)
                 let events = try await control.recordedAfterClose()
                 try verify(name: name, events: events)
                 print("PASS: \(name)")
@@ -194,11 +207,162 @@ struct InputManagerHIDQueueTests {
         try await sentinelAndDisconnect(fixture)
     }
 
+    @MainActor private static func microOrigin(_ fixture: CaptureFixture, width: CGFloat? = 1920, x: CGFloat = 480) async {
+        fixture.manager.handleVideoMouseMove(pointInView: CGPoint(x: x, y: 540),
+            viewSize: CGSize(width: 1920, height: 1080),
+            videoSize: width.map { CGSize(width: $0, height: 1080) })
+        await fixture.manager.waitForHIDCommandsToDrain()
+    }
+
+    @MainActor private static func testMicroBackground(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        await microOrigin(fixture)
+        fixture.appIsActive = false
+        fixture.keyWindow = fixture.otherWindow
+        fixture.manager.refreshLocalInputFocus()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        try expect(!fixture.manager.isMouseCaptureEnabled, "Background fixture must actually revoke ordinary capture")
+        clock.now = 59
+        await fixture.manager.performMicroJigglerTick()
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroUnknownWidth(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        await microOrigin(fixture, width: nil)
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroAutomaticScheduler(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        await microOrigin(fixture)
+        clock.automaticTimer = true
+        fixture.manager.setMicroJigglerEnabled(true)
+        try await clock.waitForTimerSleep()
+        clock.now = 60
+        clock.releaseTimerSleep()
+        // Waiting for the next real scheduler sleep proves that the timer's
+        // queued outward and return transmissions have completed.
+        try await clock.waitForTimerSleep()
+        fixture.manager.setMicroJigglerEnabled(false)
+        clock.now = 120
+        clock.releaseTimerSleep()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroRevokedOrigin(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        fixture.manager.handleVideoMouseMove(pointInView: CGPoint(x: 480, y: 540),
+            viewSize: CGSize(width: 1920, height: 1080), videoSize: CGSize(width: 1920, height: 1080))
+        fixture.keyWindow = fixture.otherWindow
+        fixture.manager.refreshLocalInputFocus()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroHeldKey(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        NSApp.sendEvent(fixture.event())
+        await fixture.manager.waitForHIDCommandsToDrain()
+        fixture.manager.setGLKVMAbsoluteMouseMode(false)
+        fixture.manager.setGLKVMAbsoluteMouseMode(true)
+        await microOrigin(fixture)
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        NSApp.sendEvent(fixture.event(type: .keyUp))
+        await fixture.manager.waitForHIDCommandsToDrain()
+        clock.now = 120
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroUserActivity(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        await microOrigin(fixture)
+        clock.betweenMoves = {
+            fixture.manager.handleVideoMouseMove(pointInView: CGPoint(x: 960, y: 540),
+                viewSize: CGSize(width: 1920, height: 1080), videoSize: CGSize(width: 1920, height: 1080))
+        }
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        await fixture.manager.disconnectInputForSession()
+        clock.betweenMoves = nil
+    }
+
+    @MainActor private static func testMicroHeldButton(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        fixture.manager.handleVideoMouseButton(button: .left, isDown: true, pointInView: CGPoint(x: 480, y: 540),
+            viewSize: CGSize(width: 1920, height: 1080), videoSize: CGSize(width: 1920, height: 1080))
+        await fixture.manager.waitForHIDCommandsToDrain()
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroCommandKey(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        NSApp.sendEvent(fixture.event(type: .flagsChanged, keyCode: 55, modifiers: [.command]))
+        NSApp.sendEvent(fixture.event(keyCode: 0, modifiers: [.command]))
+        NSApp.sendEvent(fixture.event(type: .flagsChanged, keyCode: 55, modifiers: []))
+        await fixture.manager.waitForHIDCommandsToDrain()
+        await microOrigin(fixture)
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testMicroHeadless(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setMicroJigglerEnabled(true)
+        await microOrigin(fixture)
+        clock.betweenMoves = { fixture.manager.setLocalInputCaptureAllowed(false) }
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+        clock.betweenMoves = nil
+    }
+
+    @MainActor private static func testMicroRelative(_ fixture: CaptureFixture, _ clock: MicroClock) async throws {
+        fixture.manager.setGLKVMAbsoluteMouseMode(false)
+        fixture.manager.setMicroJigglerEnabled(true)
+        clock.now = 60
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.disconnectInputForSession()
+    }
+
     private static func verify(name: String, events: [RecordedHIDEvent]) throws {
         try expect(events.map(\.seq) == events.indices.map { $0 + 1 }, "Recorded sequence is missing or unordered: \(events)")
         let hid = events.filter { $0.type != "json" }
         let moves = hid.filter { $0.type == "move" }
         let sentinelMoves = moves.filter { $0.x == 1234 && $0.y == 5678 }
+        if name.hasPrefix("micro ") {
+            let coordinates = moves.map { [$0.x ?? Int.min, $0.y ?? Int.min] }
+            switch name {
+            case "micro one pixel background Manual", "micro held key survives mouse-mode invalidation", "micro automatic scheduler after toolbar enable":
+                try expect(coordinates == [[-16384, 0], [-16350, 0], [-16384, 0]], "Expected exactly real origin, +1px, original: \(hid)")
+            case "micro no unknown width":
+                try expect(coordinates == [[-16384, 0]], "Unknown video extent cannot jiggle: \(hid)")
+            case "micro held button", "micro held command key after modifier up":
+                try expect(coordinates == [[-16384, 0]], "Held remote key/button must prevent micro movement: \(hid)")
+            case "micro revoked queued origin":
+                try expect(moves.isEmpty, "Revoked UI point cannot become jiggler anchor: \(hid)")
+            case "micro user move cancels stale return":
+                try expect(coordinates == [[-16384, 0], [-16350, 0], [0, 0]], "Real activity must cancel old-position return: \(hid)")
+            case "micro Headless cancels return":
+                try expect(coordinates == [[-16384, 0], [-16350, 0]], "Headless must synchronously cancel pending return: \(hid)")
+            case "micro relative plus minus one":
+                let relative = hid.filter { $0.type == "relative" }.map { [$0.x ?? Int.min, $0.y ?? Int.min] }
+                try expect(relative == [[1, 0], [-1, 0]], "Relative pulse must be exactly plus/minus one: \(hid)")
+            default: throw CaptureTestFailure(description: "Unverified micro case \(name)")
+            }
+            return
+        }
         if name == "actual WebSocket dispatch" {
             try expect(moves.count == 3 && sentinelMoves.count == 1, "Scheduled/captured moves and sentinel must all dispatch: \(hid)")
             try expect(hid.contains { $0.type == "key" && $0.key == "KeyX" && $0.state == true }, "Actual KeyX down missing: \(hid)")
@@ -221,5 +385,35 @@ struct InputManagerHIDQueueTests {
 
     private static func isCleanup(_ event: RecordedHIDEvent) -> Bool {
         event.state == false && ((event.type == "key" && event.key == "") || event.type == "button")
+    }
+}
+
+@MainActor
+private final class MicroClock {
+    var now: TimeInterval = 0
+    var betweenMoves: (@MainActor () -> Void)?
+    var automaticTimer = false
+    private var timerWaiter: CheckedContinuation<Void, Error>?
+
+    func sleep(_ delay: UInt64) async throws {
+        if delay == 20_000_000 { betweenMoves?(); return }
+        if automaticTimer {
+            try await withCheckedThrowingContinuation { timerWaiter = $0 }
+            try Task.checkCancellation()
+        } else { try await Task.sleep(nanoseconds: 3_600_000_000_000) }
+    }
+
+    func waitForTimerSleep() async throws {
+        let deadline = Date().addingTimeInterval(5)
+        while timerWaiter == nil {
+            try expect(Date() < deadline, "Automatic jiggler timer did not enter the injected sleeper")
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    func releaseTimerSleep() {
+        let waiter = timerWaiter
+        timerWaiter = nil
+        waiter?.resume()
     }
 }

@@ -122,6 +122,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func bindControlSafetyState() {
+        kvmDeviceManager.$mouseJigglerEnabled
+            .sink { [weak self] enabled in
+                self?.inputManager.setMicroJigglerEnabled(enabled == true)
+            }
+            .store(in: &cancellables)
+
         controlModeStore.$mode
             .sink { [weak self] mode in
                 self?.kvmDeviceManager.setHeadlessModeActive(mode == .codexHeadless)

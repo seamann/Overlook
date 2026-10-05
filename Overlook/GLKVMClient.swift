@@ -585,6 +585,20 @@ final class GLKVMClient {
         )
     }
 
+    /// Confirms the daemon state, rather than relying on the UI configuration.
+    func getHIDJigglerState() async throws -> Bool {
+        struct HIDState: Decodable {
+            struct Jiggler: Decodable { let active: Bool }
+            let jiggler: Jiggler
+        }
+        let response = try await request(
+            method: "GET",
+            path: "api/hid",
+            responseType: GLKVMResponse<HIDState>.self
+        )
+        return response.result.jiggler.active
+    }
+
     func getTurnCredentials() async throws -> GLKVMTurnCredentials {
         let response = try await request(
             method: "GET",

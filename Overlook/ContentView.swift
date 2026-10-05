@@ -171,7 +171,9 @@ struct ContentView: View {
         guard let isEnabled = kvmDeviceManager.mouseJigglerEnabled else {
             return "Mouse jiggler state unavailable"
         }
-        return isEnabled ? "Disable mouse jiggler" : "Keep the remote display awake"
+        return isEnabled
+            ? "Disable tiny mouse movements"
+            : "Keep the remote display awake with a tiny movement after 60 seconds without input"
     }
 
     private var mouseJigglerButton: some View {
