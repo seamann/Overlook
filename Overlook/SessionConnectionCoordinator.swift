@@ -1,35 +1,15 @@
 import Foundation
 import Combine
 
-enum SessionConnectionError: Error, LocalizedError {
-    case previousSessionCleanupFailed
-    case manualReviewExpired
-
-    var errorDescription: String? {
-        switch self {
-        case .previousSessionCleanupFailed:
-            return "Die alte KVM-Sitzung hat den HID-Disconnect nicht bestätigt. Öffne Connections, um die Bereinigung erneut zu versuchen oder die alte Sitzung nach manueller Prüfung lokal zu verwerfen. Die Eingabe bleibt gesperrt."
-        case .manualReviewExpired:
-            return "Diese Prüfung der alten KVM-Sitzung ist nicht mehr gültig. Öffne Connections erneut und prüfe die angezeigte Sitzung im Modus Manual."
-        }
-    }
-}
-
 /// Owns connection attempts across all UI entry points. Preparation can overlap;
 /// published state and remote HID transitions belong to one attempt at a time.
 @MainActor
 final class SessionConnectionCoordinator: ObservableObject {
-    struct PendingCleanupReview: Identifiable, Equatable, Sendable {
-        let id: UUID
-        let endpoint: String
-    }
-
     struct Dependencies {
         var prepare: @MainActor (KVMDevice, String?) async throws -> PreparedKVMConnection
         var commit: @MainActor (PreparedKVMConnection) -> KVMDevice
         var invalidateSession: @MainActor () -> Void
         var drainSession: @MainActor () async -> Void
-        var blockInputForRecovery: @MainActor () -> Void
         var installInput: @MainActor (GLKVMClient) -> Void
         var setHIDConnected: @MainActor (GLKVMClient, Bool) async throws -> Void
         var connectVideo: @MainActor (KVMDevice) async throws -> Void
@@ -45,13 +25,10 @@ final class SessionConnectionCoordinator: ObservableObject {
     }
 
     @Published private(set) var isConnecting = false
-    @Published private(set) var pendingCleanupReview: PendingCleanupReview?
     private let dependencies: Dependencies
     private var attemptGeneration: UInt64 = 0
     private var connectionTask: Task<KVMDevice, Error>?
-    private var lifecycleTail: Task<Void, Error>?
-    private var activeClient: GLKVMClient?
-    private var cleanupClient: GLKVMClient?
+    private var lifecycleTail: Task<Void, Never>?
 
     init(dependencies: Dependencies) {
         self.dependencies = dependencies
@@ -85,17 +62,13 @@ final class SessionConnectionCoordinator: ObservableObject {
                 try self.checkAttempt(id)
                 let prepared = try await self.dependencies.prepare(device, password)
                 try self.checkAttempt(id)
-                try await teardown.value
+                await teardown.value
                 try self.checkAttempt(id)
                 return try await self.activate(prepared, attemptID: id)
             } catch {
                 if !self.isCurrent(id) || Task.isCancelled || Self.isCancellation(error) {
                     if self.isCurrent(id) {
-                        let cleanup = self.beginTeardown()
-                        if case .failure(let cleanupError) = await cleanup.result,
-                           self.isCurrent(id) {
-                            self.dependencies.reportTransportError("HID disconnect", cleanupError)
-                        }
+                        await self.beginTeardown().value
                     }
                     throw CancellationError()
                 }
@@ -115,45 +88,9 @@ final class SessionConnectionCoordinator: ObservableObject {
         dependencies.setConnectionTransitioning(true)
         let teardown = beginTeardown()
         return Task { @MainActor in
-            do {
-                try await teardown.value
-            } catch {
-                if self.isCurrent(id) { self.dependencies.reportTransportError("HID disconnect", error) }
-            }
+            await teardown.value
             guard self.isCurrent(id) else { return }
             self.dependencies.setConnectionTransitioning(false)
-        }
-    }
-
-    func acknowledgeUnconfirmedCleanup(
-        reviewID: UUID,
-        authorization: @escaping @MainActor @Sendable () -> Bool
-    ) async throws {
-        try Task.checkCancellation()
-        guard let client = cleanupClient else { throw SessionConnectionError.manualReviewExpired }
-        let attemptID = attemptGeneration
-        try checkCleanupReview(reviewID, client: client, attemptID: attemptID, authorization: authorization)
-
-        // Already-sent HID work must settle before consent can discard its
-        // local owner. This acknowledgement never issues a remote operation.
-        _ = await lifecycleTail?.result
-        try checkCleanupReview(reviewID, client: client, attemptID: attemptID, authorization: authorization)
-        dependencies.blockInputForRecovery()
-        cleanupClient = nil
-        pendingCleanupReview = nil
-    }
-
-    private func checkCleanupReview(
-        _ reviewID: UUID,
-        client: GLKVMClient,
-        attemptID: UInt64,
-        authorization: @MainActor @Sendable () -> Bool
-    ) throws {
-        try Task.checkCancellation()
-        guard authorization(), isCurrent(attemptID), !isConnecting,
-              connectionTask == nil, activeClient == nil, cleanupClient === client,
-              pendingCleanupReview?.id == reviewID else {
-            throw SessionConnectionError.manualReviewExpired
         }
     }
 
@@ -164,35 +101,16 @@ final class SessionConnectionCoordinator: ObservableObject {
         return attemptGeneration
     }
 
-    private func beginTeardown() -> Task<Void, Error> {
+    private func beginTeardown() -> Task<Void, Never> {
         let previous = lifecycleTail
-        let client = activeClient ?? cleanupClient
-        activeClient = nil
-        cleanupClient = client
         dependencies.invalidateSession()
 
         let teardown = Task { @MainActor in
-            // Wait for settlement even if the prior transition failed. A new
-            // explicit attempt may retry the retained cleanup client once.
-            _ = await previous?.result
+            // HID(false) changes the device-wide USB connection. An app session
+            // ends by draining input releases and closing its WebSocket instead.
+            // Let any already-sent HID enable settle before closing that session.
+            await previous?.value
             await self.dependencies.drainSession()
-            guard let client, self.cleanupClient === client else { return }
-            do {
-                try await self.dependencies.setHIDConnected(client, false)
-            } catch {
-                if self.cleanupClient === client {
-                    self.dependencies.blockInputForRecovery()
-                    self.pendingCleanupReview = PendingCleanupReview(
-                        id: UUID(),
-                        endpoint: "\(client.baseURL.host ?? "Unbekannt"):\(client.baseURL.port ?? 443)"
-                    )
-                }
-                throw SessionConnectionError.previousSessionCleanupFailed
-            }
-            if self.cleanupClient === client {
-                self.cleanupClient = nil
-                self.pendingCleanupReview = nil
-            }
         }
         lifecycleTail = teardown
         return teardown
@@ -201,11 +119,10 @@ final class SessionConnectionCoordinator: ObservableObject {
     private func activate(_ prepared: PreparedKVMConnection, attemptID: UInt64) async throws -> KVMDevice {
         try checkAttempt(attemptID)
         let connected = dependencies.commit(prepared)
-        activeClient = prepared.client
         dependencies.installInput(prepared.client)
 
-        // Keep the actual remote call outside the cancellable attempt. A later
-        // teardown must observe its completion before issuing HID(false).
+        // Enable USB HID for devices disabled by earlier app versions. Keep this
+        // remote call outside the cancellable attempt so teardown can await it.
         let enable = Task { @MainActor in
             try await self.dependencies.setHIDConnected(prepared.client, true)
         }

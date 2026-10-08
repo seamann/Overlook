@@ -14,7 +14,7 @@ struct LocalRecoveryPolicyTests {
             ("preferences require the same connected Manual state as the toolbar", settingsAccess),
             ("disconnected input recovery offers reconnect instead of release", disconnectedInputRecovery),
             ("input release requires both live video and a recovery transport", connectedInputRecovery),
-            ("old cleanup review and busy states cannot release input", pendingCleanupInputRecovery),
+            ("device reconnection stays available while input remains paused", pausedConnectionInputRecovery),
             ("Headless and revoked Manual cannot acknowledge input recovery", authorizedInputRecovery),
             ("recovery errors explain the next local step", inputRecoveryErrors),
         ]
@@ -93,6 +93,15 @@ struct LocalRecoveryPolicyTests {
     }
 
     private static func connectionCancellation() throws {
+        try expect(LocalConnectionAction(isConnected: true, isConnecting: false,
+                                         hasSelectedDevice: true, isSelectedDeviceConnected: false) == .switchDevice,
+                   "Selecting a different connected device must offer automatic switching")
+        try expect(LocalConnectionAction(isConnected: true, isConnecting: true,
+                                         hasSelectedDevice: true, isSelectedDeviceConnected: false) == .cancel,
+                   "A pending switch must remain cancellable")
+        try expect(LocalConnectionAction(isConnected: true, isConnecting: false,
+                                         hasSelectedDevice: false, isSelectedDeviceConnected: false) == .disconnect,
+                   "Clearing device selection must not initiate a switch")
         for hasDevice in [false, true] {
             let action = LocalConnectionAction(isConnected: false, isConnecting: true, hasSelectedDevice: hasDevice)
             try expect(action == .cancel && action.isEnabled, "Cannot cancel connecting attempt")
@@ -151,20 +160,20 @@ struct LocalRecoveryPolicyTests {
                    "Ready recovery does not require inspecting the remote image")
     }
 
-    private static func pendingCleanupInputRecovery() throws {
-        let pending = inputRecovery(isConnected: false, hasVideo: false, hasTransport: false, hasCleanup: true)
-        try expect(pending.action == .reviewPreviousSession, "Failed old cleanup has no local takeover path")
-        try expect(pending.buttonTitle == "Alte Sitzung prüfen …" && pending.message.contains("direkt"),
-                   "Old cleanup review does not explain direct target inspection")
-        try expect(inputRecovery(isBusy: true, hasCleanup: true).action == .waitForConnection,
+    private static func pausedConnectionInputRecovery() throws {
+        let pending = inputRecovery(isConnected: false, hasVideo: false, hasTransport: false)
+        try expect(pending.action == .reconnect, "Old device cleanup still blocks connecting a new device")
+        try expect(pending.buttonTitle == "Erneut verbinden" && pending.message.contains("Bild"),
+                   "Recovery must offer a new connection followed by a fresh image review")
+        try expect(inputRecovery(isBusy: true).action == .waitForConnection,
                    "A still running transition allows concurrent review")
         try expect(inputRecovery(isBusy: true).buttonTitle == nil, "Busy recovery offers a duplicate action")
         try expect(inputRecovery(isBusy: true).message.contains("angehalten"), "Busy state does not explain retained input pause")
     }
 
     private static func authorizedInputRecovery() throws {
-        try expect(inputRecovery(mode: .codexHeadless, hasCleanup: true).action == .switchToManual,
-                   "Headless can acknowledge the human cleanup review")
+        try expect(inputRecovery(mode: .codexHeadless).action == .switchToManual,
+                   "Headless can acknowledge the human input review")
         try expect(inputRecovery(mode: .codexHeadless).buttonTitle == nil,
                    "Headless offers the human input release button")
         try expect(inputRecovery(mode: .codexHeadless).message.contains("Manual"),
@@ -187,12 +196,12 @@ struct LocalRecoveryPolicyTests {
     private static func inputRecovery(
         mode: OverlookControlMode = .manual, isConnected: Bool = true,
         isBusy: Bool = false, hasVideo: Bool = true, hasTransport: Bool = true,
-        hasCleanup: Bool = false, captureAllowed: Bool = true
+        captureAllowed: Bool = true
     ) -> InputRecoveryPresentation {
         InputRecoveryPresentation(
             mode: mode, isConnected: isConnected, isBusy: isBusy,
             hasLiveVideo: hasVideo, hasRecoveryTransport: hasTransport,
-            hasPendingCleanupReview: hasCleanup, isLocalCaptureAllowed: captureAllowed
+            isLocalCaptureAllowed: captureAllowed
         )
     }
 

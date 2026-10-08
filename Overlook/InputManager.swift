@@ -10,6 +10,8 @@ extension Notification.Name {
 
 @MainActor
 class InputManager: ObservableObject {
+    static let inputRecoveryBlockedDefaultsKey = "overlook.inputRecoveryBlocked"
+    private let inputRecoveryDefaults: UserDefaults?
     private var webRTCManager: WebRTCManager?
     private var glkvmClient: GLKVMClient?
     private var glkvmWebSocketClient: GLKVMClient.WebSocketClient?
@@ -112,15 +114,23 @@ class InputManager: ObservableObject {
             NSPasteboard.general.string(forType: .string)
         },
         microJigglerClock: @escaping @MainActor () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        microJigglerSleeper: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        microJigglerSleeper: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
+        inputRecoveryDefaults: UserDefaults? = nil
     ) {
+        self.inputRecoveryDefaults = inputRecoveryDefaults
         localInputCapture = LocalInputCaptureContext(focusEnvironment: inputFocusEnvironment)
         self.clipboardText = clipboardText
         self.microJigglerClock = microJigglerClock
         self.microJigglerSleeper = microJigglerSleeper
+        inputBlocked = Self.storedInputRecoveryBlocked(in: inputRecoveryDefaults)
+        if inputBlocked { activityStatus = "Input blocked: previous remote outcome is unknown" }
         observeLocalInputFocusChanges()
         installKeyboardMonitorIfNeeded()
         refreshLocalInputFocus()
+    }
+
+    private static func storedInputRecoveryBlocked(in defaults: UserDefaults?) -> Bool {
+        defaults?.bool(forKey: inputRecoveryBlockedDefaultsKey) ?? false
     }
     
     func setup(with webRTCManager: WebRTCManager) {
@@ -1040,6 +1050,7 @@ class InputManager: ObservableObject {
     }
 
     private func latchUnconfirmedInput() {
+        inputRecoveryDefaults?.set(true, forKey: Self.inputRecoveryBlockedDefaultsKey)
         inputBlockGeneration = UUID()
         invalidateMicroJiggler()
         inputBlocked = true
@@ -1073,6 +1084,7 @@ class InputManager: ObservableObject {
         try await verifyCurrentRecoveryTransport(ws, owner: capturedTransport,
                                                  reviewedBlockGeneration: reviewedBlockGeneration,
                                                  authorization: authorization)
+        inputRecoveryDefaults?.removeObject(forKey: Self.inputRecoveryBlockedDefaultsKey)
         inputBlocked = false
         invalidateMicroJiggler()
         transportID = UUID().uuidString

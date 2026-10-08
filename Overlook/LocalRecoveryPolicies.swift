@@ -98,7 +98,7 @@ struct LocalRecoveryPresentation: Equatable, Sendable {
 }
 
 enum InputRecoveryAction: Equatable, Sendable {
-    case switchToManual, waitForConnection, reviewPreviousSession, reconnect, releaseInput
+    case switchToManual, waitForConnection, reconnect, releaseInput
 }
 
 struct InputRecoveryPresentation: Equatable, Sendable {
@@ -107,11 +107,10 @@ struct InputRecoveryPresentation: Equatable, Sendable {
     init(
         mode: OverlookControlMode, isConnected: Bool, isBusy: Bool,
         hasLiveVideo: Bool, hasRecoveryTransport: Bool,
-        hasPendingCleanupReview: Bool, isLocalCaptureAllowed: Bool
+        isLocalCaptureAllowed: Bool
     ) {
         if mode != .manual { action = .switchToManual }
         else if isBusy || !isLocalCaptureAllowed { action = .waitForConnection }
-        else if hasPendingCleanupReview { action = .reviewPreviousSession }
         else if !isConnected || !hasLiveVideo || !hasRecoveryTransport { action = .reconnect }
         else { action = .releaseInput }
     }
@@ -119,7 +118,6 @@ struct InputRecoveryPresentation: Equatable, Sendable {
     var buttonTitle: String? {
         switch action {
         case .switchToManual, .waitForConnection: return nil
-        case .reviewPreviousSession: return "Alte Sitzung prüfen …"
         case .reconnect: return "Erneut verbinden"
         case .releaseInput: return "Eingabe nach Prüfung freigeben"
         }
@@ -131,8 +129,6 @@ struct InputRecoveryPresentation: Equatable, Sendable {
             return "Für die eigene Prüfung zuerst in Manual wechseln."
         case .waitForConnection:
             return "Verbindung oder Freigabe läuft. Die Eingabe bleibt angehalten."
-        case .reviewPreviousSession:
-            return "Die alte KVM-Sitzung konnte nicht sauber getrennt werden. Prüfe den alten Zielrechner direkt, bevor du sie lokal abschließt."
         case .reconnect:
             return "Erst neu verbinden und das Remote-Bild prüfen. Danach kannst du die Eingabe freigeben."
         case .releaseInput:
@@ -164,9 +160,12 @@ enum LocalConnectionAction: Equatable, Sendable {
     case connect(enabled: Bool)
     case cancel
     case disconnect
+    case switchDevice
 
-    init(isConnected: Bool, isConnecting: Bool, hasSelectedDevice: Bool) {
+    init(isConnected: Bool, isConnecting: Bool, hasSelectedDevice: Bool,
+         isSelectedDeviceConnected: Bool = true) {
         if isConnecting { self = .cancel }
+        else if isConnected && hasSelectedDevice && !isSelectedDeviceConnected { self = .switchDevice }
         else if isConnected { self = .disconnect }
         else { self = .connect(enabled: hasSelectedDevice) }
     }

@@ -1,10 +1,16 @@
 import AppKit
+import Darwin
 import Foundation
 
 @main
 struct InputManagerGLKVMTests {
     @MainActor static func main() async {
+        NSApplication.shared.setActivationPolicy(.prohibited)
         do {
+            try await testInputRecoveryPersistsAcrossManagers()
+            try await testInputRecoveryRestoresConservativeStoredFlags()
+            try await testRejectedInputRecoveryKeepsPersistedBlock()
+            try await testAuthorizedInputRecoveryClearsPersistedBlock()
             for revocation in PasteRevocation.allCases {
                 try await testPasteRechecksAuthorityAfterConfiguration(revocation)
             }
@@ -14,10 +20,195 @@ struct InputManagerGLKVMTests {
             try await testExplicitUnconfirmedSessionBlocksWithoutRecoveryTransport()
             try await testPendingHTTPPrintsRequireFreshManualReview(failPrint: false)
             try await testPendingHTTPPrintsRequireFreshManualReview(failPrint: true)
-            print("InputManagerGLKVMTests passed (11 HTTP cases)")
+            print("InputManagerGLKVMTests passed (11 HTTP cases, 4 persistence groups)")
         } catch {
             fputs("InputManagerGLKVMTests FAILED: \(error)\n", stderr)
             exit(1)
+        }
+    }
+
+    @MainActor private static func withRecoveryDefaults(
+        _ operation: @MainActor (UserDefaults) async throws -> Void
+    ) async throws {
+        let suiteName = "overlook.input-recovery-fixture.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            throw CaptureTestFailure(description: "Cannot create isolated recovery defaults")
+        }
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        try await operation(defaults)
+    }
+
+    @MainActor private static func testInputRecoveryPersistsAcrossManagers() async throws {
+        try await withRecoveryDefaults { defaults in
+            let first = InputManager(inputRecoveryDefaults: defaults)
+            try expect(!first.inputBlocked, "A fresh installation has no recovery block")
+            first.blockInputAfterUnconfirmedSession()
+            try expect(defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "Unknown input must persist before shutdown")
+            defaults.removeObject(forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+            first.blockInputAfterUnconfirmedSession()
+            try expect(defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "Every unknown outcome must persist even when already blocked")
+            await first.shutdown()
+            let restarted = InputManager(inputRecoveryDefaults: defaults)
+            try expect(restarted.inputBlocked, "A replacement manager must restore the previous unknown outcome")
+            try expect(restarted.activityStatus == "Input blocked: previous remote outcome is unknown",
+                       "Restart must expose the recovery block in activity status")
+            let readiness = await restarted.inputReadiness()
+            try expect(!readiness.text && !readiness.mouse, "Restart cannot restore normal input readiness")
+            try expect(!restarted.hasInputRecoveryTransport, "Restoring uncertainty cannot invent a release transport")
+            await restarted.shutdown()
+            let isolated = InputManager()
+            try expect(!isolated.inputBlocked, "Default fixture managers must remain independent of stored app state")
+            isolated.blockInputAfterUnconfirmedSession()
+            let nextIsolated = InputManager()
+            try expect(!nextIsolated.inputBlocked, "In-memory fixture blocks cannot leak into another manager")
+            await isolated.shutdown()
+            await nextIsolated.shutdown()
+        }
+    }
+
+    @MainActor private static func testInputRecoveryRestoresConservativeStoredFlags() async throws {
+        try await withRecoveryDefaults { defaults in
+            for value in [false, "false", 0] as [Any] {
+                defaults.removeObject(forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+                defaults.set(value, forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+                let manager = InputManager(inputRecoveryDefaults: defaults)
+                try expect(!manager.inputBlocked, "Stored false must preserve unblocked input: \(value)")
+                manager.blockInputAfterUnconfirmedSession()
+                let restarted = InputManager(inputRecoveryDefaults: defaults)
+                try expect(restarted.inputBlocked, "A fresh unknown outcome must persist across restart: \(value)")
+                await manager.shutdown()
+                await restarted.shutdown()
+            }
+            for value in [true, "true", 1] as [Any] {
+                defaults.removeObject(forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+                defaults.set(value, forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+                let manager = InputManager(inputRecoveryDefaults: defaults)
+                try expect(manager.inputBlocked, "A truthy stored flag must conservatively restore the block: \(value)")
+                manager.blockInputAfterUnconfirmedSession()
+                let restarted = InputManager(inputRecoveryDefaults: defaults)
+                try expect(restarted.inputBlocked, "Relatching a truthy flag must stay blocked after restart: \(value)")
+                await manager.shutdown()
+                await restarted.shutdown()
+            }
+        }
+    }
+
+    @MainActor private static func testRejectedInputRecoveryKeepsPersistedBlock() async throws {
+        try await withRecoveryDefaults { defaults in
+            let manager = InputManager(inputRecoveryDefaults: defaults)
+            manager.blockInputAfterUnconfirmedSession()
+            do {
+                try await manager.recoverInputAfterManualReview(authorization: { false })
+                throw CaptureTestFailure(description: "Unauthorized recovery must reject")
+            } catch let error as RemoteActionError { try expect(error == .unauthorized, "Recovery requires current Manual authority") }
+            do {
+                try await manager.recoverInputAfterManualReview(authorization: { true })
+                throw CaptureTestFailure(description: "Recovery without a transport must reject")
+            } catch let error as RemoteActionError { try expect(error == .inputUnavailable, "Absent release transport must remain unavailable") }
+            let cancelled = Task { @MainActor in
+                withUnsafeCurrentTask { $0?.cancel() }
+                try await manager.recoverInputAfterManualReview(authorization: { true })
+            }
+            do {
+                try await cancelled.value
+                throw CaptureTestFailure(description: "Cancelled recovery must reject")
+            } catch is CancellationError {}
+            try expect(manager.inputBlocked && defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "Failed, unauthorized and cancelled recovery must retain persistent uncertainty")
+            await manager.shutdown()
+            let restarted = InputManager(inputRecoveryDefaults: defaults)
+            try expect(restarted.inputBlocked, "Rejected review must remain blocked after restart")
+            await restarted.shutdown()
+        }
+    }
+
+    @MainActor private static func testAuthorizedInputRecoveryClearsPersistedBlock() async throws {
+        try await withRecoveryHIDFixture { fixture in
+            try await testInputRecoveryOnCurrentTransport(fixture)
+        }
+    }
+
+    @MainActor private static func withRecoveryHIDFixture(
+        _ operation: @MainActor (RecoveryHIDFixture) async throws -> Void
+    ) async throws {
+        let fixture = try await RecoveryHIDFixture.start()
+        do { try await operation(fixture) }
+        catch {
+            await fixture.finish()
+            throw error
+        }
+        await fixture.finish()
+    }
+
+    @MainActor private static func testInputRecoveryOnCurrentTransport(_ fixture: RecoveryHIDFixture) async throws {
+        try await withRecoveryDefaults { defaults in
+            defaults.set(true, forKey: InputManager.inputRecoveryBlockedDefaultsKey)
+            let manager = InputManager(inputRecoveryDefaults: defaults)
+            let client = try GLKVMClient(host: "127.0.0.1", port: fixture.port, allowInsecureTLS: true,
+                                         sessionConfiguration: .ephemeral)
+            manager.setGLKVMClient(client)
+            manager.setSessionAvailable(true)
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while !manager.hasInputRecoveryTransport {
+                try expect(ProcessInfo.processInfo.systemUptime < deadline, "Local recovery HID transport did not become ready")
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            try expect(manager.inputBlocked, "Connecting a fresh transport cannot acknowledge a restored block")
+            var checks = 0
+            do {
+                try await manager.recoverInputAfterManualReview(authorization: {
+                    checks += 1
+                    if checks == 4 { manager.blockInputAfterUnconfirmedSession() }
+                    return true
+                })
+                throw CaptureTestFailure(description: "A newer unknown outcome after release must reject recovery")
+            } catch let error as RemoteActionError { try expect(error == .sessionChanged, "A new block needs another review") }
+            try expect(defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "A transmitted release cannot erase a newer unreviewed block")
+            var revocationChecks = 0
+            do {
+                try await manager.recoverInputAfterManualReview(authorization: {
+                    revocationChecks += 1
+                    return revocationChecks < 4
+                })
+                throw CaptureTestFailure(description: "Revoked authority after release must reject recovery")
+            } catch let error as RemoteActionError { try expect(error == .sessionChanged, "Final release must retain current authority") }
+            try expect(defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "A transmitted release cannot erase the block after authority is revoked")
+            var cancellationChecks = 0
+            let cancelled = Task { @MainActor in
+                try await manager.recoverInputAfterManualReview(authorization: {
+                    cancellationChecks += 1
+                    if cancellationChecks == 4 { withUnsafeCurrentTask { $0?.cancel() } }
+                    return true
+                })
+            }
+            do {
+                try await cancelled.value
+                throw CaptureTestFailure(description: "Cancellation after release must reject recovery")
+            } catch is CancellationError {}
+            try expect(defaults.bool(forKey: InputManager.inputRecoveryBlockedDefaultsKey),
+                       "Cancellation after an actual release must retain the stored block")
+            try await manager.recoverInputAfterManualReview(authorization: { true })
+            try expect(!manager.inputBlocked, "Successful authorized release must clear the live block")
+            try expect(defaults.object(forKey: InputManager.inputRecoveryBlockedDefaultsKey) == nil,
+                       "Successful authorized release must remove the stored recovery block")
+            let releases = ["0100", "02006c656674", "02007269676874", "02006d6964646c65"]
+            let releaseDeadline = ProcessInfo.processInfo.systemUptime + 3
+            var packets = try await fixture.releasePackets()
+            while packets.count < 16 {
+                try expect(ProcessInfo.processInfo.systemUptime < releaseDeadline, "Fixture did not receive actual HID releases")
+                try await Task.sleep(nanoseconds: 10_000_000)
+                packets = try await fixture.releasePackets()
+            }
+            try expect(Array(packets.prefix(16)) == releases + releases + releases + releases,
+                       "Each recovery must transmit keyboard and all three mouse-button releases")
+            await manager.shutdown()
+            let restarted = InputManager(inputRecoveryDefaults: defaults)
+            try expect(!restarted.inputBlocked, "An acknowledged block must stay cleared after restart")
+            await restarted.shutdown()
         }
     }
 
@@ -230,6 +421,95 @@ struct InputManagerGLKVMTests {
             result.resolve(false)
         }
         return await result.wait()
+    }
+}
+
+private final class RecoveryFixtureTLS: NSObject, URLSessionDelegate {
+    func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        guard challenge.protectionSpace.host == "127.0.0.1",
+              challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+              let trust = challenge.protectionSpace.serverTrust else {
+            completionHandler(.performDefaultHandling, nil)
+            return
+        }
+        completionHandler(.useCredential, URLCredential(trust: trust))
+    }
+}
+
+private struct RecoveryHIDFixture {
+    let port: Int
+    let process: Process
+    let directory: URL
+    let session: URLSession
+
+    static func start() async throws -> RecoveryHIDFixture {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("overlook-recovery-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let portFile = directory.appendingPathComponent("port")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        let sourceDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        process.arguments = ["node", sourceDirectory.appendingPathComponent("hid-capture-fixture.mjs").path, portFile.path]
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 2
+        configuration.timeoutIntervalForResource = 3
+        let session = URLSession(configuration: configuration, delegate: RecoveryFixtureTLS(), delegateQueue: nil)
+        do {
+            try process.run()
+            let deadline = ProcessInfo.processInfo.systemUptime + 5
+            var publishedPort: Int?
+            while publishedPort == nil {
+                if let portText = try? String(contentsOf: portFile, encoding: .utf8),
+                   let port = Int(portText), (1...65535).contains(port), port != 17891 {
+                    publishedPort = port
+                    break
+                }
+                try expect(process.isRunning && ProcessInfo.processInfo.systemUptime < deadline,
+                           "Local HID fixture failed to publish its port")
+                try await Task.sleep(nanoseconds: 10_000_000)
+            }
+            guard let port = publishedPort else {
+                throw CaptureTestFailure(description: "Invalid local HID fixture port")
+            }
+            let (data, response) = try await session.data(from: URL(string: "https://127.0.0.1:\(port)/fixture/health")!)
+            let identity = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            try expect((response as? HTTPURLResponse)?.statusCode == 200
+                       && identity?["fixture"] as? String == "overlook-hid-capture-fixture"
+                       && identity?["loopback"] as? Bool == true,
+                       "Recovery test may connect only to the verified local recording fixture")
+            return RecoveryHIDFixture(port: port, process: process, directory: directory, session: session)
+        } catch {
+            session.invalidateAndCancel()
+            await stop(process)
+            try? FileManager.default.removeItem(at: directory)
+            throw error
+        }
+    }
+
+    func releasePackets() async throws -> [String] {
+        struct Packet: Decodable { let raw: String }
+        let (data, response) = try await session.data(from: URL(string: "https://127.0.0.1:\(port)/fixture/events")!)
+        try expect((response as? HTTPURLResponse)?.statusCode == 200, "Cannot read recorded local HID releases")
+        return try JSONDecoder().decode([Packet].self, from: data).map(\.raw)
+    }
+
+    private static func stop(_ process: Process) async {
+        guard process.isRunning else { return }
+        await Task.detached {
+            process.terminate()
+            let deadline = ProcessInfo.processInfo.systemUptime + 3
+            while process.isRunning && ProcessInfo.processInfo.systemUptime < deadline {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+            if process.isRunning { Darwin.kill(process.processIdentifier, SIGKILL) }
+        }.value
+    }
+
+    func finish() async {
+        session.invalidateAndCancel()
+        await Self.stop(process)
+        try? FileManager.default.removeItem(at: directory)
     }
 }
 

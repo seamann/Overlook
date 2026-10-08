@@ -3,7 +3,7 @@ import Combine
 import Darwin
 import SwiftUI
 
-/// Renders the production recovery UI with local, inert session dependencies.
+/// Renders production connection controls with local, inert session dependencies.
 /// Applies a network-denied sandbox before creating application objects.
 @main
 @MainActor
@@ -81,7 +81,7 @@ private final class RecoveryFixtureDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         Task { @MainActor in
             do {
-                try await fixture.seedFailedDisconnect()
+                try await fixture.seedDisconnectedOldSession()
                 showWindow()
             } catch {
                 fixture.record("fixture_setup_failed")
@@ -92,7 +92,7 @@ private final class RecoveryFixtureDelegate: NSObject, NSApplicationDelegate {
 
     private func showWindow() {
         let content = RecoveryFixtureView(fixture: fixture, input: fixture.input,
-                                          coordinator: fixture.coordinator)
+                                          devices: fixture.devices)
             .environmentObject(fixture.video)
             .environmentObject(fixture.input)
             .environmentObject(fixture.ocr)
@@ -103,7 +103,7 @@ private final class RecoveryFixtureDelegate: NSObject, NSApplicationDelegate {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 740),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = "Overlook Recovery Fixture"
+        window.title = "Overlook Switch Fixture"
         window.contentView = NSHostingView(rootView: content)
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -118,7 +118,7 @@ private final class RecoveryFixtureDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private final class RecoveryFixtureModel: ObservableObject {
     let video = WebRTCManager()
-    let input = InputManager(clipboardText: { nil })
+    let input = InputManager(clipboardText: { nil }, inputRecoveryDefaults: nil)
     let ocr = OCRManager()
     let devices = KVMDeviceManager(
         startsServices: false, persistsConnections: false,
@@ -128,7 +128,16 @@ private final class RecoveryFixtureModel: ObservableObject {
     let mode = ControlModeStore(defaults: nil)
     let requests = LocalUIRequests()
     private let runID = UUID().uuidString
-    @Published private(set) var simulatedHIDTransitions = 0
+    let oldDevice = KVMDevice(id: "fixture-old-session", name: "Old Fixture KVM",
+                              host: "old-kvm.invalid", port: 443, type: .glinetComet,
+                              authToken: "", capabilities: [.videoStreaming, .keyboardInput])
+    let newDevice = KVMDevice(id: "fixture-new-session", name: "New Fixture KVM",
+                              host: "new-kvm.invalid", port: 443, type: .glinetComet,
+                              authToken: "", capabilities: [.videoStreaming, .keyboardInput])
+    @Published private(set) var inputInstallCount = 0
+    @Published private(set) var hidEnableCalls = 0
+    @Published private(set) var hidDisableCalls = 0
+    private var committedEndpoints: [String] = []
     private var seeded = false
     private var observers = Set<AnyCancellable>()
     private weak var window: NSWindow?
@@ -144,12 +153,16 @@ private final class RecoveryFixtureModel: ObservableObject {
     }
 
     lazy var coordinator = SessionConnectionCoordinator(dependencies: .init(
-        prepare: { device, _ in
-            PreparedKVMConnection(device: device,
-                                  client: try GLKVMClient(host: device.host, port: device.port))
+        prepare: { [unowned self] device, _ in
+            guard device == oldDevice || device == newDevice else {
+                throw FixtureError.unsupportedDevice
+            }
+            return PreparedKVMConnection(device: device,
+                                         client: try GLKVMClient(host: device.host, port: device.port))
         },
         commit: { [unowned self] prepared in
             devices.connectedDevice = prepared.device
+            committedEndpoints = committedEndpoints + [prepared.device.connectionString]
             return prepared.device
         },
         invalidateSession: { [unowned self] in
@@ -157,30 +170,37 @@ private final class RecoveryFixtureModel: ObservableObject {
             input.setSessionAvailable(false)
         },
         drainSession: {},
-        blockInputForRecovery: { [unowned self] in input.blockInputAfterUnconfirmedSession() },
-        installInput: { [unowned self] _ in input.setSessionAvailable(true) },
+        installInput: { [unowned self] _ in
+            inputInstallCount += 1
+            input.setSessionAvailable(true)
+        },
         setHIDConnected: { [unowned self] _, connected in
-            simulatedHIDTransitions += 1
-            if !connected { throw FixtureError.unconfirmedDisconnect }
+            if connected {
+                hidEnableCalls += 1
+            } else {
+                hidDisableCalls += 1
+                throw FixtureError.globalHIDDisconnect
+            }
         },
         connectVideo: { _ in },
         setConnectionTransitioning: { [unowned self] in input.setConnectionTransitioning($0) },
         reportTransportError: { _, _ in }
     ))
 
-    func seedFailedDisconnect() async throws {
+    func seedDisconnectedOldSession() async throws {
         input.setup(with: video)
         mode.configureInputCapture { [weak input] in input?.setLocalInputCaptureAllowed($0) }
-        let device = KVMDevice(id: "fixture-old-session", name: "Fixture KVM",
-                               host: "old-kvm.invalid", port: 443, type: .glinetComet,
-                               authToken: "", capabilities: [.videoStreaming, .keyboardInput])
-        _ = try await coordinator.startConnection(to: device).task.value
+        devices.availableDevices = [oldDevice, newDevice]
+        input.blockInputAfterUnconfirmedSession()
+        _ = try await coordinator.startConnection(to: oldDevice).task.value
         await coordinator.disconnect().value
-        precondition(input.inputBlocked && coordinator.pendingCleanupReview != nil)
-        precondition(simulatedHIDTransitions == 2 && devices.connectedDevice == nil)
+        precondition(input.inputBlocked && devices.connectedDevice == nil)
+        precondition(inputInstallCount == 1 && hidEnableCalls == 1 && hidDisableCalls == 0)
         seeded = true
         observe(input.objectWillChange)
         observe(coordinator.objectWillChange)
+        observe(devices.objectWillChange)
+        observe(objectWillChange)
         record("ready")
     }
 
@@ -192,16 +212,19 @@ private final class RecoveryFixtureModel: ObservableObject {
 
     func record(_ event: String) {
         guard seeded || event == "fixture_setup_failed" else { return }
-        // Confirmation may remove local ownership, but may never release input
-        // or generate a third simulated HID transition in this isolated journey.
-        if seeded { precondition(input.inputBlocked && simulatedHIDTransitions == 2) }
+        // A replacement session may install new input, but it must retain the
+        // recovery latch and must never disable device-wide USB HID.
+        if seeded { precondition(input.inputBlocked && hidDisableCalls == 0) }
         let state: [String: Any] = [
             "runID": runID,
             "event": event,
             "inputBlocked": input.inputBlocked,
-            "reviewPending": coordinator.pendingCleanupReview != nil,
             "connected": devices.connectedDevice != nil,
-            "simulatedHIDTransitions": simulatedHIDTransitions,
+            "connectedEndpoint": devices.connectedDevice?.connectionString ?? "",
+            "committedEndpoints": committedEndpoints,
+            "inputInstallCount": inputInstallCount,
+            "hidEnableCalls": hidEnableCalls,
+            "hidDisableCalls": hidDisableCalls,
             "windowContentWidth": window?.contentLayoutRect.width ?? 0,
             "networkAccess": "denied_in_process"
         ]
@@ -223,20 +246,26 @@ private final class RecoveryFixtureModel: ObservableObject {
         }
     }
 
-    private enum FixtureError: Error { case unconfirmedDisconnect }
+    private enum FixtureError: Error {
+        case unsupportedDevice
+        case globalHIDDisconnect
+    }
 }
 
 private struct RecoveryFixtureView: View {
     @ObservedObject var fixture: RecoveryFixtureModel
     @ObservedObject var input: InputManager
-    @ObservedObject var coordinator: SessionConnectionCoordinator
+    @ObservedObject var devices: KVMDeviceManager
 
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 6) {
-                Text("Test-App · Eingabe: \(input.inputBlocked ? "gesperrt" : "frei") · Alt-Sitzung: \(coordinator.pendingCleanupReview == nil ? "abgeschlossen" : "Prüfung offen") · simulierte HID-Aufrufe: \(fixture.simulatedHIDTransitions) · Netzwerk gesperrt")
+                Text("Test-App · Eingabe: \(input.inputBlocked ? "gesperrt" : "frei") · Installationen: \(fixture.inputInstallCount) · HID an: \(fixture.hidEnableCalls) · HID aus: \(fixture.hidDisableCalls) · Netzwerk gesperrt")
                     .font(.caption)
                     .accessibilityIdentifier("recovery-fixture-state")
+                Text("Ziel: \(devices.connectedDevice?.connectionString ?? "getrennt")")
+                    .font(.caption)
+                    .accessibilityIdentifier("switch-fixture-endpoint")
                 HStack {
                     Text("Fensterbreite:").font(.caption)
                     ForEach([1100, 720, 480], id: \.self) { width in

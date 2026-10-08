@@ -32,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var menuBarAgent: MenuBarAgent?
 
     let webRTCManager = WebRTCManager()
-    let inputManager = InputManager()
+    let inputManager = InputManager(inputRecoveryDefaults: .standard)
     let ocrManager = OCRManager()
     let kvmDeviceManager = KVMDeviceManager()
     let controlModeStore = ControlModeStore()
@@ -52,9 +52,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         drainSession: { [unowned self] in
             await localControlServer.waitForMutationsToDrain()
             await inputManager.disconnectInputForSession()
-        },
-        blockInputForRecovery: { [unowned self] in
-            inputManager.blockInputAfterUnconfirmedSession()
         },
         installInput: { [unowned self] client in
             inputManager.setGLKVMClient(client)

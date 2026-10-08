@@ -34,13 +34,6 @@ struct ContentView: View {
     @State private var isChangingControlMode = false
     @State private var isRecoveringInput = false
     @State private var inputRecoveryErrorMessage: String?
-    @State private var cleanupReviewConfirmation: CleanupReviewConfirmation?
-
-    private struct CleanupReviewConfirmation {
-        let review: SessionConnectionCoordinator.PendingCleanupReview
-        let modeSnapshot: ControlModeSnapshot
-    }
-
     @State private var showingConnections = false
     @State private var didAutoOpenConnections = false
 
@@ -59,6 +52,18 @@ struct ContentView: View {
 
     private var isConnected: Bool { kvmDeviceManager.connectedDevice != nil }
     private var isEstablishingConnection: Bool { sessionCoordinator.isConnecting }
+
+    private var connectionAction: LocalConnectionAction {
+        let selectedIsConnected = selectedDevice.map { selected in
+            kvmDeviceManager.connectedDevice.map { connected in
+                selected.host.lowercased() == connected.host.lowercased() && selected.port == connected.port
+            } ?? false
+        } ?? false
+        return LocalConnectionAction(
+            isConnected: isConnected, isConnecting: isEstablishingConnection,
+            hasSelectedDevice: selectedDevice != nil, isSelectedDeviceConnected: selectedIsConnected
+        )
+    }
 
     private var controlMode: OverlookControlMode {
         controlModeStore.mode
@@ -79,7 +84,6 @@ struct ContentView: View {
             isSessionConnecting: isEstablishingConnection,
             isPanelPresented: showingSettings || showingConnections || showingManualConnect
                 || showingPasswordPrompt || isShowingOCRResult || connectionErrorMessage != nil
-                || cleanupReviewConfirmation != nil
         )
     }
 
@@ -90,7 +94,6 @@ struct ContentView: View {
             hasLiveVideo: webRTCManager.isConnected && webRTCManager.videoSize != nil
                 && !webRTCManager.isStreamStalled,
             hasRecoveryTransport: inputManager.hasInputRecoveryTransport,
-            hasPendingCleanupReview: sessionCoordinator.pendingCleanupReview != nil,
             isLocalCaptureAllowed: inputManager.isLocalInputCaptureAllowed
         )
     }
@@ -237,21 +240,6 @@ struct ContentView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .padding()
         .frame(maxWidth: .infinity, alignment: .center)
-        .alert(
-            "Alte KVM-Sitzung lokal abschließen?",
-            isPresented: Binding(
-                get: { cleanupReviewConfirmation != nil },
-                set: { if !$0 { cleanupReviewConfirmation = nil } }
-            ),
-            presenting: cleanupReviewConfirmation
-        ) { confirmation in
-            Button("Geprüft, Sitzung abschließen") {
-                finishReviewedPreviousSession(confirmation)
-            }
-            Button("Abbrechen", role: .cancel) {}
-        } message: { confirmation in
-            Text("Prüfe den alten Zielrechner \(confirmation.review.endpoint) direkt. Läuft dort keine unerwartete Eingabe mehr, kannst du die alte Sitzung lokal abschließen. Die Eingabe bleibt bis zur Prüfung und Freigabe der neuen Verbindung gesperrt. Der alte HID-Disconnect bleibt unbestätigt.")
-        }
     }
 
     private func performInputRecoveryAction() {
@@ -260,11 +248,6 @@ struct ContentView: View {
         case .reconnect:
             showingSettings = false
             showingConnections = true
-        case .reviewPreviousSession:
-            guard let review = sessionCoordinator.pendingCleanupReview else { return }
-            cleanupReviewConfirmation = CleanupReviewConfirmation(
-                review: review, modeSnapshot: controlModeStore.snapshot
-            )
         case .releaseInput:
             releaseReviewedInput()
         case .switchToManual, .waitForConnection:
@@ -289,24 +272,6 @@ struct ContentView: View {
         }
     }
 
-    private func finishReviewedPreviousSession(_ confirmation: CleanupReviewConfirmation) {
-        isRecoveringInput = true
-        Task { @MainActor in
-            defer { isRecoveringInput = false }
-            do {
-                try await sessionCoordinator.acknowledgeUnconfirmedCleanup(reviewID: confirmation.review.id) {
-                    controlModeStore.snapshot == confirmation.modeSnapshot
-                        && confirmation.modeSnapshot.mode == .manual
-                }
-                inputRecoveryErrorMessage = nil
-                showingSettings = false
-                showingConnections = true
-            } catch {
-                inputRecoveryErrorMessage = recoveryMessage(for: error)
-            }
-        }
-    }
-
     private func recoveryMessage(for error: Error) -> String {
         if error is CancellationError { return InputRecoveryFailure.cancelled.message }
         if let error = error as? RemoteActionError {
@@ -316,9 +281,6 @@ struct ContentView: View {
             case .unauthorized: return InputRecoveryFailure.unauthorized.message
             default: return InputRecoveryFailure.releaseFailed.message
             }
-        }
-        if let error = error as? SessionConnectionError, case .manualReviewExpired = error {
-            return InputRecoveryFailure.sessionChanged.message
         }
         return InputRecoveryFailure.releaseFailed.message
     }
@@ -473,6 +435,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 ConnectionsPopoverView(
                     selectedDevice: $selectedDevice,
+                    connectionAction: connectionAction,
                     isConnected: isConnected,
                     isConnecting: isEstablishingConnection,
                     isScanning: kvmDeviceManager.isScanning,
@@ -535,7 +498,7 @@ struct ContentView: View {
     private var windowContent: some View {
         videoContent
         .safeAreaInset(edge: .top, spacing: 0) {
-            if inputManager.inputBlocked || sessionCoordinator.pendingCleanupReview != nil {
+            if inputManager.inputBlocked {
                 inputRecoveryBanner
             }
         }
@@ -581,7 +544,6 @@ struct ContentView: View {
         .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
-        .onChange(of: cleanupReviewConfirmation != nil) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: inputManager.inputBlocked) { _, blocked in
             if !blocked { inputRecoveryErrorMessage = nil }
         }
@@ -842,11 +804,12 @@ struct ContentView: View {
     }
 
     private func toggleConnection() {
-        if isConnected || isEstablishingConnection {
+        switch connectionAction {
+        case .cancel, .disconnect:
             sessionCoordinator.disconnect()
             showingConnections = true
-        } else if let device = selectedDevice {
-            connectToDevice(device)
+        case .switchDevice, .connect:
+            if let device = selectedDevice { connectToDevice(device) }
         }
     }
 
@@ -1037,7 +1000,7 @@ struct ContentView: View {
         inputManager.setLocalUIBlocked(
             showingSettings || showingConnections || showingManualConnect
                 || showingPasswordPrompt || isShowingOCRResult || isOCRModeEnabled
-                || connectionErrorMessage != nil || cleanupReviewConfirmation != nil,
+                || connectionErrorMessage != nil,
             owner: inputCaptureOwner
         )
     }
@@ -1311,6 +1274,7 @@ private struct WindowTitleSetter: NSViewRepresentable {
 
 struct ConnectionsPopoverView: View {
     @Binding var selectedDevice: KVMDevice?
+    let connectionAction: LocalConnectionAction
 
     let isConnected: Bool
     let isConnecting: Bool
@@ -1341,9 +1305,6 @@ struct ConnectionsPopoverView: View {
     let onForgetSelectedDevice: () -> Void
 
     var body: some View {
-        let connectionAction = LocalConnectionAction(
-            isConnected: isConnected, isConnecting: isConnecting, hasSelectedDevice: selectedDevice != nil
-        )
         let resolutionText: String = {
             guard let videoSize, videoSize.width > 0, videoSize.height > 0 else { return "—" }
             return "\(Int(videoSize.width))x\(Int(videoSize.height))"
@@ -1383,7 +1344,7 @@ struct ConnectionsPopoverView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .disabled(isConnected || isConnecting)
+            .disabled(isConnecting)
 
             if connectionAction == .cancel {
                 HStack(spacing: 8) {
@@ -1404,7 +1365,7 @@ struct ConnectionsPopoverView: View {
             } else {
                 Button(action: onToggleConnection) {
                     HStack(spacing: 8) {
-                        Text("Connect")
+                        Text(connectionAction == .switchDevice ? "Switch Device" : "Connect")
                     }
                     .frame(maxWidth: .infinity)
                 }
@@ -1419,7 +1380,7 @@ struct ConnectionsPopoverView: View {
                     .disabled(isScanning || isConnecting)
 
                 Button("Manual Connect…") { onManualConnect() }
-                    .disabled(isConnected || isConnecting)
+                    .disabled(isConnecting)
 
                 Button("Forget") { onForgetSelectedDevice() }
                     .disabled(isConnected || isConnecting || selectedDevice?.id.hasPrefix("saved-") != true)

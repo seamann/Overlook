@@ -4,31 +4,50 @@ import Foundation
 struct SessionConnectionCoordinatorTests {
     @MainActor
     static func main() async throws {
+        try await testSwitchDoesNotContactUnreachableOldEndpoint()
         try await testLatestAuthenticationWins()
         try await testSupersededAuthenticationCannotCommitWhileLatestWaits()
         try await testDisconnectDuringPreparation()
         try await testManualTokenLookupBelongsToAttempt()
-        try await testHIDEnableAndDisableSettleBeforeReplacement()
+        try await testHIDEnableSettlesBeforeSessionDrainAndReplacement()
         try await testMutationDrainPrecedesReplacement()
         try await testStaleVideoCompletionCannotChangeReplacement()
         try await testCancellationAndAuthenticationFailureRemainDistinct()
         try await testCurrentTransportFailureKeepsAPIConnection()
-        try await testFailedTeardownBlocksReplacementUntilRetry()
-        try await testCurrentCancellationCleansCommittedSession()
+        try await testCurrentCancellationDrainsCommittedSession()
         try await testCancelledTaskCannotStartPreparation()
-        try await testHIDEnableFailureStaysOwnedUntilDisconnect()
-        try await testCancelledSessionReportsFailedCleanup()
-        try await testFailedCleanupLatchesInputAndPublishesReview()
-        try await testAcknowledgementOnlyDiscardsLocalCleanup()
-        try await testReviewRejectsInvalidAuthorizationAndID()
-        try await testAcknowledgementWaitsForCleanupAndRechecksReview()
-        try await testCancelledAcknowledgementRetainsCleanup()
-        try await testAcknowledgementRechecksAttemptAndManualAuthorization()
-        try await testSuspendedAcknowledgementRejectsNewAttempt()
-        try await testAcknowledgedOldEndpointCannotAffectNewEndpoint()
-        try await testCleanupReviewNeverContainsCredentials()
-        testCleanupErrorOffersRecoveryActions()
-        print("SessionConnectionCoordinatorTests passed (24 behavioral groups)")
+        try await testHIDEnableFailureDoesNotBlockLocalDisconnect()
+        try await testDisconnectDoesNotContactUnreachableEndpoint()
+        try await testRepeatedDisconnectsStayLocal()
+        try await testLatestReplacementWinsWhileOldEnableSettles()
+        try await testStaleEnableFailureCannotReportOrStartVideo()
+        try await testCurrentCancellationWaitsForAlreadySentEnable()
+        try await testDisconnectWaitsForAlreadySentEnable()
+        try await testReplacementWaitsForPendingDisconnectDrain()
+        try await testAuthenticationFailureCannotRestoreOldSession()
+        try await testInitialDrainPrecedesFirstCommit()
+        try await testVideoTransportCancellationDrainsSession()
+        try await testInputDrainRecoveryLatchSurvivesReplacement()
+        try await testCancelledAttemptCannotCommitAfterDrain()
+        print("SessionConnectionCoordinatorTests passed (25 behavioral groups)")
+    }
+
+    @MainActor
+    private static func testSwitchDoesNotContactUnreachableOldEndpoint() async throws {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(
+            to: fixture.device("old", host: "old-kvm.invalid")
+        ).task.value
+        fixture.unreachableHosts.insert("old-kvm.invalid")
+        let replacement = fixture.coordinator.startConnection(
+            to: fixture.device("new", host: "new-kvm.invalid")
+        )
+        precondition(fixture.installedName == nil, "Switch must invalidate the old local session synchronously")
+        _ = try await replacement.task.value
+        fixture.expectNoGlobalDisconnect()
+        fixture.expectOrder("drained:2", "commit:new", "enable:new")
+        precondition(fixture.installedName == "new")
+        precondition(fixture.reportedErrors.isEmpty, "An unreachable old endpoint must not create a cleanup error")
     }
 
     @MainActor
@@ -84,6 +103,9 @@ struct SessionConnectionCoordinatorTests {
         await expectCancellation(attempt.task)
         precondition(fixture.committedNames.isEmpty)
         precondition(!fixture.events.contains("enable:A"))
+        precondition(fixture.events.filter { $0 == "transition:false" }.count == 1,
+                     "Stale preparation must not publish another transition completion")
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
@@ -105,33 +127,28 @@ struct SessionConnectionCoordinatorTests {
     }
 
     @MainActor
-    private static func testHIDEnableAndDisableSettleBeforeReplacement() async throws {
+    private static func testHIDEnableSettlesBeforeSessionDrainAndReplacement() async throws {
         let fixture = SessionFixture()
         let enableA = SessionGate()
-        let disableA = SessionGate()
         fixture.enableGates["A"] = enableA
-        fixture.disableGates["A"] = disableA
         let a = fixture.coordinator.startConnection(to: fixture.device("A", host: "same.invalid"))
         await fixture.waitFor("enable:A")
         let b = fixture.coordinator.startConnection(to: fixture.device("B", host: "same.invalid"))
         await fixture.waitFor("prepared:B")
+        precondition(!fixture.events.contains("drain:2"), "Old enable must settle before the input transport closes")
         precondition(!fixture.events.contains("enable:B"))
         enableA.release()
-        await fixture.waitFor("disable:A")
-        precondition(!fixture.events.contains("enable:B"))
-        disableA.release()
         _ = try await b.task.value
         await expectCancellation(a.task)
-        fixture.expectOrder("enabled:A", "disable:A", "disabled:A", "commit:B", "enable:B")
-        precondition(!fixture.events.contains("disable:B"))
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2", "commit:B", "enable:B")
+        fixture.expectNoGlobalDisconnect()
         precondition(fixture.installedName == "B")
     }
 
     @MainActor
     private static func testMutationDrainPrecedesReplacement() async throws {
         let fixture = SessionFixture()
-        let a = fixture.coordinator.startConnection(to: fixture.device("A"))
-        _ = try await a.task.value
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
         let drain = SessionGate()
         fixture.nextDrainGate = drain
         let b = fixture.coordinator.startConnection(to: fixture.device("B"))
@@ -140,7 +157,8 @@ struct SessionConnectionCoordinatorTests {
         precondition(!fixture.events.contains("commit:B"))
         drain.release()
         _ = try await b.task.value
-        fixture.expectOrder("drained:2", "disable:A", "commit:B", "enable:B")
+        fixture.expectOrder("drained:2", "commit:B", "enable:B")
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
@@ -148,7 +166,7 @@ struct SessionConnectionCoordinatorTests {
         let fixture = SessionFixture()
         let videoA = SessionGate()
         fixture.videoGates["A"] = videoA
-        fixture.videoFailures.insert("A")
+        fixture.videoErrors["A"] = SessionFixtureError.video
         let a = fixture.coordinator.startConnection(to: fixture.device("A"))
         await fixture.waitFor("video:A")
         let b = fixture.coordinator.startConnection(to: fixture.device("B"))
@@ -169,6 +187,7 @@ struct SessionConnectionCoordinatorTests {
         let attempt = cancelled.coordinator.startConnection(to: cancelled.device("cancel"))
         await expectCancellation(attempt.task)
         precondition(!cancelled.coordinator.isConnecting)
+        precondition(cancelled.installedName == nil)
 
         let failed = SessionFixture()
         failed.preparationErrors["auth"] = SessionFixtureError.authentication
@@ -183,7 +202,7 @@ struct SessionConnectionCoordinatorTests {
     @MainActor
     private static func testCurrentTransportFailureKeepsAPIConnection() async throws {
         let fixture = SessionFixture()
-        fixture.videoFailures.insert("A")
+        fixture.videoErrors["A"] = SessionFixtureError.video
         let result = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
         precondition(result.name == "A")
         precondition(fixture.installedName == "A")
@@ -191,28 +210,12 @@ struct SessionConnectionCoordinatorTests {
         let disconnect = fixture.coordinator.disconnect()
         precondition(fixture.installedName == nil)
         await disconnect.value
-        fixture.expectOrder("enabled:A", "disable:A", "disabled:A")
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2")
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
-    private static func testFailedTeardownBlocksReplacementUntilRetry() async throws {
-        let fixture = SessionFixture()
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
-        fixture.disableFailures.insert("A")
-        do {
-            _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
-            preconditionFailure("Unconfirmed teardown allowed replacement")
-        } catch SessionConnectionError.previousSessionCleanupFailed { }
-        precondition(fixture.committedNames == ["A"])
-        precondition(!fixture.events.contains("enable:B"))
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
-        precondition(fixture.committedNames == ["A", "C"])
-        fixture.expectOrder("disabled:A", "commit:C", "enable:C")
-    }
-
-    @MainActor
-    private static func testCurrentCancellationCleansCommittedSession() async throws {
+    private static func testCurrentCancellationDrainsCommittedSession() async throws {
         let fixture = SessionFixture()
         let video = SessionGate()
         fixture.videoGates["A"] = video
@@ -222,7 +225,8 @@ struct SessionConnectionCoordinatorTests {
         video.release()
         await expectCancellation(attempt.task)
         precondition(fixture.installedName == nil, "Cancelled video startup must not leave a committed session")
-        fixture.expectOrder("enabled:A", "disable:A", "disabled:A")
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2")
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
@@ -233,257 +237,230 @@ struct SessionConnectionCoordinatorTests {
         await expectCancellation(attempt.task)
         precondition(!fixture.events.contains("prepare:A"))
         precondition(fixture.committedNames.isEmpty)
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
-    private static func testHIDEnableFailureStaysOwnedUntilDisconnect() async throws {
+    private static func testHIDEnableFailureDoesNotBlockLocalDisconnect() async throws {
         let fixture = SessionFixture()
         fixture.enableFailures.insert("A")
         _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
         precondition(fixture.reportedErrors == ["HID connect"])
         await fixture.coordinator.disconnect().value
-        precondition(fixture.events.contains("disabled:A"))
-    }
-
-    @MainActor
-    private static func testCancelledSessionReportsFailedCleanup() async throws {
-        let fixture = SessionFixture()
-        let video = SessionGate()
-        fixture.videoGates["A"] = video
-        fixture.disableFailures.insert("A")
-        let attempt = fixture.coordinator.startConnection(to: fixture.device("A"))
-        await fixture.waitFor("video:A")
-        attempt.task.cancel()
-        video.release()
-        await expectCancellation(attempt.task)
         precondition(fixture.installedName == nil)
-        precondition(fixture.reportedErrors == ["HID disconnect"], "Failed cancellation cleanup must be reported")
-        fixture.disableFailures.remove("A")
+        precondition(!fixture.inputBlocked, "A failed USB enable must not create an unrelated input recovery latch")
         _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
-        fixture.expectOrder("disabled:A", "commit:B", "enable:B")
+        precondition(fixture.installedName == "B")
+        fixture.expectOrder("drained:2", "commit:B")
+        fixture.expectNoGlobalDisconnect()
     }
 
     @MainActor
-    private static func testFailedCleanupLatchesInputAndPublishesReview() async throws {
+    private static func testDisconnectDoesNotContactUnreachableEndpoint() async throws {
         let fixture = SessionFixture()
         _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
-        fixture.disableFailures.insert("A")
-        await fixture.coordinator.disconnect().value
-        precondition(fixture.coordinator.pendingCleanupReview != nil, "Failed HID cleanup must publish a manual review")
-        let first = fixture.coordinator.pendingCleanupReview!
-        precondition(first.endpoint == "A.invalid:443")
-        precondition(fixture.inputBlocked)
-        fixture.expectOrder("disable:A", "input-blocked")
-        await expectCleanupFailure(fixture.coordinator.startConnection(to: fixture.device("B")).task)
-        let retry = fixture.coordinator.pendingCleanupReview!
-        precondition(retry.id != first.id, "Every failed cleanup needs its own review consent")
-        precondition(fixture.committedNames == ["A"])
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
-        precondition(fixture.coordinator.pendingCleanupReview == nil)
-        precondition(fixture.inputBlocked, "Successful retry must not release the review block")
-        fixture.expectOrder("input-blocked", "commit:C")
-    }
-
-    @MainActor
-    private static func testAcknowledgementOnlyDiscardsLocalCleanup() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
+        fixture.unreachableHosts.insert("A.invalid")
         let remoteBefore = fixture.remoteEvents
-        try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
-        precondition(fixture.coordinator.pendingCleanupReview == nil)
-        precondition(fixture.inputBlocked)
-        precondition(fixture.remoteEvents == remoteBefore, "Review acknowledgement must issue no remote calls")
-        precondition(fixture.committedNames == ["A"], "Review acknowledgement must not auto-connect")
-        await fixture.coordinator.disconnect().value
-        precondition(fixture.remoteEvents == remoteBefore, "Forgotten local client must not retry remotely")
+        let disconnect = fixture.coordinator.disconnect()
+        precondition(fixture.installedName == nil)
+        await disconnect.value
+        precondition(fixture.remoteEvents == remoteBefore, "Disconnect must only drain the app's existing session")
+        precondition(fixture.reportedErrors.isEmpty)
+        precondition(!fixture.inputBlocked)
+        precondition(fixture.events.last == "transition:false")
+        fixture.expectOrder("drain:2", "drained:2")
     }
 
     @MainActor
-    private static func testReviewRejectsInvalidAuthorizationAndID() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: UUID(), authorization: { true })
-        }
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { false })
-        }
-        precondition(fixture.coordinator.pendingCleanupReview == review)
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
-        precondition(fixture.events.filter { $0 == "disable:A" }.count == 2, "Rejected consent must retain the old client")
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
-        }
-    }
-
-    @MainActor
-    private static func testAcknowledgementWaitsForCleanupAndRechecksReview() async throws {
-        let fixture = try await failedCleanupFixture()
-        let oldReview = fixture.coordinator.pendingCleanupReview!
-        let retryGate = SessionGate()
-        fixture.disableGates["A"] = retryGate
-        let retry = fixture.coordinator.disconnect()
-        await fixture.waitForCount("disable:A", count: 2)
-        let ack = Task { @MainActor in
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: oldReview.id, authorization: { true })
-        }
-        await Task.yield()
-        precondition(fixture.coordinator.pendingCleanupReview == oldReview)
-        retryGate.release()
-        await retry.value
-        await expectReviewExpired { try await ack.value }
-        precondition(fixture.coordinator.pendingCleanupReview?.id != oldReview.id)
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
-        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
-    }
-
-    @MainActor
-    private static func testCancelledAcknowledgementRetainsCleanup() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
-        let drainGate = SessionGate()
-        fixture.nextDrainGate = drainGate
-        let retry = fixture.coordinator.disconnect()
-        await fixture.waitFor("drain:3")
-        let ack = Task { @MainActor in
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
-        }
-        await Task.yield()
-        ack.cancel()
-        drainGate.release()
-        await retry.value
-        do { try await ack.value; preconditionFailure("Cancelled review discarded the old client") }
-        catch is CancellationError { }
-        precondition(fixture.coordinator.pendingCleanupReview != nil)
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
-        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
-    }
-
-    @MainActor
-    private static func testAcknowledgementRechecksAttemptAndManualAuthorization() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
-        let authorization = SessionAuthorization()
-        authorization.onFirstCheck = {
-            authorization.allowed = false
-        }
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
-                reviewID: review.id, authorization: { authorization.check() })
-        }
-        precondition(authorization.checkCount == 2, "Mode authorization must be rechecked after settlement")
-        precondition(fixture.coordinator.pendingCleanupReview == review)
-
-        let attemptAuthorization = SessionAuthorization()
-        let preparation = SessionGate()
-        fixture.preparationGates["B"] = preparation
-        var replacement: SessionConnectionCoordinator.Attempt?
-        attemptAuthorization.onFirstCheck = {
-            replacement = fixture.coordinator.startConnection(to: fixture.device("B"))
-        }
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
-                reviewID: review.id, authorization: { attemptAuthorization.check() })
-        }
-        precondition(fixture.coordinator.pendingCleanupReview != nil)
-        preparation.release()
-        await expectCleanupFailure(replacement!.task)
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
-        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
-    }
-
-    @MainActor
-    private static func testAcknowledgedOldEndpointCannotAffectNewEndpoint() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
-        try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
-        let oldRemoteCount = fixture.events.filter { $0.hasSuffix(":A") && ($0.hasPrefix("enable") || $0.hasPrefix("disable")) }.count
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("B", host: "other.invalid")).task.value
-        await expectReviewExpired {
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
-        }
-        await fixture.coordinator.disconnect().value
-        precondition(fixture.events.filter { $0.hasSuffix(":A") && ($0.hasPrefix("enable") || $0.hasPrefix("disable")) }.count == oldRemoteCount)
-        precondition(fixture.events.contains("disabled:B"))
-        precondition(fixture.inputBlocked)
-    }
-
-    @MainActor
-    private static func testSuspendedAcknowledgementRejectsNewAttempt() async throws {
-        let fixture = try await failedCleanupFixture()
-        let review = fixture.coordinator.pendingCleanupReview!
-        let retryGate = SessionGate()
-        fixture.disableGates["A"] = retryGate
-        let retry = fixture.coordinator.disconnect()
-        await fixture.waitForCount("disable:A", count: 2)
-        let authorization = SessionAuthorization()
-        let ack = Task { @MainActor in
-            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
-                reviewID: review.id, authorization: { authorization.check() })
-        }
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(2))
-        while authorization.checkCount == 0 {
-            precondition(clock.now < deadline, "Review acknowledgement did not start")
-            await Task.yield()
-        }
-        let nextAttempt = fixture.coordinator.startConnection(to: fixture.device("B"))
-        retryGate.release()
-        await retry.value
-        await expectReviewExpired { try await ack.value }
-        await expectCleanupFailure(nextAttempt.task)
-        precondition(fixture.coordinator.pendingCleanupReview != nil)
-        fixture.disableFailures.remove("A")
-        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
-        precondition(fixture.events.filter { $0 == "disable:A" }.count == 4)
-    }
-
-    @MainActor
-    private static func testCleanupReviewNeverContainsCredentials() async throws {
-        let fixture = SessionFixture()
-        var device = fixture.device("A", host: "username:password@A.invalid")
-        device.authToken = "token-never-in-ui"
-        _ = try await fixture.coordinator.startConnection(to: device).task.value
-        fixture.disableFailures.insert("A")
-        await fixture.coordinator.disconnect().value
-        precondition(fixture.coordinator.pendingCleanupReview?.endpoint == "A.invalid:443")
-    }
-
-    private static func testCleanupErrorOffersRecoveryActions() {
-        let cleanupText = SessionConnectionError.previousSessionCleanupFailed.localizedDescription
-        precondition(cleanupText.contains("Connections"))
-        precondition(cleanupText.contains("manueller Prüfung"))
-        let expiredText = SessionConnectionError.manualReviewExpired.localizedDescription
-        precondition(expiredText.contains("Connections"))
-        precondition(expiredText.contains("Manual"))
-    }
-
-    @MainActor
-    private static func failedCleanupFixture() async throws -> SessionFixture {
+    private static func testRepeatedDisconnectsStayLocal() async throws {
         let fixture = SessionFixture()
         _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
-        fixture.disableFailures.insert("A")
-        await fixture.coordinator.disconnect().value
-        precondition(fixture.coordinator.pendingCleanupReview != nil)
-        return fixture
-    }
-
-    private static func expectCleanupFailure(_ task: Task<KVMDevice, Error>) async {
-        do { _ = try await task.value; preconditionFailure("Expected cleanup failure") }
-        catch SessionConnectionError.previousSessionCleanupFailed { }
-        catch { preconditionFailure("Cleanup failure became \(error)") }
+        let remoteBefore = fixture.remoteEvents
+        let gate = SessionGate()
+        fixture.nextDrainGate = gate
+        let first = fixture.coordinator.disconnect()
+        await fixture.waitFor("drain:2")
+        let second = fixture.coordinator.disconnect()
+        let transitionCompletions = fixture.events.filter { $0 == "transition:false" }.count
+        gate.release()
+        await first.value
+        await second.value
+        precondition(fixture.events.filter { $0 == "transition:false" }.count == transitionCompletions + 1,
+                     "Superseded disconnect must not finish the latest transition")
+        fixture.expectOrder("drained:2", "drain:3", "drained:3")
+        precondition(fixture.remoteEvents == remoteBefore)
+        precondition(fixture.installedName == nil)
     }
 
     @MainActor
-    private static func expectReviewExpired(_ operation: @MainActor () async throws -> Void) async {
-        do { try await operation(); preconditionFailure("Expired or unauthorized review was accepted") }
-        catch SessionConnectionError.manualReviewExpired { }
-        catch { preconditionFailure("Review rejection became \(error)") }
+    private static func testLatestReplacementWinsWhileOldEnableSettles() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.enableGates["A"] = gate
+        let a = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("enable:A")
+        let b = fixture.coordinator.startConnection(to: fixture.device("B"))
+        await fixture.waitFor("prepared:B")
+        let c = fixture.coordinator.startConnection(to: fixture.device("C"))
+        await fixture.waitFor("prepared:C")
+        precondition(fixture.committedNames == ["A"])
+        gate.release()
+        _ = try await c.task.value
+        await expectCancellation(a.task)
+        await expectCancellation(b.task)
+        precondition(fixture.committedNames == ["A", "C"])
+        fixture.expectOrder("enabled:A", "drained:2", "drained:3", "enable:C")
+        precondition(!fixture.events.contains("enable:B"))
+        precondition(fixture.installedName == "C")
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testStaleEnableFailureCannotReportOrStartVideo() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.enableGates["A"] = gate
+        fixture.enableFailures.insert("A")
+        let a = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("enable:A")
+        let b = fixture.coordinator.startConnection(to: fixture.device("B"))
+        await fixture.waitFor("prepared:B")
+        gate.release()
+        _ = try await b.task.value
+        await expectCancellation(a.task)
+        precondition(fixture.reportedErrors.isEmpty)
+        precondition(!fixture.events.contains("video:A"))
+        precondition(fixture.installedName == "B")
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testCurrentCancellationWaitsForAlreadySentEnable() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.enableGates["A"] = gate
+        let attempt = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("enable:A")
+        attempt.task.cancel()
+        gate.release()
+        await expectCancellation(attempt.task)
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2")
+        precondition(!fixture.events.contains("video:A"))
+        precondition(fixture.installedName == nil)
+        precondition(fixture.reportedErrors.isEmpty)
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testDisconnectWaitsForAlreadySentEnable() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.enableGates["A"] = gate
+        let attempt = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("enable:A")
+        let disconnect = fixture.coordinator.disconnect()
+        precondition(fixture.installedName == nil)
+        await Task.yield()
+        precondition(!fixture.events.contains("drain:2"))
+        gate.release()
+        await disconnect.value
+        await expectCancellation(attempt.task)
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2")
+        precondition(!fixture.events.contains("video:A"))
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testReplacementWaitsForPendingDisconnectDrain() async throws {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
+        let gate = SessionGate()
+        fixture.nextDrainGate = gate
+        let disconnect = fixture.coordinator.disconnect()
+        await fixture.waitFor("drain:2")
+        let enableB = SessionGate()
+        fixture.enableGates["B"] = enableB
+        let b = fixture.coordinator.startConnection(to: fixture.device("B"))
+        await fixture.waitFor("prepared:B")
+        precondition(!fixture.events.contains("commit:B"))
+        gate.release()
+        await disconnect.value
+        precondition(fixture.coordinator.isConnecting, "Stale disconnect cannot finish the replacement's transition")
+        enableB.release()
+        _ = try await b.task.value
+        fixture.expectOrder("drained:2", "drain:3", "drained:3", "commit:B", "enable:B")
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testAuthenticationFailureCannotRestoreOldSession() async throws {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
+        fixture.preparationErrors["B"] = SessionFixtureError.authentication
+        do {
+            _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
+            preconditionFailure("Authentication failure was ignored")
+        } catch SessionFixtureError.authentication { }
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.installedName == nil)
+        precondition(fixture.committedNames == ["A"])
+        precondition(!fixture.coordinator.isConnecting)
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testInitialDrainPrecedesFirstCommit() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.nextDrainGate = gate
+        let attempt = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("prepared:A")
+        precondition(fixture.committedNames.isEmpty)
+        gate.release()
+        _ = try await attempt.task.value
+        fixture.expectOrder("drained:1", "commit:A", "input:A", "enable:A", "video:A")
+    }
+
+    @MainActor
+    private static func testVideoTransportCancellationDrainsSession() async throws {
+        let fixture = SessionFixture()
+        fixture.videoErrors["A"] = URLError(.cancelled)
+        await expectCancellation(fixture.coordinator.startConnection(to: fixture.device("A")).task)
+        precondition(fixture.installedName == nil)
+        precondition(fixture.reportedErrors.isEmpty, "Transport cancellation must remain cancellation")
+        fixture.expectOrder("enabled:A", "drain:2", "drained:2")
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testInputDrainRecoveryLatchSurvivesReplacement() async throws {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
+        fixture.nextDrainBlocksInput = true
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
+        precondition(fixture.inputBlocked, "Installing the replacement must not clear an actual input-drain recovery latch")
+        fixture.expectOrder("input-blocked", "commit:B", "enable:B")
+        await fixture.coordinator.disconnect().value
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
+        precondition(fixture.inputBlocked, "Later local teardown must retain the input transport's recovery latch")
+        precondition(fixture.installedName == "C")
+        fixture.expectNoGlobalDisconnect()
+    }
+
+    @MainActor
+    private static func testCancelledAttemptCannotCommitAfterDrain() async throws {
+        let fixture = SessionFixture()
+        let gate = SessionGate()
+        fixture.nextDrainGate = gate
+        let attempt = fixture.coordinator.startConnection(to: fixture.device("A"))
+        await fixture.waitFor("prepared:A")
+        attempt.task.cancel()
+        gate.release()
+        await expectCancellation(attempt.task)
+        precondition(fixture.committedNames.isEmpty)
+        precondition(fixture.installedName == nil)
+        fixture.expectOrder("drained:1", "drain:2", "drained:2")
+        fixture.expectNoGlobalDisconnect()
     }
 
     private static func expectCancellation(_ task: Task<KVMDevice, Error>) async {
@@ -493,21 +470,7 @@ struct SessionConnectionCoordinatorTests {
     }
 }
 
-private enum SessionFixtureError: Error { case authentication, video, disable, enable }
-
-@MainActor
-private final class SessionAuthorization {
-    var allowed = true
-    var checkCount = 0
-    var onFirstCheck: (() -> Void)?
-
-    func check() -> Bool {
-        let current = allowed
-        checkCount += 1
-        if checkCount == 1 { onFirstCheck?() }
-        return current
-    }
-}
+private enum SessionFixtureError: Error { case authentication, video, enable }
 
 @MainActor
 private final class SessionGate {
@@ -539,14 +502,13 @@ private final class SessionFixture {
     var preparationErrors: [String: Error] = [:]
     var enableGates: [String: SessionGate] = [:]
     var enableFailures: Set<String> = []
-    var disableGates: [String: SessionGate] = [:]
-    var disableFailures: Set<String> = []
+    var unreachableHosts: Set<String> = []
     var videoGates: [String: SessionGate] = [:]
-    var videoFailures: Set<String> = []
+    var videoErrors: [String: Error] = [:]
     var nextDrainGate: SessionGate?
+    var nextDrainBlocksInput = false
     private var drainCount = 0
     private var clientNames: [ObjectIdentifier: String] = [:]
-    private var eventWaiters: [String: [CheckedContinuation<Void, Never>]] = [:]
 
     lazy var coordinator = SessionConnectionCoordinator(dependencies: .init(
         prepare: { [unowned self] device, _ in
@@ -569,17 +531,20 @@ private final class SessionFixture {
             record("invalidate")
         },
         drainSession: { [unowned self] in
+            precondition(!Task.isCancelled, "Session drain must settle outside the cancelled attempt")
             drainCount += 1
             let count = drainCount
             let gate = nextDrainGate
+            let blocksInput = nextDrainBlocksInput
             nextDrainGate = nil
+            nextDrainBlocksInput = false
             record("drain:\(count)")
             await gate?.wait()
+            if blocksInput {
+                inputBlocked = true
+                record("input-blocked")
+            }
             record("drained:\(count)")
-        },
-        blockInputForRecovery: { [unowned self] in
-            inputBlocked = true
-            record("input-blocked")
         },
         installInput: { [unowned self] client in
             installedName = clientNames[ObjectIdentifier(client)]
@@ -589,15 +554,15 @@ private final class SessionFixture {
             precondition(!Task.isCancelled, "Already sent HID work must settle outside the cancelled attempt")
             let name = clientNames[ObjectIdentifier(client)]!
             record("\(enabled ? "enable" : "disable"):\(name)")
-            await (enabled ? enableGates[name] : disableGates[name])?.wait()
+            await enableGates[name]?.wait()
+            if unreachableHosts.contains(client.baseURL.host ?? "") { throw URLError(.cannotConnectToHost) }
             if enabled, enableFailures.contains(name) { throw SessionFixtureError.enable }
-            if !enabled, disableFailures.contains(name) { throw SessionFixtureError.disable }
             record("\(enabled ? "enabled" : "disabled"):\(name)")
         },
         connectVideo: { [unowned self] device in
             record("video:\(device.name)")
             await videoGates[device.name]?.wait()
-            if videoFailures.contains(device.name) { throw SessionFixtureError.video }
+            if let error = videoErrors[device.name] { throw error }
             record("video-ready:\(device.name)")
         },
         setConnectionTransitioning: { [unowned self] value in record("transition:\(value)") },
@@ -611,26 +576,23 @@ private final class SessionFixture {
 
     func record(_ event: String) {
         events.append(event)
-        let waiters = eventWaiters.removeValue(forKey: event) ?? []
-        waiters.forEach { $0.resume() }
     }
 
     func waitFor(_ event: String) async {
-        guard !events.contains(event) else { return }
-        await withCheckedContinuation { eventWaiters[event, default: []].append($0) }
-    }
-
-    func waitForCount(_ event: String, count: Int) async {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(2))
-        while events.filter({ $0 == event }).count < count {
-            precondition(clock.now < deadline, "Timed out waiting for \(count) occurrences of \(event)")
+        while !events.contains(event) {
+            precondition(clock.now < deadline, "Timed out waiting for \(event): \(events)")
             await Task.yield()
         }
     }
 
     var remoteEvents: [String] {
         events.filter { $0.hasPrefix("enable:") || $0.hasPrefix("disable:") || $0.hasPrefix("video:") }
+    }
+
+    func expectNoGlobalDisconnect() {
+        precondition(!events.contains { $0.hasPrefix("disable:") }, "App-session teardown must not change global USB HID")
     }
 
     func expectOrder(_ expected: String...) {
