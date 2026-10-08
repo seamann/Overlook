@@ -1,6 +1,6 @@
 # Overlook: Stand und Eingabesperre nach Disconnect
 
-Stand: 8. Oktober 2026. Die erste Bestandsaufnahme und die Wiederverbindungsversuche stehen unten als Diagnoseprotokoll. Danach beauftragte Wolfgang ausdrücklich die Produktreparatur. Deren Umsetzung und Prüfung werden im letzten Abschnitt festgehalten.
+Stand: 8. Oktober 2026. Die Bestandsaufnahme, erste Reparatur und Wiederverbindungsversuche stehen unten als Diagnoseprotokoll. Der letzte Abschnitt beschreibt die anschließende Korrektur des Gerätewechsels, nachdem Wolfgang die erneute Blockade meldete.
 
 ## Befund
 
@@ -102,4 +102,32 @@ Nach Neustart bestätigt der laufende MCP-Endpunkt genau den neuen Build. Die Ap
 
 Der frische MCP-Status meldet `hid_status=Connected`, `input_blocked=false` sowie Video-, Text- und Mausbereitschaft jeweils `true`. Die native Oberfläche bestätigt die richtige Zieladresse, den Zustand Connected und laufendes Video mit 1920×1080 bei 59 fps. Beleg: `mcp-installed-after-connect.json`. Das ist die erfolgreiche neue Verbindung; es ist kein Nachweis für den alten unbekannten HID-Abschluss. Physische Tastatur-/Mauswirkung, längere Reconnect-Ausdauer und Audio wurden bei dieser Reparatur nicht neu abgenommen. Der Agent sendete keine Remote-Tastatur-, Maus- oder Textaktion.
 
-`npm audit` im aktuellen MCP-Projekt meldet am 8. Oktober 0 bekannte Schwachstellen. Änderungen werden ausschließlich lokal gesichert; kein Push und keine PR. Die vorhandenen fremden Änderungen im WAGO-Arbeitsbaum bleiben unberührt.
+`npm audit` im aktuellen MCP-Projekt meldete 0 bekannte Schwachstellen. Danach beauftragte Wolfgang ausdrücklich den GitHub-Push. Die vorhandenen 26 lokalen Commits wurden auf `seamann/codex/overlook-webrtc154-2026-10-02` veröffentlicht; HEAD `f92094f` wurde per Git-Remote und GitHub-API bestätigt. Eine PR und ein Merge wurden nicht vorgenommen. Die vorhandenen fremden Änderungen im WAGO-Arbeitsbaum bleiben unberührt.
+
+## Nachbesserung: automatischer Gerätewechsel
+
+Wolfgang meldete erneut die alte HID-Disconnect-Sperre, diesmal beim Wechsel zu einem anderen KVM. Ein frischer TCP-Test zeigte die inzwischen umgekehrte Erreichbarkeit: das ausgewählte neue `192.168.8.142:443` antwortete; das bisherige `192.178.1.62:443` antwortete nicht. Die fehlende Antwort des alten Geräts verhinderte weiterhin die Aktivierung des neuen Clients.
+
+Die lokale GLKVM-Referenzimplementierung zeigt die falsche Bedeutung des bisherigen Abschlusses: `POST /api/hid/set_connected?connected=false` schaltet die globale USB-HID-Verbindung des Geräts. Der HTTP-Handler stellt lediglich ein MCU-Ereignis in die Queue und liefert `{"ok":true,"result":{}}`; er bestätigt weder den Abschluss einer Overlook-Sitzung noch die Ausführung der USB-Umschaltung. Das Antwortformat passt zu `GLKVMEmptyResult`. Der Fehler liegt im Einsatz dieses Aufrufs als zwingende Voraussetzung für den nächsten Gerätewechsel.
+
+Der Coordinator schließt deshalb die lokale Sitzung automatisch: sofortige Session-Invalidierung, Abwarten bereits gesendeter HID-Enable-Aufrufe, vollständiger Mutation-/Print-/HID-Drain, Freigabe gedrückter Tasten und Maustasten sowie Schließen des alten Eingabe-WebSockets. Dieser Ablauf sendet kein globales HID(false). Das neue Gerät wird erst nach diesem lokalen Abschluss und einer aktuellen Versuchsgeneration installiert. HID(true) bleibt beim expliziten Verbinden erhalten, damit frühere App-Versionen abgeschaltete USB-HID-Verbindungen wieder einschalten können. Die bisherige lokale Alt-Sitzungsbestätigung und ihr blockierender Fehlerdialog entfallen.
+
+Die Geräteauswahl ist auch bei bestehender Verbindung bedienbar. Ein anderes ausgewähltes Host-/Port-Paar bietet „Switch Device“ und nutzt denselben Coordinator; das aktive Ziel bietet weiterhin „Disconnect“. „Manual Connect…“ kann ebenfalls einen Wechsel starten. Laufende Versuche bleiben abbrechbar und sperren doppelte Auswahlaktionen.
+
+Eine tatsächlich ungewisse Eingabe bleibt gesperrt, auch nach einem Gerätewechsel oder App-Neustart. Die Produktion speichert dafür `overlook.inputRecoveryBlocked` in ihren UserDefaults. Nur die erfolgreiche aktuelle Manual-Freigabe mit unverändertem Transport, Sperrgeneration und Autorisierung entfernt den Eintrag. Neue Verbindung, USB-Enable und Neustart löschen ihn nicht. Testinstanzen verwenden isolierte Defaults oder ausschließlich Speicherzustand.
+
+RED reproduzierte die Blockade durch den nicht erreichbaren alten Endpunkt. Die gezielten GREEN-Läufe bestanden mit 25 Coordinator-Gruppen, 13 UI-Policy-Gruppen sowie 11 HTTP-Fällen und 4 Persistenzgruppen. Gemessene Zeilen-Coverage: Coordinator 98,06 %, LocalRecoveryPolicies 95,39 %. Die geänderten InputManager-Persistenz-/Recoveryfunktionen erreichten 100 % ausführbare LLVM-Regionen; dies ist keine App-Gesamtcoverage.
+
+Die native Prüfung nutzte die tatsächliche ContentView in einer Test-App mit gesperrtem Netzwerk und inerten KVM-Abhängigkeiten. Über deren echte Connections-Oberfläche wurde New verbunden, zu Old gewechselt, zu New zurückgewechselt und anschließend getrennt. Alle vier Installationen blieben eingabegesperrt, HID-Enable wurde viermal simuliert, HID(false) keinmal. Der Lauf `9A604113-6760-45CD-9CB5-4BAFE0144C41` und die Größenprüfungen bei 720 und 480 Pixeln stehen unter `/Users/doebber/.codex/artifacts/overlook-switch-2026-10-08/ui-e2e/state.jsonl`. Banner und Geräteauswahl blieben getrennt und bedienbar. „Manual Connect…“ wurde in dieser Fixture nicht geöffnet; Video und reale Remote-Eingaben waren simuliert. Die Test-App wurde anschließend geschlossen.
+
+Unabhängige Code-, Swift- und Sicherheitsprüfungen fanden keine offenen blockierenden Befunde. Die ursprünglich realen IP-Adressen im Regressionstest wurden durch `.invalid`-Testnamen ersetzt. `npm audit` meldete erneut 0 bekannte Schwachstellen.
+
+Der vollständige neue Lauf `scripts/test-agent-control.sh all` bestand mit Exit 0, sämtlichen nativen Suites und 96/96 MCP-Tests. Ein früherer Lauf wurde während paralleler Quelländerungen vom Swift-Compiler abgebrochen; sein Log ist als `all-tests-intermediate.log` erhalten. Ein weiterer Lauf traf eine bestehende Zeit-Race im Snapshot-Test: dessen Encoder meldete „gestartet“ auch dann, wenn ein Fehler ihn bereits beendet hatte. Die Testhilfe hält nun Erfolg und Fehler bis zur expliziten Gate-Freigabe; Produktionscode wurde dafür nicht geändert. Der native Snapshot-Harness bestand anschließend 20 vollständige Läufe mit jeweils 17/17 Gruppen. Die früheren Fehler- und neuen Erfolgsausgaben bleiben im Artefaktordner erhalten.
+
+Codecommit: `ea90adc` (`fix: switch KVM sessions without blocking on old devices`). Die getrennte Testhärtung steht in `8b035dc` (`test: keep snapshot encoder gates active after failures`).
+
+Der signierte Xcode-Release-Build `8b035dc5fa46-92e417a9c37ce07e-devsigned` wurde unter `/Applications/Overlook.app` installiert. Source-Revision und Fingerprint blieben während des Builds unverändert; Team, Bundle-ID, Designated Requirement, Entitlements, Signaturen, Dateihashes und Symlinks stimmen zwischen Kandidat und installierter App überein. Overlook wurde regulär geschlossen. Das bisherige App-Bundle bleibt unter `/Users/doebber/.codex/artifacts/overlook-switch-2026-10-08/rollback/Overlook-before-switch.app` erhalten.
+
+Vor dem Austausch bestätigte MCP erneut die aktive Eingabesperre. Weil der alte Build sie noch nicht persistierte, wurde dieser bestehende Sperrzustand vor dem regulären Quit in den neuen Defaults-Eintrag übernommen. Nach dem Start bestätigte der laufende MCP-Endpunkt den neuen Build, Manual und `input_blocked=true`. Die alte Cleanup-Bestätigung erscheint nicht mehr; der Banner bietet „Erneut verbinden“.
+
+Das bereits von Wolfgang ausgewählte und nun erreichbare `192.168.8.142:443` wurde im neuen Build gewählt und Connect gestartet. Die App erreichte den normalen Passwortdialog. Die Anmeldung benötigt das Passwort dieses Geräts; der Agent fragte es nicht im Chat ab und speicherte es nicht in Nachweisen. Eine erfolgreiche neue Verbindung und tatsächliche Eingabewirkung waren zu diesem Prüfpunkt noch nicht nachgewiesen. Belege stehen unter `mcp-preinstall-state.json`, `mcp-installed-before-auth.json`, `release/build-manifest.txt`, `preinstall-verification.json` und `install-receipt.json` im neuen Artefaktordner.
