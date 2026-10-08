@@ -415,14 +415,20 @@ private final class ControlledSnapshotEncoder: @unchecked Sendable {
         do {
             snapshot = try SnapshotPNGEncoder.encode(input, region: region, limits: limits)
         } catch {
-            signalStarted()
+            waitForRelease()
             throw error
         }
+        waitForRelease()
+        return snapshot
+    }
+
+    // Even cancellation during PNG encoding must retain this controlled encoder
+    // until release, so its start signal cannot mean the resource already settled.
+    private func waitForRelease() {
         signalStarted()
         releaseCondition.lock()
         while !released { releaseCondition.wait() }
         releaseCondition.unlock()
-        return snapshot
     }
 
     private func signalStarted() {
