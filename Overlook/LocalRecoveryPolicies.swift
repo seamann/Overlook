@@ -97,6 +97,69 @@ struct LocalRecoveryPresentation: Equatable, Sendable {
     }
 }
 
+enum InputRecoveryAction: Equatable, Sendable {
+    case switchToManual, waitForConnection, reviewPreviousSession, reconnect, releaseInput
+}
+
+struct InputRecoveryPresentation: Equatable, Sendable {
+    let action: InputRecoveryAction
+
+    init(
+        mode: OverlookControlMode, isConnected: Bool, isBusy: Bool,
+        hasLiveVideo: Bool, hasRecoveryTransport: Bool,
+        hasPendingCleanupReview: Bool, isLocalCaptureAllowed: Bool
+    ) {
+        if mode != .manual { action = .switchToManual }
+        else if isBusy || !isLocalCaptureAllowed { action = .waitForConnection }
+        else if hasPendingCleanupReview { action = .reviewPreviousSession }
+        else if !isConnected || !hasLiveVideo || !hasRecoveryTransport { action = .reconnect }
+        else { action = .releaseInput }
+    }
+
+    var buttonTitle: String? {
+        switch action {
+        case .switchToManual, .waitForConnection: return nil
+        case .reviewPreviousSession: return "Alte Sitzung prüfen …"
+        case .reconnect: return "Erneut verbinden"
+        case .releaseInput: return "Eingabe nach Prüfung freigeben"
+        }
+    }
+
+    var message: String {
+        switch action {
+        case .switchToManual:
+            return "Für die eigene Prüfung zuerst in Manual wechseln."
+        case .waitForConnection:
+            return "Verbindung oder Freigabe läuft. Die Eingabe bleibt angehalten."
+        case .reviewPreviousSession:
+            return "Die alte KVM-Sitzung konnte nicht sauber getrennt werden. Prüfe den alten Zielrechner direkt, bevor du sie lokal abschließt."
+        case .reconnect:
+            return "Erst neu verbinden und das Remote-Bild prüfen. Danach kannst du die Eingabe freigeben."
+        case .releaseInput:
+            return "Prüfe das aktuelle Remote-Bild. Bereits übertragener Text wird nicht zurückgenommen."
+        }
+    }
+}
+
+enum InputRecoveryFailure: CaseIterable, Sendable {
+    case transportUnavailable, sessionChanged, unauthorized, cancelled, releaseFailed
+
+    var message: String {
+        switch self {
+        case .transportUnavailable:
+            return "Die Eingabeverbindung ist nicht bereit. Bitte erneut verbinden."
+        case .sessionChanged:
+            return "Die Sitzung hat sich geändert. Prüfe die aktuelle Verbindung erneut."
+        case .unauthorized:
+            return "Die Freigabe ist nicht mehr gültig. Wechsle nach Manual und prüfe erneut."
+        case .cancelled:
+            return "Die Freigabe wurde abgebrochen. Die Eingabe bleibt gesperrt."
+        case .releaseFailed:
+            return "Die Eingabefreigabe konnte nicht übertragen werden. Erneut verbinden und den Remote-Zustand prüfen."
+        }
+    }
+}
+
 enum LocalConnectionAction: Equatable, Sendable {
     case connect(enabled: Bool)
     case cancel

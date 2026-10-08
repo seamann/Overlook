@@ -16,6 +16,7 @@ execFileSync('/usr/bin/openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes
 chmodSync(key, 0o600);
 let mode = 'stall-handshake';
 let records = [];
+let printTexts = [];
 const sockets = new Map();
 const transportSockets = new Set();
 const respond = (response, code, body) => response.writeHead(code,
@@ -27,7 +28,7 @@ const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }
   if (url.pathname === '/fixture/health') {
     respond(response, 200, { fixture: 'overlook-ws-settlement', loopback: true });
   } else if (url.pathname === '/fixture/status') {
-    respond(response, 200, { connections: records });
+    respond(response, 200, { connections: records, printTexts });
   } else if (url.pathname === '/fixture/mode' && request.method === 'POST') {
     const next = url.searchParams.get('value');
     if (!['normal', 'stall-handshake'].includes(next)) respond(response, 400, { error: 'Invalid mode' });
@@ -35,6 +36,13 @@ const server = createServer({ key: readFileSync(key), cert: readFileSync(cert) }
   } else if (url.pathname === '/fixture/close' && request.method === 'POST') {
     sockets.get(Number(url.searchParams.get('id')))?.destroy();
     respond(response, 200, { ok: true });
+  } else if (url.pathname === '/api/hid/print' && request.method === 'POST') {
+    let body = '';
+    request.on('data', chunk => { body += chunk.toString('utf8'); });
+    request.on('end', () => {
+      printTexts = [...printTexts, body];
+      respond(response, 503, { ok: false, error: 'Deliberately unconfirmed fixture print' });
+    });
   } else if (url.pathname === '/api/system/get_config') {
     respond(response, 200, { ok: true, result: { config: { is_absolute_mouse: true } } });
   } else respond(response, 404, { error: 'Unknown fixture endpoint' });
@@ -47,7 +55,7 @@ server.on('connection', socket => {
 });
 server.on('upgrade', (request, socket) => {
   const id = records.length + 1;
-  const record = { id, mode, upgraded: false, closed: false, bytes: 0, events: [] };
+  const record = { id, mode, upgraded: false, closed: false, bytes: 0, events: [], binary: [] };
   records = [...records, record];
   const update = change => { records = records.map(item => item.id === id ? { ...item, ...change } : item); };
   sockets.set(id, socket);
@@ -80,6 +88,10 @@ server.on('upgrade', (request, socket) => {
       if (masked) for (let index = 0; index < payload.length; index++) payload[index] ^= pending[offset + (index % 4)];
       pending = pending.subarray(payloadStart + length);
       if (opcode === 8) { socket.end(Buffer.from([0x88, 0])); return; }
+      if (opcode === 2) {
+        const current = records.find(item => item.id === id);
+        update({ binary: [...current.binary, payload.toString('hex')] });
+      }
       if (opcode === 1) {
         try {
           const type = JSON.parse(payload.toString('utf8')).event_type;

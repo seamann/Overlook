@@ -39,6 +39,10 @@ class InputManager: ObservableObject {
     private var activePrintDrainWaiters: [CheckedContinuation<Void, Never>] = []
     private(set) var transportID = UUID().uuidString
     @Published private(set) var inputBlocked = false
+    private var inputBlockGeneration = UUID()
+    @Published private(set) var hasInputRecoveryTransport = false
+    private var inputRecoveryObserverID = UUID()
+    private var inputRecoveryReadinessQueryID = UUID()
 
     private struct PendingAbsoluteMouseMove: Equatable, Sendable {
         let toX: Int
@@ -432,6 +436,7 @@ class InputManager: ObservableObject {
     }
 
     func disconnectGLKVMWebSocket() {
+        retireInputRecoveryTransport()
         invalidateMicroJiggler()
         transportID = UUID().uuidString
         stopMouseMoveSender()
@@ -454,6 +459,7 @@ class InputManager: ObservableObject {
     }
 
     func disconnectInputForSession() async {
+        retireInputRecoveryTransport()
         setSessionAvailable(false)
         transportID = UUID().uuidString
         stopMouseMoveSender()
@@ -1029,7 +1035,12 @@ class InputManager: ObservableObject {
         }
     }
 
+    func blockInputAfterUnconfirmedSession() {
+        latchUnconfirmedInput()
+    }
+
     private func latchUnconfirmedInput() {
+        inputBlockGeneration = UUID()
         invalidateMicroJiggler()
         inputBlocked = true
         refreshLocalInputFocus()
@@ -1041,19 +1052,27 @@ class InputManager: ObservableObject {
     func recoverInputAfterManualReview(
         authorization: @escaping @MainActor @Sendable () -> Bool
     ) async throws {
+        try Task.checkCancellation()
         guard inputBlocked, isLocalInputCaptureAllowed, authorization() else { throw RemoteActionError.unauthorized }
         let capturedTransport = transportID
-        let pending = hidCommandTail
-        try await RemoteGestureCleanup.perform(press: {}, body: {}, release: { await pending?.value })
-        guard authorization(), isLocalInputCaptureAllowed, capturedTransport == transportID else {
+        let reviewedBlockGeneration = inputBlockGeneration
+        if activePrintOperations > 0 {
+            await waitForActivePrintOperationsToDrain()
+            try Task.checkCancellation()
+            // The visible review preceded text that was still being transmitted.
+            // Require a new sight review after every dispatched print has settled.
             throw RemoteActionError.sessionChanged
         }
         guard let ws = glkvmWebSocketClient else { throw RemoteActionError.inputUnavailable }
+        let pending = hidCommandTail
+        try await RemoteGestureCleanup.perform(press: {}, body: {}, release: { await pending?.value })
+        try await verifyCurrentRecoveryTransport(ws, owner: capturedTransport,
+                                                 reviewedBlockGeneration: reviewedBlockGeneration,
+                                                 authorization: authorization)
         try await RemoteGestureCleanup.perform(press: {}, body: {}, release: { try await ws.releaseAllHIDInputs() })
-        guard authorization(), isLocalInputCaptureAllowed, capturedTransport == transportID else {
-            throw RemoteActionError.sessionChanged
-        }
-        try Task.checkCancellation()
+        try await verifyCurrentRecoveryTransport(ws, owner: capturedTransport,
+                                                 reviewedBlockGeneration: reviewedBlockGeneration,
+                                                 authorization: authorization)
         inputBlocked = false
         invalidateMicroJiggler()
         transportID = UUID().uuidString
@@ -1061,7 +1080,26 @@ class InputManager: ObservableObject {
         lastInputError = nil
         refreshLocalInputFocus()
     }
-    
+
+    private func verifyCurrentRecoveryTransport(
+        _ ws: GLKVMClient.WebSocketClient, owner: String, reviewedBlockGeneration: UUID,
+        authorization: @escaping @MainActor @Sendable () -> Bool
+    ) async throws {
+        try Task.checkCancellation()
+        guard authorization(), isLocalInputCaptureAllowed, acceptsHIDCommands,
+              transportMode == .glkvmWebSocket, transportID == owner,
+              inputBlockGeneration == reviewedBlockGeneration,
+              glkvmWebSocketClient === ws else { throw RemoteActionError.sessionChanged }
+        let connected = await ws.isConnected
+        try Task.checkCancellation()
+        guard authorization(), isLocalInputCaptureAllowed, acceptsHIDCommands,
+              transportMode == .glkvmWebSocket, transportID == owner,
+              inputBlockGeneration == reviewedBlockGeneration,
+              glkvmWebSocketClient === ws else { throw RemoteActionError.sessionChanged }
+        hasInputRecoveryTransport = connected
+        guard connected else { throw RemoteActionError.inputUnavailable }
+    }
+
     private func handleMouseEvent(_ event: NSEvent) {
         guard isMouseCaptureEnabled else { return }
         
@@ -1382,6 +1420,7 @@ class InputManager: ObservableObject {
     }
 
     func shutdown() async {
+        retireInputRecoveryTransport()
         setMicroJigglerEnabled(false)
         acceptsHIDCommands = false
         stopFullInputCapture()
@@ -1426,18 +1465,23 @@ class InputManager: ObservableObject {
                   glkvmClient === client,
                   transportID == expectedTransport else { return }
             let ws = try? client.makeWebSocketClient(stream: false)
+            retireInputRecoveryTransport()
             invalidateMicroJiggler()
             heldRemoteKeys = []
             heldRemoteButtons = []
             glkvmWebSocketClient = ws
             transportID = UUID().uuidString
             let installedTransport = transportID
+            if let ws { await observeInputRecoveryTransport(ws) }
+            guard acceptsHIDCommands, !Task.isCancelled, glkvmClient === client,
+                  transportID == installedTransport, glkvmWebSocketClient === ws else { return }
             await ws?.connect()
             guard acceptsHIDCommands,
                   !Task.isCancelled,
                   glkvmClient === client,
-                  transportID == installedTransport else {
+                  transportID == installedTransport, glkvmWebSocketClient === ws else {
                 if glkvmWebSocketClient === ws {
+                    retireInputRecoveryTransport()
                     glkvmWebSocketClient = nil
                 }
                 await ws?.disconnect()
@@ -1446,7 +1490,33 @@ class InputManager: ObservableObject {
             // Reconnection does not prove that an earlier HTTP print has stopped
             // or that an unconfirmed release reached the remote application.
             activityStatus = ws == nil ? "HID connection failed" : "HID connecting"
-            hidStatus = ws == nil ? "Failed" : "Connecting"
+            hidStatus = ws == nil ? "Failed" : (hasInputRecoveryTransport ? "Connected" : "Connecting")
+        }
+    }
+
+    private func retireInputRecoveryTransport() {
+        inputRecoveryObserverID = UUID()
+        inputRecoveryReadinessQueryID = UUID()
+        hasInputRecoveryTransport = false
+    }
+
+    private func observeInputRecoveryTransport(_ ws: GLKVMClient.WebSocketClient) async {
+        let observerID = inputRecoveryObserverID
+        await ws.setReadinessChangedHandler { [weak self, weak ws] in
+            Task { @MainActor [weak self, weak ws] in
+                guard let self, let ws, self.acceptsHIDCommands,
+                      self.inputRecoveryObserverID == observerID,
+                      self.glkvmWebSocketClient === ws else { return }
+                let owner = self.transportID
+                let queryID = UUID()
+                self.inputRecoveryReadinessQueryID = queryID
+                let connected = await ws.isConnected
+                guard self.acceptsHIDCommands, self.inputRecoveryObserverID == observerID,
+                      self.inputRecoveryReadinessQueryID == queryID,
+                      self.transportID == owner, self.glkvmWebSocketClient === ws else { return }
+                self.hasInputRecoveryTransport = connected
+                if connected { self.hidStatus = "Connected" }
+            }
         }
     }
 
@@ -1573,8 +1643,11 @@ class InputManager: ObservableObject {
                 guard !Task.isCancelled, let self else { return }
                 try? await Task.sleep(nanoseconds: delay)
                 await self.reconnectGLKVMWebSocketIfNeeded()
-                let connected = await self.glkvmWebSocketClient?.isConnected == true
-                guard self.acceptsHIDCommands, !Task.isCancelled else { return }
+                let owner = self.transportID
+                let ws = self.glkvmWebSocketClient
+                let connected = await ws?.isConnected == true
+                guard self.acceptsHIDCommands, !Task.isCancelled,
+                      self.transportID == owner, self.glkvmWebSocketClient === ws else { return }
                 if connected {
                     self.hidStatus = "Connected"
                     self.hidReconnectTask = nil

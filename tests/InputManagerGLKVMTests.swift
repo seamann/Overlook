@@ -11,7 +11,10 @@ struct InputManagerGLKVMTests {
             try await testToolbarPasteRejectsRevokedCaptureGeneration()
             try await testFailedPasteKeepsManualRecoveryAuthority()
             try await testSessionDisconnectDrainsDispatchedPrint()
-            print("InputManagerGLKVMTests passed (8 HTTP cases)")
+            try await testExplicitUnconfirmedSessionBlocksWithoutRecoveryTransport()
+            try await testPendingHTTPPrintsRequireFreshManualReview(failPrint: false)
+            try await testPendingHTTPPrintsRequireFreshManualReview(failPrint: true)
+            print("InputManagerGLKVMTests passed (11 HTTP cases)")
         } catch {
             fputs("InputManagerGLKVMTests FAILED: \(error)\n", stderr)
             exit(1)
@@ -155,6 +158,67 @@ struct InputManagerGLKVMTests {
         try expect(fixture.manager.inputBlocked, "An unconfirmed old print must retain the conservative input block")
     }
 
+    @MainActor private static func testExplicitUnconfirmedSessionBlocksWithoutRecoveryTransport() async throws {
+        let fixture = CaptureFixture()
+        defer { fixture.finish() }
+        try expect(!fixture.manager.hasInputRecoveryTransport, "An uninstalled HID socket must never advertise recovery")
+        fixture.manager.blockInputAfterUnconfirmedSession()
+        fixture.manager.blockInputAfterUnconfirmedSession()
+        try expect(fixture.manager.inputBlocked, "An unconfirmed session must latch and retain the input block")
+        try expectCapture(fixture, keyboard: false, mouse: false)
+        let readiness = await fixture.manager.inputReadiness()
+        try expect(!readiness.text && !readiness.mouse, "A latched session must disable all input readiness")
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: { true })
+            throw CaptureTestFailure(description: "Disconnected manual recovery must reject")
+        } catch let error as RemoteActionError {
+            try expect(error == .inputUnavailable, "Absent recovery transport must report inputUnavailable")
+        }
+        try expect(fixture.manager.inputBlocked, "Rejected disconnected recovery must keep the input block")
+    }
+
+    @MainActor private static func testPendingHTTPPrintsRequireFreshManualReview(failPrint: Bool) async throws {
+        let fixture = CaptureFixture()
+        defer { fixture.finish() }
+        let http = CaptureHTTPHarness()
+        http.holdPrint = true
+        http.failPrint = failPrint
+        CaptureHTTPProtocol.harness = http
+        defer { CaptureHTTPProtocol.harness = nil }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [CaptureHTTPProtocol.self]
+        let client = try GLKVMClient(host: "capture-fixture.invalid", sessionConfiguration: configuration)
+        fixture.manager.setGLKVMClient(client)
+        await http.waitForFirstConfiguration()
+        let first = Task { @MainActor in try? await fixture.manager.sendTextToRemote("first outstanding fixture print") }
+        let second = Task { @MainActor in try? await fixture.manager.sendTextToRemote("second outstanding fixture print") }
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        while http.printRequests < 2 {
+            try expect(ProcessInfo.processInfo.systemUptime < deadline, "Both actual HTTP print requests must dispatch")
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        fixture.manager.blockInputAfterUnconfirmedSession()
+        var recoveryError: Error?
+        let recovery = Task { @MainActor in
+            do { try await fixture.manager.recoverInputAfterManualReview(authorization: { true }) }
+            catch { recoveryError = error }
+        }
+        let finishedWithTwoPrintsOutstanding = await completesWithinObservationWindow(recovery)
+        http.releaseOnePrint()
+        let finishedWithOnePrintOutstanding = await completesWithinObservationWindow(recovery)
+        http.releasePrint()
+        _ = await first.value
+        _ = await second.value
+        await recovery.value
+        try expect(!finishedWithTwoPrintsOutstanding && !finishedWithOnePrintOutstanding,
+                   "Manual recovery must wait for every already dispatched HTTP print before requesting a new review")
+        try expect(recoveryError as? RemoteActionError == .sessionChanged,
+                   "A sight review predating pending text must reject even when all prints succeed")
+        try expect(fixture.manager.inputBlocked, "Pending or later failed prints must preserve the input block")
+        try expectCapture(fixture, keyboard: false, mouse: false)
+        try expect(http.printRequests == 2, "Draining review must never replay either original print")
+    }
+
     @MainActor private static func completesWithinObservationWindow(_ operation: Task<Void, Never>) async -> Bool {
         let result = CaptureCompletionRace()
         Task { @MainActor in
@@ -223,6 +287,12 @@ private final class CaptureHTTPHarness {
     func waitForFirstConfiguration() async { await firstConfiguration.wait() }
     func waitForHeldConfiguration() async { await heldConfiguration.wait() }
     func waitForHeldPrint() async { await heldPrint.wait() }
+
+    func releaseOnePrint() {
+        guard let request = pendingPrints.first else { return }
+        pendingPrints = Array(pendingPrints.dropFirst())
+        respondPrint(request)
+    }
 
     func releasePrint() {
         holdPrint = false

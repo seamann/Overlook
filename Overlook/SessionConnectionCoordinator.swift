@@ -3,9 +3,15 @@ import Combine
 
 enum SessionConnectionError: Error, LocalizedError {
     case previousSessionCleanupFailed
+    case manualReviewExpired
 
     var errorDescription: String? {
-        "The previous KVM session could not confirm HID disconnect. Try connecting again to retry cleanup."
+        switch self {
+        case .previousSessionCleanupFailed:
+            return "Die alte KVM-Sitzung hat den HID-Disconnect nicht bestätigt. Öffne Connections, um die Bereinigung erneut zu versuchen oder die alte Sitzung nach manueller Prüfung lokal zu verwerfen. Die Eingabe bleibt gesperrt."
+        case .manualReviewExpired:
+            return "Diese Prüfung der alten KVM-Sitzung ist nicht mehr gültig. Öffne Connections erneut und prüfe die angezeigte Sitzung im Modus Manual."
+        }
     }
 }
 
@@ -13,11 +19,17 @@ enum SessionConnectionError: Error, LocalizedError {
 /// published state and remote HID transitions belong to one attempt at a time.
 @MainActor
 final class SessionConnectionCoordinator: ObservableObject {
+    struct PendingCleanupReview: Identifiable, Equatable, Sendable {
+        let id: UUID
+        let endpoint: String
+    }
+
     struct Dependencies {
         var prepare: @MainActor (KVMDevice, String?) async throws -> PreparedKVMConnection
         var commit: @MainActor (PreparedKVMConnection) -> KVMDevice
         var invalidateSession: @MainActor () -> Void
         var drainSession: @MainActor () async -> Void
+        var blockInputForRecovery: @MainActor () -> Void
         var installInput: @MainActor (GLKVMClient) -> Void
         var setHIDConnected: @MainActor (GLKVMClient, Bool) async throws -> Void
         var connectVideo: @MainActor (KVMDevice) async throws -> Void
@@ -33,6 +45,7 @@ final class SessionConnectionCoordinator: ObservableObject {
     }
 
     @Published private(set) var isConnecting = false
+    @Published private(set) var pendingCleanupReview: PendingCleanupReview?
     private let dependencies: Dependencies
     private var attemptGeneration: UInt64 = 0
     private var connectionTask: Task<KVMDevice, Error>?
@@ -112,6 +125,38 @@ final class SessionConnectionCoordinator: ObservableObject {
         }
     }
 
+    func acknowledgeUnconfirmedCleanup(
+        reviewID: UUID,
+        authorization: @escaping @MainActor @Sendable () -> Bool
+    ) async throws {
+        try Task.checkCancellation()
+        guard let client = cleanupClient else { throw SessionConnectionError.manualReviewExpired }
+        let attemptID = attemptGeneration
+        try checkCleanupReview(reviewID, client: client, attemptID: attemptID, authorization: authorization)
+
+        // Already-sent HID work must settle before consent can discard its
+        // local owner. This acknowledgement never issues a remote operation.
+        _ = await lifecycleTail?.result
+        try checkCleanupReview(reviewID, client: client, attemptID: attemptID, authorization: authorization)
+        dependencies.blockInputForRecovery()
+        cleanupClient = nil
+        pendingCleanupReview = nil
+    }
+
+    private func checkCleanupReview(
+        _ reviewID: UUID,
+        client: GLKVMClient,
+        attemptID: UInt64,
+        authorization: @MainActor @Sendable () -> Bool
+    ) throws {
+        try Task.checkCancellation()
+        guard authorization(), isCurrent(attemptID), !isConnecting,
+              connectionTask == nil, activeClient == nil, cleanupClient === client,
+              pendingCleanupReview?.id == reviewID else {
+            throw SessionConnectionError.manualReviewExpired
+        }
+    }
+
     private func invalidateAttempt() -> UInt64 {
         attemptGeneration &+= 1
         connectionTask?.cancel()
@@ -135,9 +180,19 @@ final class SessionConnectionCoordinator: ObservableObject {
             do {
                 try await self.dependencies.setHIDConnected(client, false)
             } catch {
+                if self.cleanupClient === client {
+                    self.dependencies.blockInputForRecovery()
+                    self.pendingCleanupReview = PendingCleanupReview(
+                        id: UUID(),
+                        endpoint: "\(client.baseURL.host ?? "Unbekannt"):\(client.baseURL.port ?? 443)"
+                    )
+                }
                 throw SessionConnectionError.previousSessionCleanupFailed
             }
-            if self.cleanupClient === client { self.cleanupClient = nil }
+            if self.cleanupClient === client {
+                self.cleanupClient = nil
+                self.pendingCleanupReview = nil
+            }
         }
         lifecycleTail = teardown
         return teardown

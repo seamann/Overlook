@@ -33,6 +33,13 @@ struct ContentView: View {
     @State private var errorKind: LocalActionErrorKind = .connection
     @State private var isChangingControlMode = false
     @State private var isRecoveringInput = false
+    @State private var inputRecoveryErrorMessage: String?
+    @State private var cleanupReviewConfirmation: CleanupReviewConfirmation?
+
+    private struct CleanupReviewConfirmation {
+        let review: SessionConnectionCoordinator.PendingCleanupReview
+        let modeSnapshot: ControlModeSnapshot
+    }
 
     @State private var showingConnections = false
     @State private var didAutoOpenConnections = false
@@ -72,6 +79,19 @@ struct ContentView: View {
             isSessionConnecting: isEstablishingConnection,
             isPanelPresented: showingSettings || showingConnections || showingManualConnect
                 || showingPasswordPrompt || isShowingOCRResult || connectionErrorMessage != nil
+                || cleanupReviewConfirmation != nil
+        )
+    }
+
+    private var inputRecoveryPresentation: InputRecoveryPresentation {
+        InputRecoveryPresentation(
+            mode: controlMode, isConnected: isConnected,
+            isBusy: isEstablishingConnection || webRTCManager.isConnecting || isRecoveringInput,
+            hasLiveVideo: webRTCManager.isConnected && webRTCManager.videoSize != nil
+                && !webRTCManager.isStreamStalled,
+            hasRecoveryTransport: inputManager.hasInputRecoveryTransport,
+            hasPendingCleanupReview: sessionCoordinator.pendingCleanupReview != nil,
+            isLocalCaptureAllowed: inputManager.isLocalInputCaptureAllowed
         )
     }
 
@@ -201,36 +221,106 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Label("Eingabe angehalten: Remote-Zustand prüfen", systemImage: "exclamationmark.triangle")
                 .font(.headline)
-            Text("Bereits übertragener Text wird nicht zurückgenommen.")
+            Text(inputRecoveryPresentation.message)
                 .font(.caption)
-            if controlMode == .manual {
-                Button(isRecoveringInput ? "Freigabe wird geprüft …" : "Eingabe nach Prüfung freigeben") {
-                    let expectedMode = controlModeStore.snapshot
-                    isRecoveringInput = true
-                    Task { @MainActor in
-                        defer { isRecoveringInput = false }
-                        do {
-                            try await inputManager.recoverInputAfterManualReview {
-                                controlModeStore.snapshot == expectedMode && expectedMode.mode == .manual
-                            }
-                            transferStatus = nil
-                        } catch {
-                            transferStatus = "Freigabe nicht bestätigt. Eingabe bleibt gesperrt."
-                        }
-                    }
-                }
-                .disabled(isRecoveringInput || !inputManager.isLocalInputCaptureAllowed)
-                .help("Nach eigener Prüfung des Remote-Zustands die Eingabesperre aufheben. Die App bleibt in Manual.")
-            } else {
-                Text("Für die eigene Prüfung zuerst in Manual wechseln.")
-                    .font(.caption)
+            if let message = inputRecoveryErrorMessage {
+                Text(message).font(.caption).foregroundStyle(.secondary)
+            }
+            if let title = inputRecoveryPresentation.buttonTitle {
+                Button(title, action: performInputRecoveryAction)
+                    .disabled(showingPasswordPrompt || connectionErrorMessage != nil)
+                    .accessibilityIdentifier("local-input-recovery")
             }
         }
         .padding(12)
         .frame(maxWidth: 440, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .padding()
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity, alignment: .center)
+        .alert(
+            "Alte KVM-Sitzung lokal abschließen?",
+            isPresented: Binding(
+                get: { cleanupReviewConfirmation != nil },
+                set: { if !$0 { cleanupReviewConfirmation = nil } }
+            ),
+            presenting: cleanupReviewConfirmation
+        ) { confirmation in
+            Button("Geprüft, Sitzung abschließen") {
+                finishReviewedPreviousSession(confirmation)
+            }
+            Button("Abbrechen", role: .cancel) {}
+        } message: { confirmation in
+            Text("Prüfe den alten Zielrechner \(confirmation.review.endpoint) direkt. Läuft dort keine unerwartete Eingabe mehr, kannst du die alte Sitzung lokal abschließen. Die Eingabe bleibt bis zur Prüfung und Freigabe der neuen Verbindung gesperrt. Der alte HID-Disconnect bleibt unbestätigt.")
+        }
+    }
+
+    private func performInputRecoveryAction() {
+        inputRecoveryErrorMessage = nil
+        switch inputRecoveryPresentation.action {
+        case .reconnect:
+            showingSettings = false
+            showingConnections = true
+        case .reviewPreviousSession:
+            guard let review = sessionCoordinator.pendingCleanupReview else { return }
+            cleanupReviewConfirmation = CleanupReviewConfirmation(
+                review: review, modeSnapshot: controlModeStore.snapshot
+            )
+        case .releaseInput:
+            releaseReviewedInput()
+        case .switchToManual, .waitForConnection:
+            break
+        }
+    }
+
+    private func releaseReviewedInput() {
+        guard inputRecoveryPresentation.action == .releaseInput else { return }
+        let expectedMode = controlModeStore.snapshot
+        isRecoveringInput = true
+        Task { @MainActor in
+            defer { isRecoveringInput = false }
+            do {
+                try await inputManager.recoverInputAfterManualReview {
+                    controlModeStore.snapshot == expectedMode && expectedMode.mode == .manual
+                }
+                inputRecoveryErrorMessage = nil
+            } catch {
+                inputRecoveryErrorMessage = recoveryMessage(for: error)
+            }
+        }
+    }
+
+    private func finishReviewedPreviousSession(_ confirmation: CleanupReviewConfirmation) {
+        isRecoveringInput = true
+        Task { @MainActor in
+            defer { isRecoveringInput = false }
+            do {
+                try await sessionCoordinator.acknowledgeUnconfirmedCleanup(reviewID: confirmation.review.id) {
+                    controlModeStore.snapshot == confirmation.modeSnapshot
+                        && confirmation.modeSnapshot.mode == .manual
+                }
+                inputRecoveryErrorMessage = nil
+                showingSettings = false
+                showingConnections = true
+            } catch {
+                inputRecoveryErrorMessage = recoveryMessage(for: error)
+            }
+        }
+    }
+
+    private func recoveryMessage(for error: Error) -> String {
+        if error is CancellationError { return InputRecoveryFailure.cancelled.message }
+        if let error = error as? RemoteActionError {
+            switch error {
+            case .inputUnavailable: return InputRecoveryFailure.transportUnavailable.message
+            case .sessionChanged: return InputRecoveryFailure.sessionChanged.message
+            case .unauthorized: return InputRecoveryFailure.unauthorized.message
+            default: return InputRecoveryFailure.releaseFailed.message
+            }
+        }
+        if let error = error as? SessionConnectionError, case .manualReviewExpired = error {
+            return InputRecoveryFailure.sessionChanged.message
+        }
+        return InputRecoveryFailure.releaseFailed.message
     }
 
     private func applyAppAppearance() {
@@ -315,10 +405,6 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                     .padding()
                     .allowsHitTesting(false)
-            }
-
-            if inputManager.inputBlocked {
-                inputRecoveryBanner
             }
 
             if isFullscreen && !showingSettings && !showingConnections {
@@ -442,11 +528,17 @@ struct ContentView: View {
             .offset(x: showingConnections ? 0 : 360)
             .animation(.easeInOut(duration: 0.2), value: showingConnections)
             .allowsHitTesting(showingConnections)
+
         }
     }
 
     private var windowContent: some View {
         videoContent
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if inputManager.inputBlocked || sessionCoordinator.pendingCleanupReview != nil {
+                inputRecoveryBanner
+            }
+        }
         .background(WindowAspectRatioSetter(videoSize: webRTCManager.videoSize))
         .background(WindowTitleSetter(title: windowTitle))
         .background(WindowReferenceSetter(window: $windowRef))
@@ -489,6 +581,10 @@ struct ContentView: View {
         .onChange(of: isShowingOCRResult) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: isOCRModeEnabled) { _, _ in updateInputCaptureForUIOverlays() }
         .onChange(of: connectionErrorMessage) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: cleanupReviewConfirmation != nil) { _, _ in updateInputCaptureForUIOverlays() }
+        .onChange(of: inputManager.inputBlocked) { _, blocked in
+            if !blocked { inputRecoveryErrorMessage = nil }
+        }
         .onChange(of: kvmDeviceManager.mouseJigglerErrorMessage) { _, message in
             if let message { showLocalError(message, kind: .mouseJiggler) }
         }
@@ -941,7 +1037,7 @@ struct ContentView: View {
         inputManager.setLocalUIBlocked(
             showingSettings || showingConnections || showingManualConnect
                 || showingPasswordPrompt || isShowingOCRResult || isOCRModeEnabled
-                || connectionErrorMessage != nil,
+                || connectionErrorMessage != nil || cleanupReviewConfirmation != nil,
             owner: inputCaptureOwner
         )
     }

@@ -18,7 +18,17 @@ struct SessionConnectionCoordinatorTests {
         try await testCancelledTaskCannotStartPreparation()
         try await testHIDEnableFailureStaysOwnedUntilDisconnect()
         try await testCancelledSessionReportsFailedCleanup()
-        print("SessionConnectionCoordinatorTests passed (14 behavioral groups)")
+        try await testFailedCleanupLatchesInputAndPublishesReview()
+        try await testAcknowledgementOnlyDiscardsLocalCleanup()
+        try await testReviewRejectsInvalidAuthorizationAndID()
+        try await testAcknowledgementWaitsForCleanupAndRechecksReview()
+        try await testCancelledAcknowledgementRetainsCleanup()
+        try await testAcknowledgementRechecksAttemptAndManualAuthorization()
+        try await testSuspendedAcknowledgementRejectsNewAttempt()
+        try await testAcknowledgedOldEndpointCannotAffectNewEndpoint()
+        try await testCleanupReviewNeverContainsCredentials()
+        testCleanupErrorOffersRecoveryActions()
+        print("SessionConnectionCoordinatorTests passed (24 behavioral groups)")
     }
 
     @MainActor
@@ -253,6 +263,229 @@ struct SessionConnectionCoordinatorTests {
         fixture.expectOrder("disabled:A", "commit:B", "enable:B")
     }
 
+    @MainActor
+    private static func testFailedCleanupLatchesInputAndPublishesReview() async throws {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
+        fixture.disableFailures.insert("A")
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.coordinator.pendingCleanupReview != nil, "Failed HID cleanup must publish a manual review")
+        let first = fixture.coordinator.pendingCleanupReview!
+        precondition(first.endpoint == "A.invalid:443")
+        precondition(fixture.inputBlocked)
+        fixture.expectOrder("disable:A", "input-blocked")
+        await expectCleanupFailure(fixture.coordinator.startConnection(to: fixture.device("B")).task)
+        let retry = fixture.coordinator.pendingCleanupReview!
+        precondition(retry.id != first.id, "Every failed cleanup needs its own review consent")
+        precondition(fixture.committedNames == ["A"])
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
+        precondition(fixture.coordinator.pendingCleanupReview == nil)
+        precondition(fixture.inputBlocked, "Successful retry must not release the review block")
+        fixture.expectOrder("input-blocked", "commit:C")
+    }
+
+    @MainActor
+    private static func testAcknowledgementOnlyDiscardsLocalCleanup() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        let remoteBefore = fixture.remoteEvents
+        try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
+        precondition(fixture.coordinator.pendingCleanupReview == nil)
+        precondition(fixture.inputBlocked)
+        precondition(fixture.remoteEvents == remoteBefore, "Review acknowledgement must issue no remote calls")
+        precondition(fixture.committedNames == ["A"], "Review acknowledgement must not auto-connect")
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.remoteEvents == remoteBefore, "Forgotten local client must not retry remotely")
+    }
+
+    @MainActor
+    private static func testReviewRejectsInvalidAuthorizationAndID() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: UUID(), authorization: { true })
+        }
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { false })
+        }
+        precondition(fixture.coordinator.pendingCleanupReview == review)
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
+        precondition(fixture.events.filter { $0 == "disable:A" }.count == 2, "Rejected consent must retain the old client")
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
+        }
+    }
+
+    @MainActor
+    private static func testAcknowledgementWaitsForCleanupAndRechecksReview() async throws {
+        let fixture = try await failedCleanupFixture()
+        let oldReview = fixture.coordinator.pendingCleanupReview!
+        let retryGate = SessionGate()
+        fixture.disableGates["A"] = retryGate
+        let retry = fixture.coordinator.disconnect()
+        await fixture.waitForCount("disable:A", count: 2)
+        let ack = Task { @MainActor in
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: oldReview.id, authorization: { true })
+        }
+        await Task.yield()
+        precondition(fixture.coordinator.pendingCleanupReview == oldReview)
+        retryGate.release()
+        await retry.value
+        await expectReviewExpired { try await ack.value }
+        precondition(fixture.coordinator.pendingCleanupReview?.id != oldReview.id)
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
+        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
+    }
+
+    @MainActor
+    private static func testCancelledAcknowledgementRetainsCleanup() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        let drainGate = SessionGate()
+        fixture.nextDrainGate = drainGate
+        let retry = fixture.coordinator.disconnect()
+        await fixture.waitFor("drain:3")
+        let ack = Task { @MainActor in
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
+        }
+        await Task.yield()
+        ack.cancel()
+        drainGate.release()
+        await retry.value
+        do { try await ack.value; preconditionFailure("Cancelled review discarded the old client") }
+        catch is CancellationError { }
+        precondition(fixture.coordinator.pendingCleanupReview != nil)
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("B")).task.value
+        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
+    }
+
+    @MainActor
+    private static func testAcknowledgementRechecksAttemptAndManualAuthorization() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        let authorization = SessionAuthorization()
+        authorization.onFirstCheck = {
+            authorization.allowed = false
+        }
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
+                reviewID: review.id, authorization: { authorization.check() })
+        }
+        precondition(authorization.checkCount == 2, "Mode authorization must be rechecked after settlement")
+        precondition(fixture.coordinator.pendingCleanupReview == review)
+
+        let attemptAuthorization = SessionAuthorization()
+        let preparation = SessionGate()
+        fixture.preparationGates["B"] = preparation
+        var replacement: SessionConnectionCoordinator.Attempt?
+        attemptAuthorization.onFirstCheck = {
+            replacement = fixture.coordinator.startConnection(to: fixture.device("B"))
+        }
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
+                reviewID: review.id, authorization: { attemptAuthorization.check() })
+        }
+        precondition(fixture.coordinator.pendingCleanupReview != nil)
+        preparation.release()
+        await expectCleanupFailure(replacement!.task)
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
+        precondition(fixture.events.filter { $0 == "disable:A" }.count == 3)
+    }
+
+    @MainActor
+    private static func testAcknowledgedOldEndpointCannotAffectNewEndpoint() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
+        let oldRemoteCount = fixture.events.filter { $0.hasSuffix(":A") && ($0.hasPrefix("enable") || $0.hasPrefix("disable")) }.count
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("B", host: "other.invalid")).task.value
+        await expectReviewExpired {
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(reviewID: review.id, authorization: { true })
+        }
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.events.filter { $0.hasSuffix(":A") && ($0.hasPrefix("enable") || $0.hasPrefix("disable")) }.count == oldRemoteCount)
+        precondition(fixture.events.contains("disabled:B"))
+        precondition(fixture.inputBlocked)
+    }
+
+    @MainActor
+    private static func testSuspendedAcknowledgementRejectsNewAttempt() async throws {
+        let fixture = try await failedCleanupFixture()
+        let review = fixture.coordinator.pendingCleanupReview!
+        let retryGate = SessionGate()
+        fixture.disableGates["A"] = retryGate
+        let retry = fixture.coordinator.disconnect()
+        await fixture.waitForCount("disable:A", count: 2)
+        let authorization = SessionAuthorization()
+        let ack = Task { @MainActor in
+            try await fixture.coordinator.acknowledgeUnconfirmedCleanup(
+                reviewID: review.id, authorization: { authorization.check() })
+        }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while authorization.checkCount == 0 {
+            precondition(clock.now < deadline, "Review acknowledgement did not start")
+            await Task.yield()
+        }
+        let nextAttempt = fixture.coordinator.startConnection(to: fixture.device("B"))
+        retryGate.release()
+        await retry.value
+        await expectReviewExpired { try await ack.value }
+        await expectCleanupFailure(nextAttempt.task)
+        precondition(fixture.coordinator.pendingCleanupReview != nil)
+        fixture.disableFailures.remove("A")
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("C")).task.value
+        precondition(fixture.events.filter { $0 == "disable:A" }.count == 4)
+    }
+
+    @MainActor
+    private static func testCleanupReviewNeverContainsCredentials() async throws {
+        let fixture = SessionFixture()
+        var device = fixture.device("A", host: "username:password@A.invalid")
+        device.authToken = "token-never-in-ui"
+        _ = try await fixture.coordinator.startConnection(to: device).task.value
+        fixture.disableFailures.insert("A")
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.coordinator.pendingCleanupReview?.endpoint == "A.invalid:443")
+    }
+
+    private static func testCleanupErrorOffersRecoveryActions() {
+        let cleanupText = SessionConnectionError.previousSessionCleanupFailed.localizedDescription
+        precondition(cleanupText.contains("Connections"))
+        precondition(cleanupText.contains("manueller Prüfung"))
+        let expiredText = SessionConnectionError.manualReviewExpired.localizedDescription
+        precondition(expiredText.contains("Connections"))
+        precondition(expiredText.contains("Manual"))
+    }
+
+    @MainActor
+    private static func failedCleanupFixture() async throws -> SessionFixture {
+        let fixture = SessionFixture()
+        _ = try await fixture.coordinator.startConnection(to: fixture.device("A")).task.value
+        fixture.disableFailures.insert("A")
+        await fixture.coordinator.disconnect().value
+        precondition(fixture.coordinator.pendingCleanupReview != nil)
+        return fixture
+    }
+
+    private static func expectCleanupFailure(_ task: Task<KVMDevice, Error>) async {
+        do { _ = try await task.value; preconditionFailure("Expected cleanup failure") }
+        catch SessionConnectionError.previousSessionCleanupFailed { }
+        catch { preconditionFailure("Cleanup failure became \(error)") }
+    }
+
+    @MainActor
+    private static func expectReviewExpired(_ operation: @MainActor () async throws -> Void) async {
+        do { try await operation(); preconditionFailure("Expired or unauthorized review was accepted") }
+        catch SessionConnectionError.manualReviewExpired { }
+        catch { preconditionFailure("Review rejection became \(error)") }
+    }
+
     private static func expectCancellation(_ task: Task<KVMDevice, Error>) async {
         do { _ = try await task.value; preconditionFailure("Expected cancellation") }
         catch is CancellationError { }
@@ -261,6 +494,20 @@ struct SessionConnectionCoordinatorTests {
 }
 
 private enum SessionFixtureError: Error { case authentication, video, disable, enable }
+
+@MainActor
+private final class SessionAuthorization {
+    var allowed = true
+    var checkCount = 0
+    var onFirstCheck: (() -> Void)?
+
+    func check() -> Bool {
+        let current = allowed
+        checkCount += 1
+        if checkCount == 1 { onFirstCheck?() }
+        return current
+    }
+}
 
 @MainActor
 private final class SessionGate {
@@ -287,6 +534,7 @@ private final class SessionFixture {
     var installedName: String?
     var invalidationCount = 0
     var reportedErrors: [String] = []
+    var inputBlocked = false
     var preparationGates: [String: SessionGate] = [:]
     var preparationErrors: [String: Error] = [:]
     var enableGates: [String: SessionGate] = [:]
@@ -329,6 +577,10 @@ private final class SessionFixture {
             await gate?.wait()
             record("drained:\(count)")
         },
+        blockInputForRecovery: { [unowned self] in
+            inputBlocked = true
+            record("input-blocked")
+        },
         installInput: { [unowned self] client in
             installedName = clientNames[ObjectIdentifier(client)]
             record("input:\(installedName!)")
@@ -366,6 +618,19 @@ private final class SessionFixture {
     func waitFor(_ event: String) async {
         guard !events.contains(event) else { return }
         await withCheckedContinuation { eventWaiters[event, default: []].append($0) }
+    }
+
+    func waitForCount(_ event: String, count: Int) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while events.filter({ $0 == event }).count < count {
+            precondition(clock.now < deadline, "Timed out waiting for \(count) occurrences of \(event)")
+            await Task.yield()
+        }
+    }
+
+    var remoteEvents: [String] {
+        events.filter { $0.hasPrefix("enable:") || $0.hasPrefix("disable:") || $0.hasPrefix("video:") }
     }
 
     func expectOrder(_ expected: String...) {

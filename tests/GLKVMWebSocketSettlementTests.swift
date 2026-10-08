@@ -9,8 +9,9 @@ private struct StalledConnection: Decodable {
     let closed: Bool
     let bytes: Int
     let events: [String]
+    let binary: [String]
 }
-private struct FixtureStatus: Decodable { let connections: [StalledConnection] }
+private struct FixtureStatus: Decodable { let connections: [StalledConnection]; let printTexts: [String] }
 
 private final class SettlementTLS: NSObject, URLSessionDelegate {
     func urlSession(_ session: URLSession, didReceive challenge: URLAuthenticationChallenge,
@@ -38,6 +39,9 @@ private struct SettlementControl {
     func close(_ id: Int) async throws { _ = try await request("/fixture/close?id=\(id)", method: "POST") }
     func status() async throws -> [StalledConnection] {
         try JSONDecoder().decode(FixtureStatus.self, from: await request("/fixture/status")).connections
+    }
+    func printedTexts() async throws -> [String] {
+        try JSONDecoder().decode(FixtureStatus.self, from: await request("/fixture/status")).printTexts
     }
     func waitForConnection(after count: Int) async throws -> StalledConnection {
         let deadline = ProcessInfo.processInfo.systemUptime + 3
@@ -67,6 +71,10 @@ struct GLKVMWebSocketSettlementTests {
         do {
             let health = try JSONSerialization.jsonObject(with: await control.request("/fixture/health")) as? [String: Any]
             try expect(health?["fixture"] as? String == "overlook-ws-settlement", "Only the local settlement fixture is allowed")
+            try await testInputRecoveryKeepsBlockAcrossReconnect(control)
+            print("PASS: live recovery transport survives the block; reconnect never unblocks or replays text")
+            try await testInputRecoveryRejectsRevocationCancellationAndStaleSession(control)
+            print("PASS: absent, failed, unauthorized, revoked, cancelled and replaced recovery keep input blocked")
             try await testCancelledRemoteActionBlocksInputAndDrains(control)
             print("PASS: cancellation after dispatch blocks actual input before bounded queue cleanup")
             try await testStalledCallerCancellationDoesNotReplay(control)
@@ -87,10 +95,186 @@ struct GLKVMWebSocketSettlementTests {
             print("PASS: stale abort preserves replacement task on the same client")
             try await testReconnectAfterOldPingStarted(control)
             print("PASS: reconnect remains usable after the old connection's regular ping started")
-            print("GLKVMWebSocketSettlementTests passed (10 groups)")
+            print("GLKVMWebSocketSettlementTests passed (12 groups)")
         } catch {
             fputs("GLKVMWebSocketSettlementTests FAILED: \(error)\n", stderr)
             exit(1)
+        }
+    }
+
+    @MainActor private static func testInputRecoveryKeepsBlockAcrossReconnect(_ control: SettlementControl) async throws {
+        try await control.mode("normal")
+        let previous = try await control.status().count
+        let textCount = try await control.printedTexts().count
+        var clock: TimeInterval = 0
+        let fixture = CaptureFixture(microJigglerClock: { clock })
+        defer { fixture.finish() }
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        fixture.manager.setGLKVMClient(client)
+        fixture.manager.setTransportMode(.glkvmWebSocket)
+        let first = try await control.waitForConnection(after: previous)
+        try await waitForRecoveryTransport(fixture.manager, available: true)
+        try expect(fixture.manager.hidStatus == "Connected", "Only actual socket readiness may publish Connected")
+        do {
+            try await fixture.manager.sendTextToRemote("original unconfirmed fixture text")
+            throw CaptureTestFailure(description: "The fixture must reject the original HTTP print")
+        } catch is GLKVMClient.ClientError {}
+        fixture.manager.blockInputAfterUnconfirmedSession()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        try expect(fixture.manager.hasInputRecoveryTransport, "A connected release transport remains available while input is blocked")
+        let blockedReady = await fixture.manager.inputReadiness()
+        try expect(!blockedReady.text && !blockedReady.mouse, "Recovery capability must not grant normal remote input")
+        try expectCapture(fixture, keyboard: false, mouse: false)
+        let firstBefore = try await control.status().first(where: { $0.id == first.id })!.binary
+        fixture.manager.setMicroJigglerEnabled(true)
+        clock = 61
+        NSApp.sendEvent(fixture.event())
+        fixture.manager.handleVideoMouseScroll(deltaX: 0, deltaY: 1)
+        await fixture.manager.performMicroJigglerTick()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        let firstAfter = try await control.status().first(where: { $0.id == first.id })!.binary
+        try expect(firstAfter == firstBefore, "Blocked local events and Jiggler must emit no HID packets")
+
+        await fixture.manager.disconnectInputForSession()
+        try expect(!fixture.manager.hasInputRecoveryTransport && fixture.manager.inputBlocked,
+                   "Session retire must remove recovery capability and retain uncertainty")
+        fixture.manager.setGLKVMClient(client)
+        fixture.manager.setSessionAvailable(true)
+        let replacement = try await control.waitForConnection(after: previous + 1)
+        try await waitForRecoveryTransport(fixture.manager, available: true)
+        try expect(fixture.manager.inputBlocked, "Reconnect cannot clear a previous unconfirmed outcome")
+        try expectCapture(fixture, keyboard: false, mouse: false)
+        let reconnectedReady = await fixture.manager.inputReadiness()
+        try expect(!reconnectedReady.text && !reconnectedReady.mouse, "Reconnect under the block must preserve disabled normal readiness")
+        clock = 122
+        await fixture.manager.performMicroJigglerTick()
+        let blockedReplacement = try await control.status().first(where: { $0.id == replacement.id })!
+        try expect(blockedReplacement.binary.isEmpty, "Blocked reconnect must never start the Jiggler")
+        try await fixture.manager.recoverInputAfterManualReview(authorization: { true })
+        try expect(!fixture.manager.inputBlocked, "Explicit Manual release on the current live socket must clear the block")
+        try expectCapture(fixture, keyboard: true, mouse: true)
+        let ready = await fixture.manager.inputReadiness()
+        try expect(ready.text && ready.mouse, "Successful Manual recovery restores normal readiness")
+        let deadline = ProcessInfo.processInfo.systemUptime + 2
+        var packets: [String] = []
+        repeat {
+            packets = try await control.status().first(where: { $0.id == replacement.id })!.binary
+            if packets.count >= 4 { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        try expect(Array(packets.prefix(4)) == ["0100", "02006c656674", "02007269676874", "02006d6964646c65"],
+                   "Manual recovery must transmit actual keyboard and three mouse releases")
+        let texts = try await control.printedTexts()
+        try expect(Array(texts.dropFirst(textCount)) == ["original unconfirmed fixture text"],
+                   "Failed text must be dispatched once only, with no replay during recovery")
+        try await control.close(replacement.id)
+        try await waitForRecoveryTransport(fixture.manager, available: false)
+        try expect(!fixture.manager.inputBlocked,
+                   "Socket failure alone must not invent an unconfirmed action after successful Manual recovery")
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func testInputRecoveryRejectsRevocationCancellationAndStaleSession(_ control: SettlementControl) async throws {
+        try await control.mode("normal")
+        let previous = try await control.status().count
+        let fixture = CaptureFixture()
+        defer { fixture.finish() }
+        let client = try GLKVMClient(host: "127.0.0.1", port: control.port, sessionConfiguration: .ephemeral)
+        fixture.manager.setGLKVMClient(client)
+        fixture.manager.setTransportMode(.glkvmWebSocket)
+        let connected = try await control.waitForConnection(after: previous)
+        try await waitForRecoveryTransport(fixture.manager, available: true)
+        fixture.manager.blockInputAfterUnconfirmedSession()
+        await fixture.manager.waitForHIDCommandsToDrain()
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: { false })
+            throw CaptureTestFailure(description: "Unauthorized recovery must reject")
+        } catch let error as RemoteActionError { try expect(error == .unauthorized, "False Manual authority must remain unauthorized") }
+        var checks = 0
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: {
+                checks += 1
+                return checks == 1
+            })
+            throw CaptureTestFailure(description: "Authority revoked during queue drain must reject")
+        } catch let error as RemoteActionError { try expect(error == .sessionChanged, "Recovery must recheck authority after queue drain") }
+        let cancelled = Task { @MainActor in
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await fixture.manager.recoverInputAfterManualReview(authorization: { true })
+        }
+        do { try await cancelled.value; throw CaptureTestFailure(description: "Cancelled recovery must reject") }
+        catch is CancellationError {}
+        try expect(fixture.manager.inputBlocked, "All rejected review attempts must retain the latch")
+
+        var latchChecks = 0
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: {
+                latchChecks += 1
+                if latchChecks == 4 { fixture.manager.blockInputAfterUnconfirmedSession() }
+                return true
+            })
+            throw CaptureTestFailure(description: "A newer unconfirmed outcome during actual release must reject")
+        } catch let error as RemoteActionError {
+            try expect(error == .sessionChanged, "Successful release cannot acknowledge a newer latched uncertainty")
+        }
+        try expect(fixture.manager.inputBlocked, "A newer block must require another explicit Manual sight review")
+
+        var cancellationChecks = 0
+        let cancelledAfterRelease = Task { @MainActor in
+            try await fixture.manager.recoverInputAfterManualReview(authorization: {
+                cancellationChecks += 1
+                if cancellationChecks == 4 { withUnsafeCurrentTask { $0?.cancel() } }
+                return true
+            })
+        }
+        do {
+            try await cancelledAfterRelease.value
+            throw CaptureTestFailure(description: "Cancellation after actual release must reject")
+        } catch is CancellationError {}
+        try expect(fixture.manager.inputBlocked, "Cancellation after successful transport release must retain uncertainty")
+
+        var finalChecks = 0
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: {
+                finalChecks += 1
+                if finalChecks >= 4 { fixture.manager.setLocalInputCaptureAllowed(false) }
+                return true
+            })
+            throw CaptureTestFailure(description: "Manual mode revoked after release must reject")
+        } catch let error as RemoteActionError { try expect(error == .sessionChanged, "Final release must retain Manual mode authorization") }
+        try expect(fixture.manager.inputBlocked, "Successful transport release cannot override revoked Manual mode")
+        fixture.manager.setLocalInputCaptureAllowed(true)
+        try await control.close(connected.id)
+        try await waitForRecoveryTransport(fixture.manager, available: false)
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: { true })
+            throw CaptureTestFailure(description: "Closed WebSocket recovery must reject")
+        } catch let error as RemoteActionError { try expect(error == .inputUnavailable, "An installed but closed socket is unavailable") }
+        try expect(fixture.manager.inputBlocked, "Failed socket must retain the block")
+
+        fixture.manager.setGLKVMClient(nil)
+        fixture.manager.setGLKVMClient(client)
+        try await waitForRecoveryTransport(fixture.manager, available: true)
+        var replacedChecks = 0
+        do {
+            try await fixture.manager.recoverInputAfterManualReview(authorization: {
+                replacedChecks += 1
+                if replacedChecks >= 4 { fixture.manager.setGLKVMClient(nil) }
+                return true
+            })
+            throw CaptureTestFailure(description: "Replaced socket after release must reject")
+        } catch let error as RemoteActionError { try expect(error == .sessionChanged, "A captured release cannot authorize a replacement session") }
+        try expect(fixture.manager.inputBlocked && !fixture.manager.hasInputRecoveryTransport,
+                   "Retiring the captured socket must retain the block and clear recovery capability")
+        await fixture.manager.disconnectInputForSession()
+    }
+
+    @MainActor private static func waitForRecoveryTransport(_ manager: InputManager, available: Bool) async throws {
+        let deadline = ProcessInfo.processInfo.systemUptime + 3
+        while manager.hasInputRecoveryTransport != available {
+            try expect(ProcessInfo.processInfo.systemUptime < deadline,
+                       "Recovery transport expected \(available), actual \(manager.hasInputRecoveryTransport)")
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 
@@ -353,6 +537,8 @@ struct GLKVMWebSocketSettlementTests {
         fixture.manager.setTransportMode(.glkvmWebSocket)
         let connection = try await control.waitForConnection(after: previous)
         try expect(!connection.upgraded, "The actual WebSocket handshake must remain suspended")
+        try expect(!fixture.manager.hasInputRecoveryTransport,
+                   "A created but unconfirmed WebSocket must not advertise a recovery transport")
         let probe = SettlementProbe()
         let disconnect = Task { @MainActor in
             await fixture.manager.disconnectInputForSession()

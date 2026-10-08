@@ -53,6 +53,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             await localControlServer.waitForMutationsToDrain()
             await inputManager.disconnectInputForSession()
         },
+        blockInputForRecovery: { [unowned self] in
+            inputManager.blockInputAfterUnconfirmedSession()
+        },
         installInput: { [unowned self] client in
             inputManager.setGLKVMClient(client)
             inputManager.setSessionAvailable(true)

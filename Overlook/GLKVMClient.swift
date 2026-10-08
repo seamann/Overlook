@@ -1204,6 +1204,7 @@ extension GLKVMClient {
         private var pingTask: Task<Void, Never>?
         private(set) var isConnected = false
         private(set) var isConnecting = false
+        private var readinessChangedHandler: (@Sendable () -> Void)?
 
         init(session: URLSession, request: URLRequest) {
             self.session = session
@@ -1214,6 +1215,13 @@ extension GLKVMClient {
                 c = continuation
             }
             self.continuation = c
+        }
+
+        /// Observer notifications carry no authority. Consumers must re-read the
+        /// current actor state and verify their own socket/session ownership.
+        func setReadinessChangedHandler(_ handler: (@Sendable () -> Void)?) {
+            readinessChangedHandler = handler
+            handler?()
         }
 
         func connect() {
@@ -1262,6 +1270,7 @@ extension GLKVMClient {
             transport = nil
             isConnected = false
             isConnecting = false
+            readinessChangedHandler?()
 
             continuation.finish()
         }
@@ -1418,7 +1427,9 @@ extension GLKVMClient {
         private func markConnected(_ completedTransport: TransportState) throws {
             guard transport === completedTransport, !Task.isCancelled else { throw CancellationError() }
             isConnecting = false
+            let becameConnected = !isConnected
             isConnected = true
+            if becameConnected { readinessChangedHandler?() }
         }
 
         func sendHidKey(key: String, state: Bool, finish: Bool = false) async throws {
@@ -1456,6 +1467,7 @@ extension GLKVMClient {
             transport = nil
             isConnected = false
             isConnecting = false
+            readinessChangedHandler?()
         }
 
         private func markDisconnected(ifCurrent capturedTransport: TransportState) {

@@ -12,6 +12,11 @@ struct LocalRecoveryPolicyTests {
             ("action alerts describe their failed operation", actionErrors),
             ("preferences requested before mount are retained and consumed once", preferencesBeforeMount),
             ("preferences require the same connected Manual state as the toolbar", settingsAccess),
+            ("disconnected input recovery offers reconnect instead of release", disconnectedInputRecovery),
+            ("input release requires both live video and a recovery transport", connectedInputRecovery),
+            ("old cleanup review and busy states cannot release input", pendingCleanupInputRecovery),
+            ("Headless and revoked Manual cannot acknowledge input recovery", authorizedInputRecovery),
+            ("recovery errors explain the next local step", inputRecoveryErrors),
         ]
         var failures: [String] = []
         for (name, test) in tests {
@@ -125,6 +130,70 @@ struct LocalRecoveryPolicyTests {
         try expect(LocalSettingsAccessPolicy.denialReason(mode: .codexHeadless, isConnected: false) != nil,
                    "Disconnected Headless opens Settings")
         try expect(LocalActionErrorKind.settings.title == "Settings Unavailable", "Settings rejection has wrong operation title")
+    }
+
+    private static func disconnectedInputRecovery() throws {
+        let state = inputRecovery(isConnected: false, hasVideo: false, hasTransport: false)
+        try expect(state.action == .reconnect, "Disconnected recovery still offers an impossible release")
+        try expect(state.buttonTitle == "Erneut verbinden", "Disconnected recovery has no connection action")
+        try expect(state.message.contains("verbinden"), "Disconnected recovery does not explain reconnection")
+    }
+
+    private static func connectedInputRecovery() throws {
+        try expect(inputRecovery(hasTransport: false).action == .reconnect,
+                   "Video alone permits release without an input transport")
+        try expect(inputRecovery(hasVideo: false).action == .reconnect,
+                   "Input transport alone permits release without inspecting the remote image")
+        let ready = inputRecovery()
+        try expect(ready.action == .releaseInput,
+                   "A fresh connected Manual session cannot offer explicit release")
+        try expect(ready.buttonTitle == "Eingabe nach Prüfung freigeben" && ready.message.contains("Bild"),
+                   "Ready recovery does not require inspecting the remote image")
+    }
+
+    private static func pendingCleanupInputRecovery() throws {
+        let pending = inputRecovery(isConnected: false, hasVideo: false, hasTransport: false, hasCleanup: true)
+        try expect(pending.action == .reviewPreviousSession, "Failed old cleanup has no local takeover path")
+        try expect(pending.buttonTitle == "Alte Sitzung prüfen …" && pending.message.contains("direkt"),
+                   "Old cleanup review does not explain direct target inspection")
+        try expect(inputRecovery(isBusy: true, hasCleanup: true).action == .waitForConnection,
+                   "A still running transition allows concurrent review")
+        try expect(inputRecovery(isBusy: true).buttonTitle == nil, "Busy recovery offers a duplicate action")
+        try expect(inputRecovery(isBusy: true).message.contains("angehalten"), "Busy state does not explain retained input pause")
+    }
+
+    private static func authorizedInputRecovery() throws {
+        try expect(inputRecovery(mode: .codexHeadless, hasCleanup: true).action == .switchToManual,
+                   "Headless can acknowledge the human cleanup review")
+        try expect(inputRecovery(mode: .codexHeadless).buttonTitle == nil,
+                   "Headless offers the human input release button")
+        try expect(inputRecovery(mode: .codexHeadless).message.contains("Manual"),
+                   "Headless state does not explain how to reach human review")
+        try expect(inputRecovery(captureAllowed: false).action == .waitForConnection,
+                   "Revoked Manual capture allows release before its drain finishes")
+    }
+
+    private static func inputRecoveryErrors() throws {
+        let messages = InputRecoveryFailure.allCases.map(\.message)
+        try expect(Set(messages).count == messages.count, "Different recovery failures collapse into one message")
+        try expect(InputRecoveryFailure.transportUnavailable.message.contains("verbinden"),
+                   "Missing transport has no reconnect instruction")
+        try expect(InputRecoveryFailure.sessionChanged.message.contains("aktuelle"),
+                   "A stale review has no instruction to inspect the current session")
+        try expect(InputRecoveryFailure.unauthorized.message.contains("Manual"),
+                   "Revoked authority has no Manual instruction")
+    }
+
+    private static func inputRecovery(
+        mode: OverlookControlMode = .manual, isConnected: Bool = true,
+        isBusy: Bool = false, hasVideo: Bool = true, hasTransport: Bool = true,
+        hasCleanup: Bool = false, captureAllowed: Bool = true
+    ) -> InputRecoveryPresentation {
+        InputRecoveryPresentation(
+            mode: mode, isConnected: isConnected, isBusy: isBusy,
+            hasLiveVideo: hasVideo, hasRecoveryTransport: hasTransport,
+            hasPendingCleanupReview: hasCleanup, isLocalCaptureAllowed: captureAllowed
+        )
     }
 
     private static func expectFailure(_ host: String, port: String, expected: ManualEndpointError) throws {
