@@ -53,11 +53,13 @@ Wolfgang bestätigte `192.178.1.62` als aktuelle KVM-Adresse und beauftragte die
 
 Danach zeigte die native App ausdrücklich: „The previous KVM session could not confirm HID disconnect. Try connecting again to retry cleanup.“ Der durch diese Meldung vorgesehene einmalige weitere Connect-Versuch wurde ausgeführt und endete erneut mit derselben Meldung. Der heutige blockierende alte Session-Abschluss ist damit live reproduziert; die konkrete alte Endpoint-/Token-/Netzfehlerursache wird durch die zusammengefasste Meldung weiterhin nicht offengelegt.
 
-Der neue Client wird im normalen Ablauf erst nach erfolgreicher alter HID-Bereinigung aktiviert. Deshalb gibt es weiterhin kein Videobild und keine Möglichkeit zur Freigabe über den Banner-Button. Wolfgang wurde um eine direkte Prüfung des Zielrechners und die Bestätigung eines regulären Overlook-Neustarts gebeten. Ein Neustart würde den lokalen, nur im Prozess gehaltenen Sperrzustand verlieren und wird nicht als Beweis der Remote-Bereinigung behandelt.
+Der neue Client wird im normalen Ablauf erst nach erfolgreicher alter HID-Bereinigung aktiviert. Deshalb gab es nach diesen Versuchen weiterhin kein Videobild und keine Möglichkeit zur Freigabe über den Banner-Button. Wolfgang wurde um eine direkte Prüfung des Zielrechners und die Bestätigung eines regulären Overlook-Neustarts gebeten. Er bestätigte diese Frage anschließend mit „ja“.
 
 Bei erfolgreichem Reconnect im selben Prozess ist der vorgesehene Ablauf: KVM-Verbindung herstellen, frisches Remote-Bild prüfen, dann in Manual ausdrücklich „Eingabe nach Prüfung freigeben“. Nach der Freigabe müssen `input_blocked=false` und die tatsächliche Bereitschaft neu geprüft werden. Eine neue Verbindung allein bestätigt kein früheres unbekanntes Aktionsergebnis.
 
 Für einen genehmigten App-Neustart gilt ein anderer Ablauf: Der Zielzustand muss vor dem Neustart direkt geprüft werden. `InputManager` startet mit `inputBlocked=false`; die vorherige Sperre und ihr Banner sind danach nicht erhalten. Nach der Wiederverbindung sind Bild, richtige Zieladresse und Bereitschaft frisch zu prüfen. Ein solcher Neustart belegt weiterhin keinen erfolgreichen Abschluss der alten HID-Bereinigung.
+
+Nach Wolfgangs Bestätigung wurde Overlook über seinen nativen Quit-Button regulär beendet. Der Prozessabschluss wurde geprüft, ohne Force Quit. Anschließend wurde exakt `/Applications/Overlook.app` wieder geöffnet. Der Sperrbanner war weg. Das bestätigte Ziel `192.178.1.62` wurde erneut ausgewählt; der neue Connect öffnete wieder den nativen Passwortdialog. Die frische Anmeldung und abschließende Videoprüfung stehen an dieser Stelle noch aus.
 
 ## Kleinste sinnvolle Produktreparatur
 
